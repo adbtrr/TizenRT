@@ -1,0 +1,1133 @@
+From 1060518c2bc9d646b2357c4a991ce3504db61660 Mon Sep 17 00:00:00 2001
+From: adbtrr_work5 <adbtrr_work5@local>
+Date: Wed, 5 Aug 2026 05:54:17 +0000
+Subject: [PATCH] examples/crashrpt_test: demonstrate crash diagnostic capture
+
+Exercises /dev/crashrpt end to end, showing how a product application
+publishes diagnostic data when the system is about to assert.
+
+Data held
+---------
+
+  500 nodes of 48 bytes
+   50 nodes of 64 bytes
+
+Each node carries a pointer to a message string of up to 255 bytes.  The
+message is not stored inside the node, so on disk it follows its node and
+both end up in the report.
+
+The structure sizes are part of the requirement, so they are checked at run
+time before anything else happens rather than assumed.  They depend on the
+pointer being four bytes; on a target where that does not hold the check
+reports the mismatch instead of silently writing a different format.
+
+The data is built once at start-up while the system is healthy.  Allocating
+several hundred blocks on the way down is exactly the kind of work that
+should not be attempted, and building it during normal operation also
+mirrors how a real product accumulates diagnostic state.
+
+Temporary file and rename
+-------------------------
+
+The report is written to crashrpt.tmp and renamed to crashrpt_r<n>.bin only
+after the write has completed and been flushed with fsync().  A reader never
+observes a partial report - the final name either exists and is complete or
+does not exist at all.  Any failure removes the temporary file.
+
+Serialisation
+-------------
+
+A 32 byte header records the magic, version, reason code, node counts and
+node sizes.  Each record is the raw node, a one byte message length, then
+the message.  One byte is sufficient because the message is capped at 255.
+
+The message pointer inside each node is zeroed in the copy that is written,
+since its value has no meaning outside the running process and leaving it
+would make the output unreproducible.
+
+The write path does no allocation.  Everything it needs was set up during
+initialisation.
+
+Usage
+-----
+
+  crashrpt_test init      build the data and register the reporter
+  crashrpt_test status    show state and the largest possible report
+  crashrpt_test crash     raise an assert to exercise the path
+
+Disabled by default.  Depends on CONFIG_CRASH_REPORT.
+---
+ apps/examples/crashrpt_test/Kconfig           |  47 ++
+ apps/examples/crashrpt_test/Kconfig_ENTRY     |   3 +
+ apps/examples/crashrpt_test/Make.defs         |  25 +
+ apps/examples/crashrpt_test/Makefile          | 158 +++++
+ apps/examples/crashrpt_test/README.txt        | 138 ++++
+ .../crashrpt_test/crashrpt_test_main.c        | 653 ++++++++++++++++++
+ 6 files changed, 1024 insertions(+)
+ create mode 100644 apps/examples/crashrpt_test/Kconfig
+ create mode 100644 apps/examples/crashrpt_test/Kconfig_ENTRY
+ create mode 100644 apps/examples/crashrpt_test/Make.defs
+ create mode 100644 apps/examples/crashrpt_test/Makefile
+ create mode 100644 apps/examples/crashrpt_test/README.txt
+ create mode 100644 apps/examples/crashrpt_test/crashrpt_test_main.c
+
+diff --git a/apps/examples/crashrpt_test/Kconfig b/apps/examples/crashrpt_test/Kconfig
+new file mode 100644
+index 00000000..c983fb15
+--- /dev/null
++++ b/apps/examples/crashrpt_test/Kconfig
+@@ -0,0 +1,47 @@
++#
++# For a description of the syntax of this configuration file,
++# see kconfig-language at https://www.kernel.org/doc/Documentation/kbuild/kconfig-language.txt
++#
++
++config EXAMPLES_CRASHRPT_TEST
++	bool "Crash diagnostic capture example"
++	default n
++	depends on CRASH_REPORT
++	---help---
++		Demonstrates /dev/crashrpt.
++
++		Holds 500 nodes of 48 bytes and 50 nodes of 64 bytes, each with a
++		message string of up to 255 bytes, and registers a reporter thread
++		that serialises all of it to a file when the system is about to
++		assert.
++
++		The report is written to a temporary file and renamed only once the
++		write has completed and been flushed, so a reader never sees a
++		partial report.
++
++if EXAMPLES_CRASHRPT_TEST
++
++config EXAMPLES_CRASHRPT_TEST_DIR
++	string "Directory for the report"
++	default "/mnt"
++	---help---
++		Where the temporary and final report files are written.  Must be a
++		writable mount point.
++
++config EXAMPLES_CRASHRPT_TEST_PRIORITY
++	int "Reporter thread priority"
++	default 254
++	---help---
++		The reporter must outrank every other runnable thread, otherwise it
++		is not scheduled before the deadline expires and no report is
++		produced.
++
++config EXAMPLES_CRASHRPT_TEST_STACKSIZE
++	int "Reporter thread stack size"
++	default 8192
++
++endif # EXAMPLES_CRASHRPT_TEST
++
++config USER_ENTRYPOINT
++	string
++	default "crashrpt_test_main" if ENTRY_CRASHRPT_TEST
+diff --git a/apps/examples/crashrpt_test/Kconfig_ENTRY b/apps/examples/crashrpt_test/Kconfig_ENTRY
+new file mode 100644
+index 00000000..c5617c91
+--- /dev/null
++++ b/apps/examples/crashrpt_test/Kconfig_ENTRY
+@@ -0,0 +1,3 @@
++config ENTRY_CRASHRPT_TEST
++	bool "Crash diagnostic capture example"
++	depends on EXAMPLES_CRASHRPT_TEST
+diff --git a/apps/examples/crashrpt_test/Make.defs b/apps/examples/crashrpt_test/Make.defs
+new file mode 100644
+index 00000000..e101e7d9
+--- /dev/null
++++ b/apps/examples/crashrpt_test/Make.defs
+@@ -0,0 +1,25 @@
++###########################################################################
++#
++# Copyright 2026 Samsung Electronics All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++# either express or implied. See the License for the specific
++# language governing permissions and limitations under the License.
++#
++###########################################################################
++############################################################################
++# apps/examples/crashrpt_test/Make.defs
++# Adds selected applications to apps/ build
++############################################################################
++
++ifeq ($(CONFIG_EXAMPLES_CRASHRPT_TEST),y)
++CONFIGURED_APPS += examples/crashrpt_test
++endif
+diff --git a/apps/examples/crashrpt_test/Makefile b/apps/examples/crashrpt_test/Makefile
+new file mode 100644
+index 00000000..c5440945
+--- /dev/null
++++ b/apps/examples/crashrpt_test/Makefile
+@@ -0,0 +1,158 @@
++###########################################################################
++#
++# Copyright 2016 Samsung Electronics All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++# either express or implied. See the License for the specific
++# language governing permissions and limitations under the License.
++#
++###########################################################################
++############################################################################
++# apps/examples/hello/Makefile
++#
++#   Copyright (C) 2008, 2010-2013 Gregory Nutt. All rights reserved.
++#   Author: Gregory Nutt <gnutt@nuttx.org>
++#
++# Redistribution and use in source and binary forms, with or without
++# modification, are permitted provided that the following conditions
++# are met:
++#
++# 1. Redistributions of source code must retain the above copyright
++#    notice, this list of conditions and the following disclaimer.
++# 2. Redistributions in binary form must reproduce the above copyright
++#    notice, this list of conditions and the following disclaimer in
++#    the documentation and/or other materials provided with the
++#    distribution.
++# 3. Neither the name NuttX nor the names of its contributors may be
++#    used to endorse or promote products derived from this software
++#    without specific prior written permission.
++#
++# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++# FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
++# COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++# BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
++# OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++# AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++# ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++# POSSIBILITY OF SUCH DAMAGE.
++#
++############################################################################
++
++-include $(TOPDIR)/.config
++-include $(TOPDIR)/Make.defs
++include $(APPDIR)/Make.defs
++
++# Hello, World! built-in application info
++
++APPNAME = crashrpt_test
++FUNCNAME = $(APPNAME)_main
++THREADEXEC = TASH_EXECMD_ASYNC
++
++# Hello, World! Example
++
++ASRCS =
++CSRCS =
++MAINSRC = crashrpt_test_main.c
++
++AOBJS = $(ASRCS:.S=$(OBJEXT))
++COBJS = $(CSRCS:.c=$(OBJEXT))
++MAINOBJ = $(MAINSRC:.c=$(OBJEXT))
++
++SRCS = $(ASRCS) $(CSRCS) $(MAINSRC)
++OBJS = $(AOBJS) $(COBJS)
++
++ifneq ($(CONFIG_BUILD_KERNEL),y)
++  OBJS += $(MAINOBJ)
++endif
++
++ifeq ($(CONFIG_WINDOWS_NATIVE),y)
++  BIN = $(APPDIR)\libapps$(LIBEXT)
++else
++ifeq ($(WINTOOL),y)
++  BIN = $(APPDIR)\\libapps$(LIBEXT)
++else
++  BIN = $(APPDIR)/libapps$(LIBEXT)
++endif
++endif
++
++ifeq ($(WINTOOL),y)
++  INSTALL_DIR = "${shell cygpath -w $(BIN_DIR)}"
++else
++  INSTALL_DIR = $(BIN_DIR)
++endif
++
++CONFIG_EXAMPLES_HELLO_PROGNAME ?= hello$(EXEEXT)
++PROGNAME = $(CONFIG_EXAMPLES_HELLO_PROGNAME)
++
++ROOTDEPPATH = --dep-path .
++
++# Common build
++
++VPATH =
++
++all: .built
++.PHONY: clean depend distclean
++
++$(AOBJS): %$(OBJEXT): %.S
++	$(call ASSEMBLE, $<, $@)
++
++$(COBJS) $(MAINOBJ): %$(OBJEXT): %.c
++	$(call COMPILE, $<, $@)
++
++.built: $(OBJS)
++	$(call ARCHIVE, $(BIN), $(OBJS))
++	@touch .built
++
++ifeq ($(CONFIG_BUILD_KERNEL),y)
++$(BIN_DIR)$(DELIM)$(PROGNAME): $(OBJS) $(MAINOBJ)
++	@echo "LD: $(PROGNAME)"
++	$(Q) $(LD) $(LDELFFLAGS) $(LDLIBPATH) -o $(INSTALL_DIR)$(DELIM)$(PROGNAME) $(ARCHCRT0OBJ) $(MAINOBJ) $(LDLIBS)
++	$(Q) $(NM) -u  $(INSTALL_DIR)$(DELIM)$(PROGNAME)
++
++install: $(BIN_DIR)$(DELIM)$(PROGNAME)
++
++else
++install:
++
++endif
++
++ifeq ($(CONFIG_BUILTIN_APPS)$(CONFIG_EXAMPLES_HELLO),yy)
++$(BUILTIN_REGISTRY)$(DELIM)$(FUNCNAME).bdat: $(DEPCONFIG) Makefile
++	$(Q) $(call REGISTER,$(APPNAME),$(FUNCNAME),$(THREADEXEC),$(PRIORITY),$(STACKSIZE))
++
++context: $(BUILTIN_REGISTRY)$(DELIM)$(FUNCNAME).bdat
++
++else
++context:
++
++endif
++
++.depend: Makefile $(SRCS)
++	@$(MKDEP) $(ROOTDEPPATH) "$(CC)" -- $(CFLAGS) -- $(SRCS) >Make.dep
++	@touch $@
++
++depend: .depend
++
++clean:
++	$(call DELFILE, .built)
++	$(call CLEAN)
++
++distclean: clean
++	$(call DELFILE, Make.dep)
++	$(call DELFILE, .depend)
++
++-include Make.dep
++.PHONY: preconfig
++preconfig:
+diff --git a/apps/examples/crashrpt_test/README.txt b/apps/examples/crashrpt_test/README.txt
+new file mode 100644
+index 00000000..4aa5adda
+--- /dev/null
++++ b/apps/examples/crashrpt_test/README.txt
+@@ -0,0 +1,138 @@
++apps/examples/crashrpt_test
++===========================
++
++Demonstration of the crash diagnostic capture driver, /dev/crashrpt.
++
++What it does
++------------
++
++The example holds a body of diagnostic data in memory and registers a
++reporter thread that serialises all of it to a file when the system is about
++to assert.
++
++  500 nodes of 48 bytes
++   50 nodes of 64 bytes
++  each node carries a message string of up to 255 bytes
++
++The message is not stored inside the node - the node holds a pointer to it.
++On disk the message follows its node, so both end up in the report.
++
++Sequence
++--------
++
++  1. The application builds the node data at start-up, while the system is
++     healthy.
++  2. The reporter thread registers through /dev/crashrpt and parks in
++     fin_wait().
++  3. An assert occurs.  At the very top of up_assert(), before any crash
++     handling begins, the kernel wakes the reporter and waits.
++  4. The reporter writes the report and tells the driver it is finished.
++  5. Assert handling continues and the board reboots.
++
++Why the data is built up front
++------------------------------
++
++Allocating several hundred blocks while the system is on its way down is
++exactly the kind of work that should not be attempted.  Building the data
++during normal operation also mirrors how a real product would accumulate
++diagnostic state.
++
++Temporary file and rename
++-------------------------
++
++The report is written to
++
++  <dir>/crashrpt.tmp
++
++and only after the write has completed and been flushed with fsync() is it
++renamed to
++
++  <dir>/crashrpt_r<n>.bin
++
++A reader therefore never observes a partially written report.  The final
++name either exists and is complete, or it does not exist at all.  If any
++step fails the temporary file is removed.
++
++File format
++-----------
++
++  Header, 32 bytes
++    magic     u32   0x54505243, "CRPT"
++    version   u32
++    reason    u32   the reason code passed by the kernel
++    n48       u32   number of 48 byte nodes
++    n64       u32   number of 64 byte nodes
++    sz48      u32   sizeof the 48 byte node
++    sz64      u32   sizeof the 64 byte node
++    reserved  u32
++
++  Then n48 records:
++    node      48 bytes, raw
++    msglen    u8
++    msg       msglen bytes, no terminator
++
++  Then n64 records:
++    node      64 bytes, raw
++    msglen    u8
++    msg       msglen bytes, no terminator
++
++The message pointer inside each node is zeroed in the copy that is written,
++since its value has no meaning outside the running process.  This also keeps
++the output reproducible.
++
++A one byte length field is sufficient because the message is capped at 255
++bytes.
++
++Largest possible report:
++
++  32 + 500 * (48 + 1 + 255) + 50 * (64 + 1 + 255) = 168032 bytes
++
++Actual size is smaller, as message lengths cycle through 32, 96, 160 and 255
++so that the boundary case is exercised regularly.
++
++Usage
++-----
++
++From TASH:
++
++  crashrpt_test init      Build the data and register the reporter
++  crashrpt_test status    Show current state and the largest possible report
++  crashrpt_test crash     Raise an assert to exercise the whole path
++
++A normal run looks like:
++
++  TASH>> crashrpt_test init
++  crashrpt_test: built 500 nodes of 48 bytes and 50 nodes of 64 bytes
++  crashrpt_test: reporter registered and waiting
++  crashrpt_test: ready, run 'crashrpt_test crash' to exercise it
++
++  TASH>> crashrpt_test crash
++  crashrpt_test: asserting now, the reporter should run before reboot
++  crashrpt_test: woken, reason 2
++  crashrpt_test: report written to /mnt/crashrpt_r0.bin
++  ... assert output follows, then the board reboots ...
++
++Configuration
++-------------
++
++  CONFIG_CRASH_REPORT                     required, kernel side
++  CONFIG_EXAMPLES_CRASHRPT_TEST           this example
++  CONFIG_EXAMPLES_CRASHRPT_TEST_DIR       where the report is written
++  CONFIG_EXAMPLES_CRASHRPT_TEST_PRIORITY  reporter priority, must be high
++  CONFIG_EXAMPLES_CRASHRPT_TEST_STACKSIZE reporter stack
++
++The directory must be a writable mount point.  On a real product a raw
++partition or an append only log is safer than a mounted filesystem, since
++writing to one straight after a crash risks corrupting it.
++
++Notes
++-----
++
++The node sizes are checked at run time before anything else happens.  They
++depend on the pointer size, so on a target where a pointer is not four bytes
++the structures would need adjusting and the check will say so rather than
++silently writing a different format.
++
++Hardware faults and asserts raised from interrupt context do not reach the
++reporter.  By then the exception context has been taken and the scheduler
++cannot run it.  Those cases need data published before the fault.
+diff --git a/apps/examples/crashrpt_test/crashrpt_test_main.c b/apps/examples/crashrpt_test/crashrpt_test_main.c
+new file mode 100644
+index 00000000..57e9e711
+--- /dev/null
++++ b/apps/examples/crashrpt_test/crashrpt_test_main.c
+@@ -0,0 +1,653 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++/****************************************************************************
++ * apps/examples/crashrpt_test/crashrpt_test_main.c
++ *
++ * Demonstration of the crash diagnostic capture driver, /dev/crashrpt.
++ *
++ * The example keeps a body of diagnostic data in memory - 500 nodes of 48
++ * bytes and 50 nodes of 64 bytes, each carrying a message string of up to
++ * 255 bytes - and registers a reporter thread that serialises all of it to
++ * a file when the system is about to assert.
++ *
++ * The data is built once at start-up rather than at crash time.  This is
++ * deliberate: allocating several hundred blocks while the system is on its
++ * way down is exactly the kind of work that should not be attempted.  It
++ * also mirrors how a real product would hold diagnostic state that it
++ * accumulates during normal operation.
++ *
++ * The reporter writes to a temporary file and renames it only after the
++ * write has completed and been flushed.  A reader therefore never observes
++ * a partially written report - the final name either exists and is complete,
++ * or does not exist at all.
++ *
++ * Usage from TASH:
++ *
++ *   crashrpt_test init      Build the data, start and register the reporter
++ *   crashrpt_test status    Show what is registered and how large a report
++ *                           would be
++ *   crashrpt_test crash     Raise an assert to exercise the whole path
++ *
++ ****************************************************************************/
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <string.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <errno.h>
++#include <time.h>
++#include <assert.h>
++#include <pthread.h>
++#include <sched.h>
++#include <sys/types.h>
++#include <sys/ioctl.h>
++#include <sys/stat.h>
++
++#include <tinyara/irq.h>
++#include <tinyara/crashrpt.h>
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++#ifndef CONFIG_EXAMPLES_CRASHRPT_TEST_DIR
++#define CONFIG_EXAMPLES_CRASHRPT_TEST_DIR   "/mnt"
++#endif
++
++#ifndef CONFIG_EXAMPLES_CRASHRPT_TEST_PRIORITY
++#define CONFIG_EXAMPLES_CRASHRPT_TEST_PRIORITY  (SCHED_PRIORITY_MAX - 1)
++#endif
++
++#ifndef CONFIG_EXAMPLES_CRASHRPT_TEST_STACKSIZE
++#define CONFIG_EXAMPLES_CRASHRPT_TEST_STACKSIZE 8192
++#endif
++
++#define CRTEST_TMP_PATH     CONFIG_EXAMPLES_CRASHRPT_TEST_DIR "/crashrpt.tmp"
++#define CRTEST_FINAL_FMT    CONFIG_EXAMPLES_CRASHRPT_TEST_DIR "/crashrpt_r%d.bin"
++
++#define CRTEST_N48          500		/* Number of 48 byte nodes */
++#define CRTEST_N64          50		/* Number of 64 byte nodes */
++
++#define CRTEST_MSG_MAX      255		/* Longest message, excluding NUL */
++
++#define CRTEST_MAGIC        0x54505243	/* "CRPT" little endian */
++#define CRTEST_VERSION      1
++
++/* Bytes written per record: the node itself, a one byte length, then the
++ * message.  A one byte length is sufficient because the message is capped
++ * at 255.
++ */
++
++#define CRTEST_REC48_MAX    (sizeof(struct crtest_node48_s) + 1 + CRTEST_MSG_MAX)
++#define CRTEST_REC64_MAX    (sizeof(struct crtest_node64_s) + 1 + CRTEST_MSG_MAX)
++
++/****************************************************************************
++ * Private Types
++ ****************************************************************************/
++
++/* Exactly 48 bytes on a 32 bit target.  The layout is checked below. */
++
++struct crtest_node48_s {
++	uint32_t id;				/*  0 ..  3 */
++	uint32_t seq;				/*  4 ..  7 */
++	uint32_t timestamp;			/*  8 .. 11 */
++	uint32_t value;				/* 12 .. 15 */
++	uint16_t type;				/* 16 .. 17 */
++	uint16_t flags;				/* 18 .. 19 */
++	uint32_t reserved[6];		/* 20 .. 43 */
++	char *msg;					/* 44 .. 47 */
++};
++
++/* Exactly 64 bytes on a 32 bit target. */
++
++struct crtest_node64_s {
++	uint32_t id;				/*  0 ..  3 */
++	uint32_t seq;				/*  4 ..  7 */
++	uint64_t timestamp;			/*  8 .. 15 */
++	uint32_t value;				/* 16 .. 19 */
++	uint32_t status;			/* 20 .. 23 */
++	uint16_t type;				/* 24 .. 25 */
++	uint16_t flags;				/* 26 .. 27 */
++	uint32_t reserved[8];		/* 28 .. 59 */
++	char *msg;					/* 60 .. 63 */
++};
++
++/* On-disk header. */
++
++struct crtest_hdr_s {
++	uint32_t magic;
++	uint32_t version;
++	uint32_t reason;
++	uint32_t n48;
++	uint32_t n64;
++	uint32_t sz48;
++	uint32_t sz64;
++	uint32_t reserved;
++};
++
++/****************************************************************************
++ * Private Data
++ ****************************************************************************/
++
++static struct crtest_node48_s *g_node48;
++static struct crtest_node64_s *g_node64;
++static bool g_data_ready;
++
++static int g_crashrpt_fd = -1;
++static pthread_t g_reporter;
++static bool g_reporter_running;
++
++/* Sequence number so repeated reports do not overwrite one another. */
++
++static int g_report_seq;
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: crtest_verify_layout
++ *
++ * Description:
++ *   The sizes are part of the requirement, so check them rather than assume
++ *   the compiler laid the structures out as intended.  A mismatch here would
++ *   silently change the file format.
++ *
++ ****************************************************************************/
++
++static int crtest_verify_layout(void)
++{
++	if (sizeof(struct crtest_node48_s) != 48) {
++		printf("crashrpt_test: node48 is %d bytes, expected 48\n", (int)sizeof(struct crtest_node48_s));
++		return ERROR;
++	}
++
++	if (sizeof(struct crtest_node64_s) != 64) {
++		printf("crashrpt_test: node64 is %d bytes, expected 64\n", (int)sizeof(struct crtest_node64_s));
++		return ERROR;
++	}
++
++	return OK;
++}
++
++/****************************************************************************
++ * Name: crtest_make_message
++ *
++ * Description:
++ *   Build a message of a varying but bounded length.  Lengths cycle so that
++ *   the short, typical and maximum cases are all exercised, and the content
++ *   encodes the node identity so a corrupted report is recognisable.
++ *
++ ****************************************************************************/
++
++static char *crtest_make_message(const char *kind, uint32_t id)
++{
++	char *msg;
++	size_t want;
++	int used;
++
++	/* Cycle 32, 96, 160, 255 so the 255 byte boundary is hit regularly. */
++
++	static const size_t lengths[] = { 32, 96, 160, CRTEST_MSG_MAX };
++	want = lengths[id & 3];
++
++	msg = (char *)malloc(want + 1);
++	if (msg == NULL) {
++		return NULL;
++	}
++
++	used = snprintf(msg, want + 1, "%s node %u: diagnostic record captured during normal operation ", kind, (unsigned int)id);
++	if (used < 0) {
++		free(msg);
++		return NULL;
++	}
++
++	/* Pad out to the intended length so the length distribution is exact. */
++
++	if ((size_t)used < want) {
++		memset(msg + used, '.', want - used);
++	}
++	msg[want] = '\0';
++
++	return msg;
++}
++
++/****************************************************************************
++ * Name: crtest_build_data
++ *
++ * Description:
++ *   Populate the node arrays.  Done once, at start-up, while the system is
++ *   healthy.
++ *
++ ****************************************************************************/
++
++static int crtest_build_data(void)
++{
++	uint32_t i;
++
++	if (g_data_ready) {
++		return OK;
++	}
++
++	g_node48 = (struct crtest_node48_s *)calloc(CRTEST_N48, sizeof(struct crtest_node48_s));
++	if (g_node48 == NULL) {
++		printf("crashrpt_test: out of memory for 48 byte nodes\n");
++		return ERROR;
++	}
++
++	g_node64 = (struct crtest_node64_s *)calloc(CRTEST_N64, sizeof(struct crtest_node64_s));
++	if (g_node64 == NULL) {
++		printf("crashrpt_test: out of memory for 64 byte nodes\n");
++		free(g_node48);
++		g_node48 = NULL;
++		return ERROR;
++	}
++
++	for (i = 0; i < CRTEST_N48; i++) {
++		g_node48[i].id = i;
++		g_node48[i].seq = i * 3u;
++		g_node48[i].timestamp = (uint32_t)time(NULL) + i;
++		g_node48[i].value = 0xa5a50000u | i;
++		g_node48[i].type = 48;
++		g_node48[i].flags = (uint16_t)(i & 0xffu);
++		g_node48[i].msg = crtest_make_message("small", i);
++
++		if (g_node48[i].msg == NULL) {
++			printf("crashrpt_test: out of memory for message %u\n", (unsigned int)i);
++			return ERROR;
++		}
++	}
++
++	for (i = 0; i < CRTEST_N64; i++) {
++		g_node64[i].id = i;
++		g_node64[i].seq = i * 7u;
++		g_node64[i].timestamp = (uint64_t)time(NULL) + i;
++		g_node64[i].value = 0x5a5a0000u | i;
++		g_node64[i].status = i;
++		g_node64[i].type = 64;
++		g_node64[i].flags = (uint16_t)(i & 0xffu);
++		g_node64[i].msg = crtest_make_message("large", i);
++
++		if (g_node64[i].msg == NULL) {
++			printf("crashrpt_test: out of memory for message %u\n", (unsigned int)i);
++			return ERROR;
++		}
++	}
++
++	g_data_ready = true;
++
++	printf("crashrpt_test: built %d nodes of %d bytes and %d nodes of %d bytes\n",
++		   CRTEST_N48, (int)sizeof(struct crtest_node48_s), CRTEST_N64, (int)sizeof(struct crtest_node64_s));
++
++	return OK;
++}
++
++/****************************************************************************
++ * Name: crtest_write_all
++ *
++ * Description:
++ *   write() may return short.  Loop until everything is out or an error is
++ *   returned that is not a signal interruption.
++ *
++ ****************************************************************************/
++
++static int crtest_write_all(int fd, const void *buf, size_t len)
++{
++	const uint8_t *p = (const uint8_t *)buf;
++	ssize_t n;
++
++	while (len > 0) {
++		n = write(fd, p, len);
++		if (n < 0) {
++			if (errno == EINTR) {
++				continue;
++			}
++			return ERROR;
++		}
++
++		p += n;
++		len -= n;
++	}
++
++	return OK;
++}
++
++/****************************************************************************
++ * Name: crtest_write_record
++ *
++ * Description:
++ *   Serialise one node followed by its message.
++ *
++ *   The message pointer inside the node is meaningless outside this process,
++ *   so it is zeroed in the copy that goes to the file.  The message itself
++ *   follows the node, preceded by a single length byte.
++ *
++ ****************************************************************************/
++
++static int crtest_write_record(int fd, const void *node, size_t node_sz, const char *msg, size_t msg_off)
++{
++	uint8_t buf[CRTEST_REC64_MAX];
++	size_t msg_len;
++	size_t total;
++
++	memcpy(buf, node, node_sz);
++
++	/* Blank the pointer field so the file is reproducible. */
++
++	memset(buf + msg_off, 0, sizeof(char *));
++
++	msg_len = (msg != NULL) ? strnlen(msg, CRTEST_MSG_MAX) : 0;
++
++	buf[node_sz] = (uint8_t)msg_len;
++	total = node_sz + 1;
++
++	if (msg_len > 0) {
++		memcpy(buf + total, msg, msg_len);
++		total += msg_len;
++	}
++
++	return crtest_write_all(fd, buf, total);
++}
++
++/****************************************************************************
++ * Name: crtest_write_report
++ *
++ * Description:
++ *   Write the whole report to a temporary file, flush it, close it, and only
++ *   then move it to its final name.
++ *
++ *   This is the part that runs while the system is on its way down, so it
++ *   does no allocation and touches nothing that has not already been set up.
++ *
++ ****************************************************************************/
++
++static int crtest_write_report(int reason)
++{
++	struct crtest_hdr_s hdr;
++	char final_path[64];
++	int fd;
++	uint32_t i;
++	int ret = ERROR;
++
++	if (!g_data_ready) {
++		printf("crashrpt_test: no data to report\n");
++		return ERROR;
++	}
++
++	fd = open(CRTEST_TMP_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
++	if (fd < 0) {
++		printf("crashrpt_test: cannot open %s, errno %d\n", CRTEST_TMP_PATH, errno);
++		return ERROR;
++	}
++
++	hdr.magic = CRTEST_MAGIC;
++	hdr.version = CRTEST_VERSION;
++	hdr.reason = (uint32_t)reason;
++	hdr.n48 = CRTEST_N48;
++	hdr.n64 = CRTEST_N64;
++	hdr.sz48 = sizeof(struct crtest_node48_s);
++	hdr.sz64 = sizeof(struct crtest_node64_s);
++	hdr.reserved = 0;
++
++	if (crtest_write_all(fd, &hdr, sizeof(hdr)) != OK) {
++		printf("crashrpt_test: header write failed, errno %d\n", errno);
++		goto errout;
++	}
++
++	for (i = 0; i < CRTEST_N48; i++) {
++		if (crtest_write_record(fd, &g_node48[i], sizeof(struct crtest_node48_s),
++								g_node48[i].msg, offsetof(struct crtest_node48_s, msg)) != OK) {
++			printf("crashrpt_test: 48 byte record %u failed, errno %d\n", (unsigned int)i, errno);
++			goto errout;
++		}
++	}
++
++	for (i = 0; i < CRTEST_N64; i++) {
++		if (crtest_write_record(fd, &g_node64[i], sizeof(struct crtest_node64_s),
++								g_node64[i].msg, offsetof(struct crtest_node64_s, msg)) != OK) {
++			printf("crashrpt_test: 64 byte record %u failed, errno %d\n", (unsigned int)i, errno);
++			goto errout;
++		}
++	}
++
++	/* Get it onto the medium before the name is published. */
++
++	if (fsync(fd) < 0) {
++		printf("crashrpt_test: fsync failed, errno %d\n", errno);
++		goto errout;
++	}
++
++	close(fd);
++	fd = -1;
++
++	/* Publish.  Until this succeeds no reader can see a partial report. */
++
++	snprintf(final_path, sizeof(final_path), CRTEST_FINAL_FMT, g_report_seq++);
++
++	if (rename(CRTEST_TMP_PATH, final_path) < 0) {
++		printf("crashrpt_test: rename to %s failed, errno %d\n", final_path, errno);
++		unlink(CRTEST_TMP_PATH);
++		return ERROR;
++	}
++
++	printf("crashrpt_test: report written to %s\n", final_path);
++	return OK;
++
++errout:
++	if (fd >= 0) {
++		close(fd);
++	}
++
++	unlink(CRTEST_TMP_PATH);
++	return ret;
++}
++
++/****************************************************************************
++ * Name: crtest_reporter_thread
++ *
++ * Description:
++ *   Registers itself with the driver and then parks in fin_wait().  It is
++ *   woken from the top of up_assert(), writes the report, and tells the
++ *   driver it is finished so that assert handling can continue.
++ *
++ ****************************************************************************/
++
++static void *crtest_reporter_thread(void *arg)
++{
++	int reason;
++
++	if (ioctl(g_crashrpt_fd, CRASHRPTIOC_REGISTER, 0) < 0) {
++		printf("crashrpt_test: register failed, errno %d\n", errno);
++		g_reporter_running = false;
++		return NULL;
++	}
++
++	printf("crashrpt_test: reporter registered and waiting\n");
++
++	for (;;) {
++		/* Parks here until the kernel wakes us.  There is no timeout - the
++		 * thread is meant to wait indefinitely for a crash that may never
++		 * come.
++		 */
++
++		reason = fin_wait();
++
++		printf("crashrpt_test: woken, reason %d\n", reason);
++
++		(void)crtest_write_report(reason);
++
++		/* Release the asserting thread whether or not the write succeeded.
++		 * Holding it up buys nothing and only delays the reboot.
++		 */
++
++		if (ioctl(g_crashrpt_fd, CRASHRPTIOC_DONE, 0) < 0) {
++			printf("crashrpt_test: done notification failed, errno %d\n", errno);
++		}
++	}
++
++	return NULL;
++}
++
++/****************************************************************************
++ * Name: crtest_start_reporter
++ ****************************************************************************/
++
++static int crtest_start_reporter(void)
++{
++	pthread_attr_t attr;
++	struct sched_param param;
++	int ret;
++
++	if (g_reporter_running) {
++		printf("crashrpt_test: reporter already running\n");
++		return OK;
++	}
++
++	g_crashrpt_fd = open(CRASHRPT_DEVPATH, O_RDWR);
++	if (g_crashrpt_fd < 0) {
++		printf("crashrpt_test: cannot open %s, errno %d\n", CRASHRPT_DEVPATH, errno);
++		printf("crashrpt_test: is CONFIG_CRASH_REPORT enabled?\n");
++		return ERROR;
++	}
++
++	pthread_attr_init(&attr);
++	pthread_attr_setstacksize(&attr, CONFIG_EXAMPLES_CRASHRPT_TEST_STACKSIZE);
++
++	/* High priority is a requirement, not a preference.  The reporter has to
++	 * outrank everything else runnable or the deadline expires before it is
++	 * scheduled.
++	 */
++
++	param.sched_priority = CONFIG_EXAMPLES_CRASHRPT_TEST_PRIORITY;
++	pthread_attr_setschedparam(&attr, &param);
++
++	ret = pthread_create(&g_reporter, &attr, crtest_reporter_thread, NULL);
++	if (ret != 0) {
++		printf("crashrpt_test: pthread_create failed, %d\n", ret);
++		close(g_crashrpt_fd);
++		g_crashrpt_fd = -1;
++		return ERROR;
++	}
++
++	pthread_setname_np(g_reporter, "crashrpt_reporter");
++	pthread_detach(g_reporter);
++
++	g_reporter_running = true;
++	return OK;
++}
++
++/****************************************************************************
++ * Name: crtest_status
++ ****************************************************************************/
++
++static void crtest_status(void)
++{
++	size_t est;
++
++	printf("crashrpt_test status\n");
++	printf("  node48 size      : %d bytes x %d\n", (int)sizeof(struct crtest_node48_s), CRTEST_N48);
++	printf("  node64 size      : %d bytes x %d\n", (int)sizeof(struct crtest_node64_s), CRTEST_N64);
++	printf("  message maximum  : %d bytes\n", CRTEST_MSG_MAX);
++	printf("  data built       : %s\n", g_data_ready ? "yes" : "no");
++	printf("  reporter running : %s\n", g_reporter_running ? "yes" : "no");
++	printf("  temporary file   : %s\n", CRTEST_TMP_PATH);
++
++	est = sizeof(struct crtest_hdr_s) + (CRTEST_N48 * CRTEST_REC48_MAX) + (CRTEST_N64 * CRTEST_REC64_MAX);
++	printf("  report at most   : %d bytes\n", (int)est);
++}
++
++/****************************************************************************
++ * Name: crtest_usage
++ ****************************************************************************/
++
++static void crtest_usage(void)
++{
++	printf("Usage: crashrpt_test <init|status|crash>\n");
++	printf("  init    build the diagnostic data and register the reporter\n");
++	printf("  status  show current state and the largest possible report\n");
++	printf("  crash   raise an assert to exercise the capture path\n");
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: crashrpt_test_main
++ ****************************************************************************/
++
++#ifdef CONFIG_BUILD_KERNEL
++int main(int argc, FAR char *argv[])
++#else
++int crashrpt_test_main(int argc, char *argv[])
++#endif
++{
++	if (argc < 2) {
++		crtest_usage();
++		return 0;
++	}
++
++	if (crtest_verify_layout() != OK) {
++		return ERROR;
++	}
++
++	if (strcmp(argv[1], "init") == 0) {
++		if (crtest_build_data() != OK) {
++			return ERROR;
++		}
++
++		if (crtest_start_reporter() != OK) {
++			return ERROR;
++		}
++
++		printf("crashrpt_test: ready, run 'crashrpt_test crash' to exercise it\n");
++
++	} else if (strcmp(argv[1], "status") == 0) {
++		crtest_status();
++
++	} else if (strcmp(argv[1], "crash") == 0) {
++		if (!g_reporter_running) {
++			printf("crashrpt_test: run 'crashrpt_test init' first\n");
++			return ERROR;
++		}
++
++		printf("crashrpt_test: asserting now, the reporter should run before reboot\n");
++
++		/* The assert reaches up_assert() through the ordinary system call
++		 * path, so the hook at the top of that function sees a healthy
++		 * system and can hand control to the reporter.
++		 */
++
++		ASSERT(0);
++
++	} else {
++		crtest_usage();
++	}
++
++	return 0;
++}
