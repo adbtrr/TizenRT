@@ -34,6 +34,7 @@
 #include <sys/types.h>
 
 #include "stc_sem_common.h"
+#include "stc_sem_monitor.h"
 
 /****************************************************************************
  * Private Data
@@ -197,6 +198,13 @@ int stc_reset(void)
 	g_stc_spin_stop = false;
 	g_stc_spin_count = 0;
 
+	/* Every scenario starts with an empty monitor registry and a zero
+	 * violation count, so a violation is always attributable to the scenario
+	 * that reports it.
+	 */
+
+	stc_mon_clear();
+
 	/* Initial value 0 makes each of these a signalling semaphore, so the
 	 * handshake machinery records no holders and cannot boost anybody.
 	 */
@@ -286,6 +294,14 @@ pid_t stc_spawn(const char *name, int prio, main_t entry, int slot)
 	g_stc_actor[slot].finished = false;
 
 	stc_pin(pid);
+
+	/* Register with the boost-leak monitor.  Doing it here means every
+	 * scenario built on this harness is monitored without writing a line for
+	 * it, and the recorded base priority is the true creation priority rather
+	 * than anything read back from the kernel.
+	 */
+
+	stc_mon_register_actor(pid, prio);
 
 	return pid;
 }

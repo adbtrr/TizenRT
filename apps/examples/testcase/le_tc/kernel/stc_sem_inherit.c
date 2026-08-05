@@ -56,6 +56,7 @@
 #include "tc_common.h"
 #include "tc_internal.h"
 #include "stc_sem_common.h"
+#include "stc_sem_monitor.h"
 
 #ifdef CONFIG_PRIORITY_INHERITANCE
 
@@ -262,6 +263,10 @@ static int scenario_begin(int initial_count)
 		return ERROR;
 	}
 
+	/* Let the boost-leak monitor tell a justified boost from a leaked one. */
+
+	stc_mon_register_sem(&g_target);
+
 	return OK;
 }
 
@@ -356,6 +361,7 @@ static int release_waiter(int slot, int final_count)
 
 static void stc_sem_pi01_boost_and_restore(void)
 {
+	uint32_t violations;
 	int ret;
 	int prio;
 
@@ -390,6 +396,9 @@ static void stc_sem_pi01_boost_and_restore(void)
 	ret = stc_wait_finished(SLOT_WAITER);
 	TC_ASSERT_EQ_CLEANUP("pi01_waiter_done", ret, OK, scenario_end());
 
+	violations = stc_mon_violations();
+	TC_ASSERT_EQ_CLEANUP("pi01_no_boost_leak", violations, 0, scenario_end());
+
 	ret = scenario_end();
 	TC_ASSERT_EQ("pi01_no_leaked_actor", ret, 0);
 
@@ -415,6 +424,7 @@ static void stc_sem_pi01_boost_and_restore(void)
 
 static void stc_sem_pi02_no_boost_for_equal_or_lower(void)
 {
+	uint32_t violations;
 	int ret;
 	int prio;
 
@@ -457,6 +467,9 @@ static void stc_sem_pi02_no_boost_for_equal_or_lower(void)
 	ret = release_waiter(SLOT_WAITER, 1);
 	TC_ASSERT_EQ_CLEANUP("pi02_drained2", ret, OK, scenario_end());
 
+	violations = stc_mon_violations();
+	TC_ASSERT_EQ_CLEANUP("pi02_no_boost_leak", violations, 0, scenario_end());
+
 	ret = scenario_end();
 	TC_ASSERT_EQ("pi02_no_leaked_actor2", ret, 0);
 
@@ -476,6 +489,7 @@ static void stc_sem_pi02_no_boost_for_equal_or_lower(void)
 
 static void stc_sem_pi03_tracks_highest_waiter(void)
 {
+	uint32_t violations;
 	int ret;
 	int prio;
 	pid_t pid;
@@ -512,6 +526,9 @@ static void stc_sem_pi03_tracks_highest_waiter(void)
 	ret = release_waiter(SLOT_WAITER, 1);
 	TC_ASSERT_EQ_CLEANUP("pi03_h_drained", ret, OK, scenario_end());
 
+	violations = stc_mon_violations();
+	TC_ASSERT_EQ_CLEANUP("pi03_no_boost_leak", violations, 0, scenario_end());
+
 	ret = scenario_end();
 	TC_ASSERT_EQ("pi03_no_leaked_actor", ret, 0);
 
@@ -540,6 +557,7 @@ static void stc_sem_pi03_tracks_highest_waiter(void)
 
 static void stc_sem_pi04_inversion_is_bounded(void)
 {
+	uint32_t violations;
 	int ret;
 	int prio;
 	pid_t pid;
@@ -590,6 +608,9 @@ static void stc_sem_pi04_inversion_is_bounded(void)
 
 	ret = stc_wait_finished(SLOT_SPINNER);
 	TC_ASSERT_EQ_CLEANUP("pi04_spinner_stopped", ret, OK, scenario_end());
+
+	violations = stc_mon_violations();
+	TC_ASSERT_EQ_CLEANUP("pi04_no_boost_leak", violations, 0, scenario_end());
 
 	ret = scenario_end();
 	TC_ASSERT_EQ("pi04_no_leaked_actor", ret, 0);
@@ -650,6 +671,7 @@ static int three_holders_and_waiter(void)
 
 static void stc_sem_pi05_all_holders_boosted(void)
 {
+	uint32_t violations;
 	int ret;
 	int prio;
 
@@ -685,6 +707,9 @@ static void stc_sem_pi05_all_holders_boosted(void)
 	ret = release_waiter(SLOT_WAITER, 3);
 	TC_ASSERT_EQ_CLEANUP("pi05_drained", ret, OK, scenario_end());
 
+	violations = stc_mon_violations();
+	TC_ASSERT_EQ_CLEANUP("pi05_no_boost_leak", violations, 0, scenario_end());
+
 	ret = scenario_end();
 	TC_ASSERT_EQ("pi05_no_leaked_actor", ret, 0);
 
@@ -712,6 +737,7 @@ static void stc_sem_pi05_all_holders_boosted(void)
 
 static void stc_sem_pi06_all_holders_restored(void)
 {
+	uint32_t violations;
 	int ret;
 	int prio;
 
@@ -745,6 +771,9 @@ static void stc_sem_pi06_all_holders_restored(void)
 	ret = release_waiter(SLOT_WAITER, 3);
 	TC_ASSERT_EQ_CLEANUP("pi06_drained", ret, OK, scenario_end());
 
+	violations = stc_mon_violations();
+	TC_ASSERT_EQ_CLEANUP("pi06_no_boost_leak", violations, 0, scenario_end());
+
 	ret = scenario_end();
 	TC_ASSERT_EQ("pi06_no_leaked_actor", ret, 0);
 
@@ -767,6 +796,18 @@ int stc_sem_inherit_main(void)
 		return ERROR;
 	}
 
+	/* Catalogue section 8.2: the monitor runs alongside every other scenario,
+	 * so each one below reports both its own oracle and any priority leak the
+	 * monitor observed while it ran.
+	 */
+
+	if (stc_mon_start() != OK) {
+		printf("\n[stc_sem_inherit] FAIL : cannot start the boost-leak monitor\n");
+		total_fail++;
+		stc_harness_end();
+		return ERROR;
+	}
+
 	stc_sem_pi01_boost_and_restore();
 	stc_sem_pi02_no_boost_for_equal_or_lower();
 	stc_sem_pi03_tracks_highest_waiter();
@@ -774,6 +815,7 @@ int stc_sem_inherit_main(void)
 	stc_sem_pi05_all_holders_boosted();
 	stc_sem_pi06_all_holders_restored();
 
+	stc_mon_stop();
 	stc_harness_end();
 
 	return OK;

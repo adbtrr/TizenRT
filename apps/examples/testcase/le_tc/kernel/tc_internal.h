@@ -84,6 +84,7 @@ int roundrobin_main(void);
 int sched_main(void);
 int semaphore_main(void);
 int stc_sem_inherit_main(void);
+int stc_sem_monitor_main(void);
 int signal_main(void);
 int debug_main(void);
 int task_main(void);
