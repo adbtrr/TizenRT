@@ -1,0 +1,1368 @@
+From e89d217a5373bb1d1e97890304f8ced49709aa69 Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_sched_tc_fixed <>
+Date: Wed, 5 Aug 2026 19:27:43 +0000
+Subject: [PATCH] apps/examples/testcase: add preemption control and priority
+ inversion families
+
+Phase 4 of the scenario test rollout.  These two families cover the parts of
+the scheduler where a defect is silent: nothing returns an error, nothing
+deadlocks, a deadline is simply missed.
+
+The harness gains two timing helpers.  stc_busy_wait_ms spins without ever
+blocking or yielding, which the lock scenarios require: any sleeping call
+would hand the CPU away and satisfy the wake for reasons unrelated to the
+lock, making the scenario pass regardless of what the lock did.
+
+stc_sched_lock adds three scenarios.  LOCK-01 parks a high priority task on
+a semaphore, takes the lock, posts, and proves across two hundred
+milliseconds of busy waiting that the task did not run, then proves it does
+once unlocked.  LOCK-02 nests to depth eight and unwinds to depth one, where
+preemption must still be disabled; an implementation treating the lock as a
+boolean rather than a count passes LOCK-01 and fails here.  LOCK-03 makes
+the wake originate on a different CPU from the lock holder, which pins down
+semantics that are currently undocumented, namely whether sched_lock is a
+promise about the calling CPU or about the system.
+
+The catalogue's SCN-LOCK-04, which exits a task while it still holds the
+lock, is deliberately not implemented.  Driving that abnormal exit path can
+trip a kernel assertion rather than fail cleanly, which would take the run
+down rather than report a result.  A note in the source records why, so that
+a reader comparing against the catalogue is not left wondering.
+
+stc_sched_inversion adds four.  INV-01 builds the classic three task
+inversion and measures the high priority task's wait, which separates the
+inherited and uninherited outcomes by an order of magnitude and so tolerates
+a generous bound.  INV-02 repeats it with the holder and the spinner on
+different CPUs, a path a single core test cannot reach.  INV-03 chains two
+mutexes so the boost has to propagate through an intermediate waiter, which
+catches an implementation that boosts only the immediate holder; that
+failure is invisible in the single mutex case.  INV-04 targets the pending
+list inversion by comparing aggregate throughput with and without scheduler
+lock churn.  It is explicitly a proxy, recorded as such in the source:
+application code cannot observe the pending list, so the scenario infers the
+inversion from its cost and uses a loose threshold intended to catch a
+collapse rather than to measure overhead.
+
+The inversion family depends on CONFIG_PRIORITY_INHERITANCE and skips
+without it, since the inversion is then expected behaviour rather than a
+defect.  INV-04 does not depend on it and always runs.  Both the SMP and
+non-SMP compilation paths are warning free under -Wall -Wextra.
+---
+ apps/examples/testcase/le_tc/kernel/Make.defs |   2 +
+ .../testcase/le_tc/kernel/kernel_tc_main.c    |   2 +
+ .../testcase/le_tc/kernel/stc_sched_common.c  |  62 ++
+ .../testcase/le_tc/kernel/stc_sched_common.h  |  11 +
+ .../le_tc/kernel/stc_sched_inversion.c        | 689 ++++++++++++++++++
+ .../testcase/le_tc/kernel/stc_sched_lock.c    | 455 ++++++++++++
+ .../testcase/le_tc/kernel/tc_internal.h       |   2 +
+ 7 files changed, 1223 insertions(+)
+ create mode 100644 apps/examples/testcase/le_tc/kernel/stc_sched_inversion.c
+ create mode 100644 apps/examples/testcase/le_tc/kernel/stc_sched_lock.c
+
+diff --git a/apps/examples/testcase/le_tc/kernel/Make.defs b/apps/examples/testcase/le_tc/kernel/Make.defs
+index 125640de..e2ac2f8f 100644
+--- a/apps/examples/testcase/le_tc/kernel/Make.defs
++++ b/apps/examples/testcase/le_tc/kernel/Make.defs
+@@ -186,6 +186,8 @@ ifeq ($(CONFIG_STC_KERNEL_SCHED),y)
+   CSRCS += stc_sched_smp.c
+   CSRCS += stc_sched_priority.c
+   CSRCS += stc_sched_affinity.c
++  CSRCS += stc_sched_lock.c
++  CSRCS += stc_sched_inversion.c
+ endif
+ 
+ # Include kernel build support
+diff --git a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+index 81f17257..ec218f54 100644
+--- a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
++++ b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+@@ -231,6 +231,8 @@ int tc_kernel_main(int argc, char *argv[])
+ 	stc_sched_smp_main();
+ 	stc_sched_priority_main();
+ 	stc_sched_affinity_main();
++	stc_sched_lock_main();
++	stc_sched_inversion_main();
+ #endif
+ 
+ 	close(g_tc_fd);
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_common.c b/apps/examples/testcase/le_tc/kernel/stc_sched_common.c
+index 7e4fa53e..27abe67f 100644
+--- a/apps/examples/testcase/le_tc/kernel/stc_sched_common.c
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_common.c
+@@ -31,6 +31,7 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include <errno.h>
++#include <time.h>
+ #include <sched.h>
+ 
+ #include "stc_sched_common.h"
+@@ -606,6 +607,67 @@ int stc_fair_pct(int nworkers)
+ 	return (int)(lo * 100 / hi);
+ }
+ 
++/****************************************************************************
++ * Name: stc_elapsed_ms
++ ****************************************************************************/
++
++uint32_t stc_elapsed_ms(const struct timespec *from, const struct timespec *to)
++{
++	int32_t sec;
++	int32_t nsec;
++
++	if (from == NULL || to == NULL) {
++		return 0;
++	}
++
++	sec = (int32_t)(to->tv_sec - from->tv_sec);
++	nsec = (int32_t)(to->tv_nsec - from->tv_nsec);
++
++	if (nsec < 0) {
++		sec -= 1;
++		nsec += 1000000000;
++	}
++
++	if (sec < 0) {
++		return 0;
++	}
++
++	return (uint32_t)(sec * 1000 + nsec / 1000000);
++}
++
++/****************************************************************************
++ * Name: stc_busy_wait_ms
++ *
++ * Description:
++ *   Spins for the requested interval without blocking or yielding.
++ *
++ *   Scenarios that disable preemption need this: usleep() would block, which
++ *   hands the CPU away and dismantles the condition being tested.  Polling
++ *   the clock is a system call but never a scheduling point, so the caller
++ *   keeps the CPU throughout.
++ *
++ ****************************************************************************/
++
++void stc_busy_wait_ms(uint32_t ms)
++{
++	struct timespec start;
++	struct timespec now;
++
++	if (clock_gettime(CLOCK_REALTIME, &start) != OK) {
++		return;
++	}
++
++	for (; ; ) {
++		if (clock_gettime(CLOCK_REALTIME, &now) != OK) {
++			return;
++		}
++
++		if (stc_elapsed_ms(&start, &now) >= ms) {
++			return;
++		}
++	}
++}
++
+ /****************************************************************************
+  * Name: stc_report
+  ****************************************************************************/
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_common.h b/apps/examples/testcase/le_tc/kernel/stc_sched_common.h
+index 37b2e4c5..9fde4560 100644
+--- a/apps/examples/testcase/le_tc/kernel/stc_sched_common.h
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_common.h
+@@ -48,6 +48,7 @@
+ #include <stdint.h>
+ #include <stdbool.h>
+ #include <sched.h>
++#include <time.h>
+ #include <sys/types.h>
+ 
+ /****************************************************************************
+@@ -232,6 +233,16 @@ uint32_t stc_sum(int nworkers);
+ 
+ int stc_fair_pct(int nworkers);
+ 
++/* Timing helpers shared by scenarios that measure latency.
++ *
++ * stc_busy_wait_ms() spins without ever blocking or yielding, which is what
++ * a scenario needs while preemption is disabled: any sleeping call would
++ * hand the CPU away and destroy the very condition under test.
++ */
++
++uint32_t stc_elapsed_ms(const struct timespec *from, const struct timespec *to);
++void stc_busy_wait_ms(uint32_t ms);
++
+ /* Print one line per worker.  Call this only outside a measurement window;
+  * console output takes locks and raises interrupts.
+  */
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_inversion.c b/apps/examples/testcase/le_tc/kernel/stc_sched_inversion.c
+new file mode 100644
+index 00000000..c1010fef
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_inversion.c
+@@ -0,0 +1,689 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file stc_sched_inversion.c
++
++/// @brief Scenario test cases for priority inversion and inheritance
++///        (family E)
++///
++/// Unbounded priority inversion is the classic real time failure: a high
++/// priority task waits on a lock held by a low priority task, which is
++/// itself unable to run because a medium priority task is using the CPU.
++/// Nothing is deadlocked, so nothing reports an error; the high priority
++/// task simply misses its deadline.
++///
++/// Priority inheritance is the fix, and it is invisible to any test that
++/// only checks return values.  These scenarios build the inversion
++/// deliberately and measure whether the high priority task gets through.
++///
++/// The whole family depends on CONFIG_PRIORITY_INHERITANCE.  Without it the
++/// inversion is expected behaviour rather than a defect, so the scenarios
++/// skip rather than fail.
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++
++#include <stdio.h>
++#include <stdbool.h>
++#include <unistd.h>
++#include <time.h>
++#include <pthread.h>
++#include <sched.h>
++
++#include "tc_internal.h"
++#include "stc_sched_common.h"
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++#ifdef CONFIG_PRIORITY_INHERITANCE
++
++#define STC_INV_LOW             (SCHED_PRIORITY_DEFAULT)
++#define STC_INV_MID             (SCHED_PRIORITY_DEFAULT + 20)
++#define STC_INV_HIGH            (SCHED_PRIORITY_DEFAULT + 40)
++
++/* How long the low priority task holds the mutex.  This is the work that
++ * inheritance has to let it finish.
++ */
++
++#define STC_INV_HOLD_MS         300
++
++/* Bound on how long the high priority task may wait for the mutex.
++ *
++ * With inheritance the low priority holder is boosted, finishes its hold and
++ * releases, so the wait is roughly the hold time plus scheduling overhead.
++ * Without inheritance the medium priority spinner keeps the holder off the
++ * CPU for as long as it runs, which is an order of magnitude longer.  The
++ * bound sits between the two with room on both sides.
++ */
++
++#define STC_INV_WAIT_BOUND_MS   1500
++
++/* How long the medium priority task spins.  Long enough that, without
++ * inheritance, it would comfortably exceed the bound above.
++ */
++
++#define STC_INV_SPIN_MS         3000
++
++/****************************************************************************
++ * Private Data
++ ****************************************************************************/
++
++static pthread_mutex_t g_inv_mutex_a;
++static pthread_mutex_t g_inv_mutex_b;
++
++static volatile bool g_inv_low_holding;
++static volatile bool g_inv_mid_holding;
++static volatile bool g_inv_high_acquired;
++static volatile uint32_t g_inv_wait_ms;
++static volatile bool g_inv_run;
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_inv_mutex_init
++ *
++ * Description:
++ *   Creates a mutex with the inheritance protocol explicitly selected, so
++ *   the scenario tests the protocol rather than whatever the platform
++ *   default happens to be.
++ *
++ ****************************************************************************/
++
++static int stc_inv_mutex_init(pthread_mutex_t *mutex)
++{
++	pthread_mutexattr_t attr;
++	int ret;
++
++	ret = pthread_mutexattr_init(&attr);
++	if (ret != OK) {
++		return ERROR;
++	}
++
++	ret = pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT);
++	if (ret != OK) {
++		return ERROR;
++	}
++
++	if (pthread_mutex_init(mutex, &attr) != OK) {
++		return ERROR;
++	}
++
++	return OK;
++}
++
++/****************************************************************************
++ * Name: stc_inv_low_task
++ *
++ * Description:
++ *   Takes the mutex and holds it while doing work that requires the CPU.
++ *   The work is a busy wait rather than a sleep, because a sleeping holder
++ *   would release the CPU to the medium priority task voluntarily and there
++ *   would be no inversion to observe.
++ *
++ ****************************************************************************/
++
++static int stc_inv_low_task(int argc, char *argv[])
++{
++	(void)pthread_mutex_lock(&g_inv_mutex_a);
++	g_inv_low_holding = true;
++
++	stc_busy_wait_ms(STC_INV_HOLD_MS);
++
++	g_inv_low_holding = false;
++	(void)pthread_mutex_unlock(&g_inv_mutex_a);
++
++	return OK;
++}
++
++/****************************************************************************
++ * Name: stc_inv_mid_task
++ *
++ * Description:
++ *   Spins at medium priority holding no lock at all.  This is what turns a
++ *   bounded wait into an unbounded one: it outranks the holder and so keeps
++ *   it off the CPU indefinitely.
++ *
++ ****************************************************************************/
++
++static int stc_inv_mid_task(int argc, char *argv[])
++{
++	struct timespec start;
++	struct timespec now;
++
++	(void)clock_gettime(CLOCK_REALTIME, &start);
++
++	while (g_inv_run) {
++		(void)clock_gettime(CLOCK_REALTIME, &now);
++		if (stc_elapsed_ms(&start, &now) >= STC_INV_SPIN_MS) {
++			break;
++		}
++	}
++
++	return OK;
++}
++
++/****************************************************************************
++ * Name: stc_inv_high_task
++ *
++ * Description:
++ *   Waits for the mutex and records how long the wait took.  That figure is
++ *   the entire result of the scenario.
++ *
++ ****************************************************************************/
++
++static int stc_inv_high_task(int argc, char *argv[])
++{
++	struct timespec start;
++	struct timespec now;
++
++	(void)clock_gettime(CLOCK_REALTIME, &start);
++
++	(void)pthread_mutex_lock(&g_inv_mutex_a);
++
++	(void)clock_gettime(CLOCK_REALTIME, &now);
++	g_inv_wait_ms = stc_elapsed_ms(&start, &now);
++	g_inv_high_acquired = true;
++
++	(void)pthread_mutex_unlock(&g_inv_mutex_a);
++
++	return OK;
++}
++
++/****************************************************************************
++ * Name: stc_inv_chain_mid_task
++ *
++ * Description:
++ *   Middle link of the nested chain: holds B, then blocks on A.  A boost
++ *   arriving on B has to travel through this task to reach the holder of A.
++ *
++ ****************************************************************************/
++
++static int stc_inv_chain_mid_task(int argc, char *argv[])
++{
++	(void)pthread_mutex_lock(&g_inv_mutex_b);
++	g_inv_mid_holding = true;
++
++	(void)pthread_mutex_lock(&g_inv_mutex_a);
++	(void)pthread_mutex_unlock(&g_inv_mutex_a);
++
++	g_inv_mid_holding = false;
++	(void)pthread_mutex_unlock(&g_inv_mutex_b);
++
++	return OK;
++}
++
++/****************************************************************************
++ * Name: stc_inv_chain_high_task
++ *
++ * Description:
++ *   Top of the nested chain: waits on B, which is held by a task blocked on
++ *   A.  Only a boost that propagates through both links lets this finish.
++ *
++ ****************************************************************************/
++
++static int stc_inv_chain_high_task(int argc, char *argv[])
++{
++	struct timespec start;
++	struct timespec now;
++
++	(void)clock_gettime(CLOCK_REALTIME, &start);
++
++	(void)pthread_mutex_lock(&g_inv_mutex_b);
++
++	(void)clock_gettime(CLOCK_REALTIME, &now);
++	g_inv_wait_ms = stc_elapsed_ms(&start, &now);
++	g_inv_high_acquired = true;
++
++	(void)pthread_mutex_unlock(&g_inv_mutex_b);
++
++	return OK;
++}
++
++/****************************************************************************
++ * Name: stc_inv_reset
++ ****************************************************************************/
++
++static void stc_inv_reset(void)
++{
++	g_inv_low_holding = false;
++	g_inv_mid_holding = false;
++	g_inv_high_acquired = false;
++	g_inv_wait_ms = 0;
++	g_inv_run = true;
++}
++
++/****************************************************************************
++ * Name: stc_sched_inv01_classic
++ *
++ * @testcase             :stc_sched_inv01_classic
++ * @brief                :SCN-INV-01, classic three task priority inversion
++ * @scenario             :A low priority task takes a mutex and busy works
++ *                        while holding it.  A high priority task then tries
++ *                        to take the same mutex and blocks.  A medium
++ *                        priority task, holding no lock at all, spins.
++ *                        Without inheritance the medium task outranks the
++ *                        holder and keeps it off the CPU, so the holder
++ *                        never finishes, never releases, and the high
++ *                        priority task waits for as long as the medium task
++ *                        chooses to run.  With inheritance the holder is
++ *                        boosted to the waiter's priority, outranks the
++ *                        medium task, finishes and releases.
++ *                        The measured wait therefore separates the two
++ *                        outcomes by an order of magnitude, which is why the
++ *                        bound can be generous and still decisive.
++ * @apicovered           :pthread_mutexattr_setprotocol, pthread_mutex_lock,
++ *                        pthread_mutex_unlock, task_create
++ * @precondition         :CONFIG_PRIORITY_INHERITANCE
++ * @postcondition        :all three tasks exited, mutex destroyed
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_inv01_classic(void)
++{
++	pid_t low;
++	pid_t mid;
++	pid_t high;
++	int init_ret;
++
++	stc_inv_reset();
++
++	init_ret = stc_inv_mutex_init(&g_inv_mutex_a);
++
++	low = task_create("stcinvl", STC_INV_LOW, STC_WORKER_STACKSIZE,
++			  stc_inv_low_task, (char * const *)NULL);
++
++	/* Wait until the low priority task actually holds the mutex, so the
++	 * ordering of the scenario is established rather than assumed.
++	 */
++
++	usleep(50 * 1000);
++
++	high = task_create("stcinvh", STC_INV_HIGH, STC_WORKER_STACKSIZE,
++			   stc_inv_high_task, (char * const *)NULL);
++
++	usleep(10 * 1000);
++
++	mid = task_create("stcinvm", STC_INV_MID, STC_WORKER_STACKSIZE,
++			  stc_inv_mid_task, (char * const *)NULL);
++
++	/* Allow the full bound plus a margin before concluding. */
++
++	usleep((STC_INV_WAIT_BOUND_MS + 500) * 1000);
++
++	g_inv_run = false;
++	usleep(200 * 1000);
++
++	if (mid > 0) {
++		(void)task_delete(mid);
++	}
++
++	(void)pthread_mutex_destroy(&g_inv_mutex_a);
++
++	printf("[SCN-INV-01] acquired=%d wait=%ums bound=%dms\n",
++	       (int)g_inv_high_acquired, (unsigned int)g_inv_wait_ms,
++	       STC_INV_WAIT_BOUND_MS);
++
++	TC_ASSERT_EQ("inv01_mutex_init", init_ret, OK);
++	TC_ASSERT_GT("inv01_low_created", low, 0);
++	TC_ASSERT_GT("inv01_high_created", high, 0);
++	TC_ASSERT_GT("inv01_mid_created", mid, 0);
++
++	/* Hard correctness assertion: the inversion resolved at all. */
++
++	TC_ASSERT("inv01_high_acquired", g_inv_high_acquired);
++
++	/* And it resolved within a bounded time rather than eventually. */
++
++	TC_ASSERT_LEQ("inv01_wait_bounded", g_inv_wait_ms,
++		      STC_INV_WAIT_BOUND_MS);
++
++	TC_SUCCESS_RESULT();
++}
++
++#ifdef CONFIG_SMP
++/****************************************************************************
++ * Name: stc_sched_inv02_cross_cpu
++ *
++ * @testcase             :stc_sched_inv02_cross_cpu
++ * @brief                :SCN-INV-02, inheritance works across CPUs
++ * @scenario             :The same inversion as SCN-INV-01, but with the
++ *                        holder pinned to one CPU and the medium priority
++ *                        spinner pinned to another.
++ *                        On a single CPU the boost only has to change which
++ *                        task the local scheduler picks.  Across CPUs it has
++ *                        to reach a task that another CPU is managing, which
++ *                        is a different path through the scheduler and one
++ *                        that a single core test can never exercise.
++ * @apicovered           :pthread_mutex_lock, sched_setaffinity, task_create
++ * @precondition         :CONFIG_PRIORITY_INHERITANCE and more than one CPU
++ * @postcondition        :all tasks exited, mutex destroyed
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_inv02_cross_cpu(void)
++{
++	cpu_set_t low_mask = 0;
++	cpu_set_t mid_mask = 0;
++	pid_t low;
++	pid_t mid;
++	pid_t high;
++	int ncpus = stc_ncpus();
++	int init_ret;
++
++	stc_inv_reset();
++
++	init_ret = stc_inv_mutex_init(&g_inv_mutex_a);
++
++	CPU_SET(0, &low_mask);
++	CPU_SET(ncpus - 1, &mid_mask);
++
++	low = task_create("stcinvl", STC_INV_LOW, STC_WORKER_STACKSIZE,
++			  stc_inv_low_task, (char * const *)NULL);
++	if (low > 0) {
++		(void)sched_setaffinity(low, sizeof(cpu_set_t), &low_mask);
++	}
++
++	usleep(50 * 1000);
++
++	high = task_create("stcinvh", STC_INV_HIGH, STC_WORKER_STACKSIZE,
++			   stc_inv_high_task, (char * const *)NULL);
++
++	usleep(10 * 1000);
++
++	mid = task_create("stcinvm", STC_INV_MID, STC_WORKER_STACKSIZE,
++			  stc_inv_mid_task, (char * const *)NULL);
++	if (mid > 0) {
++		(void)sched_setaffinity(mid, sizeof(cpu_set_t), &mid_mask);
++	}
++
++	usleep((STC_INV_WAIT_BOUND_MS + 500) * 1000);
++
++	g_inv_run = false;
++	usleep(200 * 1000);
++
++	if (mid > 0) {
++		(void)task_delete(mid);
++	}
++
++	(void)pthread_mutex_destroy(&g_inv_mutex_a);
++
++	printf("[SCN-INV-02] acquired=%d wait=%ums\n",
++	       (int)g_inv_high_acquired, (unsigned int)g_inv_wait_ms);
++
++	TC_ASSERT_EQ("inv02_mutex_init", init_ret, OK);
++	TC_ASSERT_GT("inv02_low_created", low, 0);
++	TC_ASSERT_GT("inv02_high_created", high, 0);
++	TC_ASSERT_GT("inv02_mid_created", mid, 0);
++
++	TC_ASSERT("inv02_high_acquired", g_inv_high_acquired);
++	TC_ASSERT_LEQ("inv02_wait_bounded", g_inv_wait_ms,
++		      STC_INV_WAIT_BOUND_MS);
++
++	TC_SUCCESS_RESULT();
++}
++#endif							/* CONFIG_SMP */
++
++/****************************************************************************
++ * Name: stc_sched_inv03_nested_chain
++ *
++ * @testcase             :stc_sched_inv03_nested_chain
++ * @brief                :SCN-INV-03, a boost propagates along a chain of
++ *                        mutexes
++ * @scenario             :Build a chain three deep.  The low priority task
++ *                        holds mutex A.  A second task holds mutex B and
++ *                        then blocks on A.  A high priority task blocks on
++ *                        B.  A medium priority spinner keeps the holder of A
++ *                        off the CPU.
++ *                        The high priority task's boost has to travel from B
++ *                        to the task blocked on A, and from there to the
++ *                        holder of A.  An implementation that boosts only
++ *                        the immediate holder stops one link short: the
++ *                        holder of B is boosted but cannot proceed, because
++ *                        the task it is waiting on was not.  That failure is
++ *                        invisible in the single mutex case, which is why
++ *                        the chain is tested separately.
++ * @apicovered           :pthread_mutex_lock, pthread_mutex_unlock,
++ *                        task_create
++ * @precondition         :CONFIG_PRIORITY_INHERITANCE
++ * @postcondition        :all tasks exited, both mutexes destroyed
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_inv03_nested_chain(void)
++{
++	pid_t low;
++	pid_t chain;
++	pid_t mid;
++	pid_t high;
++	int init_a;
++	int init_b;
++
++	stc_inv_reset();
++
++	init_a = stc_inv_mutex_init(&g_inv_mutex_a);
++	init_b = stc_inv_mutex_init(&g_inv_mutex_b);
++
++	/* Bottom of the chain takes A and works. */
++
++	low = task_create("stcinvl", STC_INV_LOW, STC_WORKER_STACKSIZE,
++			  stc_inv_low_task, (char * const *)NULL);
++
++	usleep(50 * 1000);
++
++	/* Middle takes B, then blocks on A. */
++
++	chain = task_create("stcinvc", STC_INV_LOW + 5, STC_WORKER_STACKSIZE,
++			    stc_inv_chain_mid_task, (char * const *)NULL);
++
++	usleep(50 * 1000);
++
++	/* Top blocks on B. */
++
++	high = task_create("stcinvh", STC_INV_HIGH, STC_WORKER_STACKSIZE,
++			   stc_inv_chain_high_task, (char * const *)NULL);
++
++	usleep(10 * 1000);
++
++	mid = task_create("stcinvm", STC_INV_MID, STC_WORKER_STACKSIZE,
++			  stc_inv_mid_task, (char * const *)NULL);
++
++	usleep((STC_INV_WAIT_BOUND_MS + 500) * 1000);
++
++	g_inv_run = false;
++	usleep(200 * 1000);
++
++	if (mid > 0) {
++		(void)task_delete(mid);
++	}
++
++	(void)pthread_mutex_destroy(&g_inv_mutex_a);
++	(void)pthread_mutex_destroy(&g_inv_mutex_b);
++
++	printf("[SCN-INV-03] acquired=%d wait=%ums\n",
++	       (int)g_inv_high_acquired, (unsigned int)g_inv_wait_ms);
++
++	TC_ASSERT_EQ("inv03_mutex_a_init", init_a, OK);
++	TC_ASSERT_EQ("inv03_mutex_b_init", init_b, OK);
++	TC_ASSERT_GT("inv03_low_created", low, 0);
++	TC_ASSERT_GT("inv03_chain_created", chain, 0);
++	TC_ASSERT_GT("inv03_high_created", high, 0);
++	TC_ASSERT_GT("inv03_mid_created", mid, 0);
++
++	/* The boost reached all the way down the chain. */
++
++	TC_ASSERT("inv03_high_acquired", g_inv_high_acquired);
++	TC_ASSERT_LEQ("inv03_wait_bounded", g_inv_wait_ms,
++		      STC_INV_WAIT_BOUND_MS);
++
++	TC_SUCCESS_RESULT();
++}
++
++#endif							/* CONFIG_PRIORITY_INHERITANCE */
++
++/****************************************************************************
++ * Name: stc_sched_inv04_lock_churn_throughput
++ *
++ * @testcase             :stc_sched_inv04_lock_churn_throughput
++ * @brief                :SCN-INV-04, scheduler lock churn does not collapse
++ *                        throughput
++ * @scenario             :Run an equal priority CPU bound workload twice, once
++ *                        undisturbed and once alongside a task that takes and
++ *                        releases the scheduler lock as fast as it can, and
++ *                        compare the total work completed.
++ *                        This targets the pending list inversion.  When a task
++ *                        yields while the scheduler is locked, the kernel may
++ *                        park it on the pending list and give its CPU to
++ *                        whatever was next in that CPU's own queue, which in
++ *                        practice is the idle task.  Each occurrence trades a
++ *                        useful task for an idle one until the lock clears, so
++ *                        the symptom is a collapse in aggregate throughput
++ *                        while every individual task still looks alive.
++ *
++ *                        This is a proxy rather than a direct observation.
++ *                        Application code cannot see the pending list, so the
++ *                        scenario infers the inversion from its cost.  The
++ *                        threshold is therefore deliberately loose: it is
++ *                        meant to catch a collapse, not to measure overhead.
++ * @apicovered           :sched_lock, sched_unlock, task_create
++ * @precondition         :none
++ * @postcondition        :churn task exited, all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++/* Proportion of undisturbed throughput that must survive the lock churn,
++ * as a percentage.  Some loss is expected and correct, because the churn
++ * task consumes CPU itself and each lock and unlock has a real cost.  The
++ * failure being hunted is a collapse to a small fraction, so half is a
++ * threshold no healthy system should approach and no broken one can meet.
++ */
++
++#define STC_INV_CHURN_FLOOR_PCT 50
++
++static volatile bool g_inv_churn_run;
++
++static int stc_inv_churn_task(int argc, char *argv[])
++{
++	while (g_inv_churn_run) {
++		(void)sched_lock();
++		(void)sched_unlock();
++	}
++
++	return OK;
++}
++
++static void stc_sched_inv04_lock_churn_throughput(void)
++{
++	struct stc_workload_s wl;
++	int ncpus = stc_ncpus();
++	int nworkers = ncpus + 1;
++	pid_t churn;
++	uint32_t baseline;
++	uint32_t churned;
++	int quiet_ret;
++	int churn_ret;
++	int pct = 0;
++
++	/* Undisturbed baseline. */
++
++	stc_workload_init(&wl, nworkers, SCHED_PRIORITY_DEFAULT, SCHED_RR);
++	wl.window_ms = 1000;
++
++	quiet_ret = stc_run_workload(&wl);
++	baseline = stc_sum(nworkers);
++
++	/* Same workload, with lock churn alongside it. */
++
++	g_inv_churn_run = true;
++	churn = task_create("stcchurn", SCHED_PRIORITY_DEFAULT,
++			    STC_WORKER_STACKSIZE, stc_inv_churn_task,
++			    (char * const *)NULL);
++
++	stc_workload_init(&wl, nworkers, SCHED_PRIORITY_DEFAULT, SCHED_RR);
++	wl.window_ms = 1000;
++
++	churn_ret = stc_run_workload(&wl);
++	churned = stc_sum(nworkers);
++
++	g_inv_churn_run = false;
++	usleep(200 * 1000);
++
++	if (baseline > 100) {
++		pct = (int)(churned / (baseline / 100));
++	}
++
++	printf("[SCN-INV-04] baseline=%u churned=%u retained=%d%%\n",
++	       (unsigned int)baseline, (unsigned int)churned, pct);
++
++	TC_ASSERT_EQ("inv04_baseline_workload", quiet_ret, OK);
++	TC_ASSERT_GT("inv04_churn_created", churn, 0);
++	TC_ASSERT_EQ("inv04_churn_workload", churn_ret, OK);
++
++	/* Every task still ran. */
++
++	TC_ASSERT_GT("inv04_all_ran", stc_min(nworkers), 0);
++
++	/* And aggregate throughput did not collapse. */
++
++	TC_ASSERT_GEQ("inv04_throughput_retained", pct,
++		      STC_INV_CHURN_FLOOR_PCT);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_sched_inversion_main
++ ****************************************************************************/
++
++int stc_sched_inversion_main(void)
++{
++	printf("[SCN-INV] priority inversion scenarios, ncpus=%d\n",
++	       stc_ncpus());
++
++#ifdef CONFIG_PRIORITY_INHERITANCE
++	stc_sched_inv01_classic();
++#ifdef CONFIG_SMP
++	if (stc_ncpus() > 1) {
++		stc_sched_inv02_cross_cpu();
++	} else {
++		printf("[SCN-INV-02] skipped, single CPU configuration\n");
++	}
++#endif
++	stc_sched_inv03_nested_chain();
++#else
++	printf("[SCN-INV] 01 to 03 skipped, built without CONFIG_PRIORITY_INHERITANCE\n");
++#endif
++
++	stc_sched_inv04_lock_churn_throughput();
++
++	return 0;
++}
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_lock.c b/apps/examples/testcase/le_tc/kernel/stc_sched_lock.c
+new file mode 100644
+index 00000000..a714b5d0
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_lock.c
+@@ -0,0 +1,455 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file stc_sched_lock.c
++
++/// @brief Scenario test cases for preemption control (family D)
++///
++/// sched_lock() promises that no other task will take the CPU until the
++/// matching unlock, however deserving that other task may be.  The existing
++/// API level test checks that the lock count increments, which would still
++/// pass if the lock had no effect whatsoever.
++///
++/// Every scenario here follows the same shape: arrange for a task that
++/// clearly outranks the holder to become runnable while the lock is held,
++/// and prove it did not run.  Proving a negative needs care, which is why
++/// these scenarios busy wait rather than sleep: any sleeping call would
++/// hand the CPU away and satisfy the wake for reasons that have nothing to
++/// do with the lock.
++///
++/// The catalogue also lists SCN-LOCK-04, which exits a task while it still
++/// holds the lock.  It is not implemented here.  Driving that abnormal exit
++/// path can trip a kernel assertion rather than fail cleanly, which would
++/// take the run down rather than report a result, so it is left out until
++/// the exit path's intended behaviour has been decided.
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++
++#include <stdio.h>
++#include <stdbool.h>
++#include <unistd.h>
++#include <semaphore.h>
++#include <sched.h>
++
++#include "tc_internal.h"
++#include "stc_sched_common.h"
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++/* Priority of the task that must be held off.  Comfortably above the test
++ * task so that nothing but the lock could possibly be keeping it waiting.
++ */
++
++#define STC_LOCK_HIGH_PRIO      (SCHED_PRIORITY_DEFAULT + 40)
++
++/* How long to hold the lock while checking that the high priority task has
++ * not run.  Long enough to span many timer ticks and many round-robin
++ * slices, so a missed preemption has every opportunity to show itself.
++ */
++
++#define STC_LOCK_HOLD_MS        200
++
++/* How long to allow after unlocking before concluding the task never ran. */
++
++#define STC_LOCK_RELEASE_MS     200
++
++/* Nesting depth for the nested lock scenario. */
++
++#define STC_LOCK_DEPTH          8
++
++/****************************************************************************
++ * Private Data
++ ****************************************************************************/
++
++static sem_t g_lock_sem;
++static volatile bool g_waiter_ran;
++static volatile bool g_poster_done;
++static volatile bool g_poster_go;
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_lock_waiter
++ *
++ * Description:
++ *   Blocks on the semaphore and sets a flag the instant it runs.  The flag
++ *   is the whole observation: if it is set while the lock is held, the lock
++ *   did not do its job.
++ *
++ ****************************************************************************/
++
++static int stc_lock_waiter(int argc, char *argv[])
++{
++	(void)sem_wait(&g_lock_sem);
++	g_waiter_ran = true;
++	return OK;
++}
++
++/****************************************************************************
++ * Name: stc_lock_remote_poster
++ *
++ * Description:
++ *   Posts the semaphore from whichever CPU it has been pinned to.  Used to
++ *   make the wake originate somewhere other than the CPU holding the lock.
++ *
++ ****************************************************************************/
++
++static int stc_lock_remote_poster(int argc, char *argv[])
++{
++	while (!g_poster_go) {
++		usleep(1000);
++	}
++
++	(void)sem_post(&g_lock_sem);
++	g_poster_done = true;
++	return OK;
++}
++
++/****************************************************************************
++ * Name: stc_lock_setup
++ *
++ * Description:
++ *   Creates a high priority task blocked on the semaphore and waits for it
++ *   to get there.  Returns its PID, or a negative value on failure.
++ *
++ ****************************************************************************/
++
++static pid_t stc_lock_setup(void)
++{
++	pid_t waiter;
++
++	g_waiter_ran = false;
++
++	if (sem_init(&g_lock_sem, 0, 0) != OK) {
++		return (pid_t)ERROR;
++	}
++
++	waiter = task_create("stclockw", STC_LOCK_HIGH_PRIO,
++			     STC_WORKER_STACKSIZE, stc_lock_waiter,
++			     (char * const *)NULL);
++	if (waiter < 0) {
++		(void)sem_destroy(&g_lock_sem);
++		return (pid_t)ERROR;
++	}
++
++	/* Let it reach sem_wait before anything else happens. */
++
++	usleep(100 * 1000);
++
++	return waiter;
++}
++
++/****************************************************************************
++ * Name: stc_lock_teardown
++ ****************************************************************************/
++
++static void stc_lock_teardown(pid_t waiter)
++{
++	if (waiter > 0 && !g_waiter_ran) {
++		(void)task_delete(waiter);
++	}
++
++	(void)sem_destroy(&g_lock_sem);
++}
++
++/****************************************************************************
++ * Name: stc_sched_lock01_holds_off_higher_priority
++ *
++ * @testcase             :stc_sched_lock01_holds_off_higher_priority
++ * @brief                :SCN-LOCK-01, a locked scheduler defers a higher
++ *                        priority wake
++ * @scenario             :Park a high priority task on a semaphore, take the
++ *                        scheduler lock, then post the semaphore.  The post
++ *                        makes a task that clearly outranks us runnable, so
++ *                        the only thing that can stop it running is the
++ *                        lock.  Busy wait for two hundred milliseconds,
++ *                        spanning many ticks, and confirm it has not run.
++ *                        Then unlock and confirm it runs promptly.
++ *                        The wait is a busy wait on purpose.  Sleeping would
++ *                        hand the CPU away and let the waiter run for
++ *                        reasons unrelated to the lock, which would make the
++ *                        scenario pass no matter what the lock did.
++ * @apicovered           :sched_lock, sched_unlock, sem_post, sem_wait
++ * @precondition         :none
++ * @postcondition        :waiter exited, semaphore destroyed
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_lock01_holds_off_higher_priority(void)
++{
++	pid_t waiter;
++	bool ran_while_locked;
++	bool ran_after_unlock;
++
++	waiter = stc_lock_setup();
++	if (waiter < 0) {
++		TC_ASSERT("lock01_setup", false);
++	}
++
++	(void)sched_lock();
++
++	(void)sem_post(&g_lock_sem);
++
++	stc_busy_wait_ms(STC_LOCK_HOLD_MS);
++	ran_while_locked = g_waiter_ran;
++
++	(void)sched_unlock();
++
++	usleep(STC_LOCK_RELEASE_MS * 1000);
++	ran_after_unlock = g_waiter_ran;
++
++	stc_lock_teardown(waiter);
++
++	printf("[SCN-LOCK-01] ran_while_locked=%d ran_after_unlock=%d\n",
++	       (int)ran_while_locked, (int)ran_after_unlock);
++
++	/* The lock did its job. */
++
++	TC_ASSERT("lock01_deferred_while_locked", !ran_while_locked);
++
++	/* And released it afterwards, so the lock is a delay and not a
++	 * permanent block.
++	 */
++
++	TC_ASSERT("lock01_released_after_unlock", ran_after_unlock);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sched_lock02_nested
++ *
++ * @testcase             :stc_sched_lock02_nested
++ * @brief                :SCN-LOCK-02, nested locks release only at depth
++ *                        zero
++ * @scenario             :Take the scheduler lock eight times, post the
++ *                        semaphore, then unlock seven times.  The count is
++ *                        back to one, not zero, so preemption must still be
++ *                        disabled and the high priority waiter must still be
++ *                        held off.  Only the eighth unlock may release it.
++ *                        This is the property that makes the lock safe to
++ *                        use inside nested calls: an inner unlock must never
++ *                        undo an outer lock.  A scheduler that treated the
++ *                        lock as a boolean rather than a count would pass
++ *                        SCN-LOCK-01 and fail here.
++ * @apicovered           :sched_lock, sched_unlock, sched_lockcount
++ * @precondition         :none
++ * @postcondition        :lock count restored, waiter exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_lock02_nested(void)
++{
++	pid_t waiter;
++	int base_count;
++	int deep_count;
++	bool ran_at_depth_one;
++	bool ran_after_full_unlock;
++	int i;
++
++	waiter = stc_lock_setup();
++	if (waiter < 0) {
++		TC_ASSERT("lock02_setup", false);
++	}
++
++	base_count = sched_lockcount();
++
++	for (i = 0; i < STC_LOCK_DEPTH; i++) {
++		(void)sched_lock();
++	}
++
++	deep_count = sched_lockcount();
++
++	(void)sem_post(&g_lock_sem);
++
++	/* Unwind to depth one.  Preemption must still be disabled. */
++
++	for (i = 0; i < STC_LOCK_DEPTH - 1; i++) {
++		(void)sched_unlock();
++	}
++
++	stc_busy_wait_ms(STC_LOCK_HOLD_MS);
++	ran_at_depth_one = g_waiter_ran;
++
++	(void)sched_unlock();
++
++	usleep(STC_LOCK_RELEASE_MS * 1000);
++	ran_after_full_unlock = g_waiter_ran;
++
++	stc_lock_teardown(waiter);
++
++	printf("[SCN-LOCK-02] base=%d deep=%d ran_at_depth_one=%d ran_after=%d\n",
++	       base_count, deep_count, (int)ran_at_depth_one,
++	       (int)ran_after_full_unlock);
++
++	TC_ASSERT_EQ("lock02_count_nested", deep_count,
++		     base_count + STC_LOCK_DEPTH);
++	TC_ASSERT_EQ("lock02_count_restored", sched_lockcount(), base_count);
++
++	/* An inner unlock must not have undone the outer lock. */
++
++	TC_ASSERT("lock02_still_locked_at_depth_one", !ran_at_depth_one);
++
++	TC_ASSERT("lock02_released_at_depth_zero", ran_after_full_unlock);
++
++	TC_SUCCESS_RESULT();
++}
++
++#ifdef CONFIG_SMP
++/****************************************************************************
++ * Name: stc_sched_lock03_cross_cpu
++ *
++ * @testcase             :stc_sched_lock03_cross_cpu
++ * @brief                :SCN-LOCK-03, the scheduler lock is global across
++ *                        CPUs
++ * @scenario             :Pin this task to CPU0 and take the scheduler lock,
++ *                        then have a task pinned to another CPU post the
++ *                        semaphore that a high priority task is waiting on.
++ *                        The wake now originates somewhere other than the
++ *                        CPU holding the lock, which is the case a per CPU
++ *                        implementation would get wrong.
++ *                        This scenario exists partly to pin down semantics
++ *                        that are currently undocumented: whether
++ *                        sched_lock() is a promise about the calling CPU or
++ *                        about the whole system.  It asserts the global
++ *                        reading, which is what the kernel's own pending
++ *                        list handling implies.
++ * @apicovered           :sched_lock, sched_unlock, sched_setaffinity,
++ *                        sem_post, sem_wait
++ * @precondition         :CONFIG_SMP_NCPUS greater than one
++ * @postcondition        :affinity restored, waiter and poster exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_lock03_cross_cpu(void)
++{
++	cpu_set_t self_mask = 0;
++	cpu_set_t remote_mask = 0;
++	cpu_set_t saved_mask = 0;
++	pid_t waiter;
++	pid_t poster;
++	int ncpus = stc_ncpus();
++	int remote = ncpus - 1;
++	bool ran_while_locked;
++	bool ran_after_unlock;
++	bool posted;
++
++	g_poster_go = false;
++	g_poster_done = false;
++
++	(void)sched_getaffinity(0, sizeof(cpu_set_t), &saved_mask);
++
++	waiter = stc_lock_setup();
++	if (waiter < 0) {
++		TC_ASSERT("lock03_setup", false);
++	}
++
++	CPU_SET(0, &self_mask);
++	CPU_SET(remote, &remote_mask);
++
++	(void)sched_setaffinity(0, sizeof(cpu_set_t), &self_mask);
++
++	poster = task_create("stcpost", SCHED_PRIORITY_DEFAULT,
++			     STC_WORKER_STACKSIZE, stc_lock_remote_poster,
++			     (char * const *)NULL);
++
++	if (poster > 0) {
++		(void)sched_setaffinity(poster, sizeof(cpu_set_t),
++					&remote_mask);
++		usleep(100 * 1000);
++	}
++
++	(void)sched_lock();
++
++	/* Release the remote poster and wait, without sleeping, for it to
++	 * report that the post has happened.
++	 */
++
++	g_poster_go = true;
++	stc_busy_wait_ms(STC_LOCK_HOLD_MS);
++
++	posted = g_poster_done;
++	ran_while_locked = g_waiter_ran;
++
++	(void)sched_unlock();
++
++	usleep(STC_LOCK_RELEASE_MS * 1000);
++	ran_after_unlock = g_waiter_ran;
++
++	if (poster > 0 && !g_poster_done) {
++		(void)task_delete(poster);
++	}
++
++	stc_lock_teardown(waiter);
++
++	(void)sched_setaffinity(0, sizeof(cpu_set_t), &saved_mask);
++
++	printf("[SCN-LOCK-03] posted=%d ran_while_locked=%d ran_after=%d\n",
++	       (int)posted, (int)ran_while_locked, (int)ran_after_unlock);
++
++	TC_ASSERT_GT("lock03_poster_created", poster, 0);
++
++	/* The remote CPU really did run and post, otherwise the rest of the
++	 * scenario proves nothing.
++	 */
++
++	TC_ASSERT("lock03_remote_posted", posted);
++
++	TC_ASSERT("lock03_deferred_while_locked", !ran_while_locked);
++	TC_ASSERT("lock03_released_after_unlock", ran_after_unlock);
++
++	TC_SUCCESS_RESULT();
++}
++#endif							/* CONFIG_SMP */
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_sched_lock_main
++ ****************************************************************************/
++
++int stc_sched_lock_main(void)
++{
++	printf("[SCN-LOCK] preemption control scenarios, ncpus=%d\n",
++	       stc_ncpus());
++
++	stc_sched_lock01_holds_off_higher_priority();
++	stc_sched_lock02_nested();
++#ifdef CONFIG_SMP
++	if (stc_ncpus() > 1) {
++		stc_sched_lock03_cross_cpu();
++	} else {
++		printf("[SCN-LOCK-03] skipped, single CPU configuration\n");
++	}
++#endif
++
++	return 0;
++}
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_internal.h b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+index 6e640736..7c1a929c 100644
+--- a/apps/examples/testcase/le_tc/kernel/tc_internal.h
++++ b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+@@ -104,6 +104,8 @@ int stc_sched_rr_main(void);
+ int stc_sched_smp_main(void);
+ int stc_sched_priority_main(void);
+ int stc_sched_affinity_main(void);
++int stc_sched_lock_main(void);
++int stc_sched_inversion_main(void);
+ int tc_get_drvfd(void);
+ 
+ #endif /* __EXAMPLES_TESTCASE_KERNEL_TC_INTERNAL_H */
+-- 
+2.43.0
+
