@@ -1,0 +1,1680 @@
+From 122557756a7e03dbf7e804ab63112b525884494f Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_sched_fixed <>
+Date: Wed, 5 Aug 2026 19:36:44 +0000
+Subject: [PATCH] apps/examples/testcase: add priority and affinity scenario
+ families
+
+Phase 3 of the scenario test rollout.  Priority and affinity are the two
+pieces of core scheduling semantics with no behavioural coverage at all
+today: the existing tests confirm that a priority or a CPU mask can be
+stored and read back, which says nothing about whether the scheduler acts
+on either.
+
+The harness gains what these families need.  A workload may now carry per
+worker priorities and per worker affinity masks rather than one value shared
+by all, and workers may be asked to call sched_getcpu on every iteration and
+record both the set of CPUs they were observed on and any sample taken
+outside their mask.  The workload lifecycle is split into start, sample and
+finish so that a scenario can act while the load is running, which is what
+lets a task's priority or affinity be changed mid flight and the effect
+measured in a second window; stc_run_workload is now those three in order.
+Because the workload structure gained optional members, stc_workload_init
+is introduced and the existing scenarios are converted to it, so that a
+partially initialised structure can never take its per worker arrays from
+whatever was on the stack.
+
+stc_sched_priority adds four scenarios.  PRI-01 saturates every CPU with low
+priority work and measures how long a released high priority task takes to
+run, where the failure mode is waiting for the load to finish seconds later.
+PRI-02 runs a ladder of distinct priorities with more tasks than CPUs and
+asserts absolutely, with no tolerance, that exactly the top ncpus tasks
+accumulate work and every task below them records zero.  PRI-03 promotes a
+task that is ready to run but assigned to no CPU, and PRI-04 demotes a task
+that is currently running; these reach different code paths and are tested
+separately for that reason.
+
+PRI-04 takes its minimum over the peers only, excluding the demoted worker.
+After the demotion that worker is the least important runnable task, so on
+an oversubscribed machine it is the one that should now be starved, and
+including it would assert the opposite of the property under test.  A second
+assertion checks that the demoted worker actually gave up ground, so the
+peers cannot appear to pass for some unrelated reason.
+
+stc_sched_affinity adds five.  AFF-01 pins two tasks to one CPU so they
+preempt each other constantly, and asserts not one sample outside the mask
+across at least a thousand samples.  AFF-02 narrows the mask of an already
+running task to exclude the CPU it is on, which forces a migration rather
+than a placement, and allows a settling period before judging placement
+because sched_setaffinity returning does not mean the task has moved yet.
+AFF-03 deliberately unbalances the run queues and checks that queue depth on
+one CPU neither starves the other nor causes pinned tasks to be migrated for
+balance.  AFF-04 checks that unpinned tasks spread one per CPU, which per
+task counters alone cannot detect because crowding every task onto one CPU
+still produces healthy looking counts.  AFF-05 locates an IDLE task by
+scanning for priority zero, rather than assuming a PID, and confirms its
+affinity cannot be changed; it asserts the negative errno that
+sched_setaffinity actually returns rather than the ERROR and errno pair
+POSIX specifies, matching what the existing API level test asserts on its
+non-SMP path.
+
+The affinity family compiles away entirely without CONFIG_SMP and reports a
+skip, as does AFF on a single CPU configuration.  Both the SMP and non-SMP
+compilation paths are warning free under -Wall -Wextra.
+---
+ apps/examples/testcase/le_tc/kernel/Make.defs |   2 +
+ .../testcase/le_tc/kernel/kernel_tc_main.c    |   2 +
+ .../le_tc/kernel/stc_sched_affinity.c         | 524 ++++++++++++++++++
+ .../testcase/le_tc/kernel/stc_sched_common.c  | 271 +++++++--
+ .../testcase/le_tc/kernel/stc_sched_common.h  |  77 ++-
+ .../le_tc/kernel/stc_sched_priority.c         | 482 ++++++++++++++++
+ .../testcase/le_tc/kernel/stc_sched_rr.c      |  19 +-
+ .../testcase/le_tc/kernel/stc_sched_smp.c     |   7 +-
+ .../testcase/le_tc/kernel/tc_internal.h       |   2 +
+ 9 files changed, 1323 insertions(+), 63 deletions(-)
+ create mode 100644 apps/examples/testcase/le_tc/kernel/stc_sched_affinity.c
+ create mode 100644 apps/examples/testcase/le_tc/kernel/stc_sched_priority.c
+
+diff --git a/apps/examples/testcase/le_tc/kernel/Make.defs b/apps/examples/testcase/le_tc/kernel/Make.defs
+index 5d031eff..125640de 100644
+--- a/apps/examples/testcase/le_tc/kernel/Make.defs
++++ b/apps/examples/testcase/le_tc/kernel/Make.defs
+@@ -184,6 +184,8 @@ ifeq ($(CONFIG_STC_KERNEL_SCHED),y)
+   CSRCS += stc_sched_monitor.c
+   CSRCS += stc_sched_rr.c
+   CSRCS += stc_sched_smp.c
++  CSRCS += stc_sched_priority.c
++  CSRCS += stc_sched_affinity.c
+ endif
+ 
+ # Include kernel build support
+diff --git a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+index 745ab59f..81f17257 100644
+--- a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
++++ b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+@@ -229,6 +229,8 @@ int tc_kernel_main(int argc, char *argv[])
+ #ifdef CONFIG_STC_KERNEL_SCHED
+ 	stc_sched_rr_main();
+ 	stc_sched_smp_main();
++	stc_sched_priority_main();
++	stc_sched_affinity_main();
+ #endif
+ 
+ 	close(g_tc_fd);
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_affinity.c b/apps/examples/testcase/le_tc/kernel/stc_sched_affinity.c
+new file mode 100644
+index 00000000..6710530c
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_affinity.c
+@@ -0,0 +1,524 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file stc_sched_affinity.c
++
++/// @brief Scenario test cases for affinity and CPU placement (family C)
++///
++/// The existing API level test for affinity sets a mask and reads the same
++/// mask back.  That confirms the value was stored; it says nothing about
++/// whether the scheduler honoured it.  These scenarios ask the running task
++/// itself, repeatedly and across many preemptions, which CPU it is actually
++/// on.
++///
++/// Every scenario here needs more than one CPU to mean anything, so the
++/// whole file compiles away without CONFIG_SMP and the entry point reports
++/// a skip.
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++
++#include <stdio.h>
++#include <unistd.h>
++#include <errno.h>
++#include <sched.h>
++#include <sys/types.h>
++#include <sys/ioctl.h>
++#include <tinyara/sched.h>
++#include <tinyara/os_api_test_drv.h>
++
++#include "tc_internal.h"
++#include "stc_sched_common.h"
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++#ifdef CONFIG_SMP
++
++/* Window for placement scenarios.  Placement is a yes or no property, so no
++ * averaging is needed and a shorter window than the fairness scenarios use
++ * is enough.  At a few million samples per second this still produces far
++ * more than the thousand samples the scenario calls for.
++ */
++
++#define STC_AFF_WINDOW_MS       1500
++
++/* Minimum samples that must be taken before a zero violation count is
++ * treated as evidence rather than as an absence of measurement.
++ */
++
++#define STC_AFF_MIN_SAMPLES     1000
++
++/* Time allowed for a task to actually move after its affinity has been
++ * narrowed, before its placement is judged against the new mask.
++ *
++ * sched_setaffinity() returning does not mean the task has migrated; the
++ * move happens when the scheduler next handles it.  Samples taken in
++ * that interval are legitimately still on the old CPU, and counting them
++ * as violations would fail a correct implementation.  The settle period
++ * is discarded because stc_workload_sample() zeroes the counters before
++ * its window begins.
++ */
++
++#define STC_AFF_SETTLE_MS       100
++
++/****************************************************************************
++ * Private Data
++ ****************************************************************************/
++
++/* Filled by the idle task scan.  sched_foreach() passes a NULL argument
++ * through the test driver, so the result has to come back in a static.
++ */
++
++static volatile pid_t g_idle_pid;
++static volatile pid_t g_scan_self;
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_aff_find_idle_cb
++ *
++ * Description:
++ *   Records the PID of an IDLE task.  The IDLE tasks are the only ones in
++ *   the system at priority zero, and they are the only tasks flagged as
++ *   locked to a CPU, which is what makes them the correct subject for the
++ *   rejection scenario.
++ *
++ *   Runs inside sched_foreach(), which holds a critical section, so this
++ *   does nothing but compare and store.
++ *
++ ****************************************************************************/
++
++static void stc_aff_find_idle_cb(struct tcb_s *tcb, void *arg)
++{
++	if (tcb == NULL || g_idle_pid != 0) {
++		return;
++	}
++
++	/* Skip the caller, and pick an IDLE task that is not PID 0, because
++	 * PID 0 means "this task" to sched_setaffinity() and would test
++	 * something else entirely.
++	 */
++
++	if (tcb->pid == g_scan_self || tcb->pid == 0) {
++		return;
++	}
++
++	if (tcb->sched_priority == 0) {
++		g_idle_pid = tcb->pid;
++	}
++}
++
++/****************************************************************************
++ * Name: stc_aff_find_idle
++ ****************************************************************************/
++
++static pid_t stc_aff_find_idle(void)
++{
++	int fd = tc_get_drvfd();
++
++	g_idle_pid = 0;
++	g_scan_self = getpid();
++
++	(void)ioctl(fd, TESTIOC_SCHED_FOREACH,
++		    (unsigned long)stc_aff_find_idle_cb);
++
++	return g_idle_pid;
++}
++
++/****************************************************************************
++ * Name: stc_sched_aff01_pinned_stays_put
++ *
++ * @testcase             :stc_sched_aff01_pinned_stays_put
++ * @brief                :SCN-AFF-01, a pinned task never runs elsewhere
++ * @scenario             :Pin two CPU bound tasks to the highest numbered
++ *                        CPU and have each of them call sched_getcpu() on
++ *                        every iteration, recording both the set of CPUs it
++ *                        was observed on and any sample taken outside its
++ *                        mask.  Because the two share one CPU they are
++ *                        preempted constantly, so the samples span a large
++ *                        number of context switches rather than a single
++ *                        placement decision.
++ *                        The oracle is absolute: not one sample outside the
++ *                        mask, over at least a thousand samples.  A single
++ *                        violation means the mask was not honoured.
++ * @apicovered           :sched_setaffinity, sched_getcpu, task_create
++ * @precondition         :CONFIG_SMP_NCPUS greater than one
++ * @postcondition        :all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_aff01_pinned_stays_put(void)
++{
++	struct stc_workload_s wl;
++	int ncpus = stc_ncpus();
++	int nworkers = 2;
++	int target = ncpus - 1;
++	int run_ret;
++	int i;
++
++	stc_workload_init(&wl, nworkers, SCHED_PRIORITY_DEFAULT, SCHED_RR);
++	wl.window_ms = STC_AFF_WINDOW_MS;
++	wl.pinned = true;
++	wl.sample_cpu = true;
++	CPU_SET(target, &wl.affinity);
++
++	run_ret = stc_run_workload(&wl);
++
++	printf("[SCN-AFF-01] target=CPU%d seen=0x%x,0x%x violations=%u,%u\n",
++	       target, (unsigned int)stc_cpu_seen_mask(0),
++	       (unsigned int)stc_cpu_seen_mask(1),
++	       (unsigned int)stc_cpu_violations(0),
++	       (unsigned int)stc_cpu_violations(1));
++
++	TC_ASSERT_EQ("aff01_workload", run_ret, OK);
++
++	for (i = 0; i < nworkers; i++) {
++		/* A zero violation count only means something if samples were
++		 * actually taken.
++		 */
++
++		TC_ASSERT_GT("aff01_sampled", stc_count(i),
++			     STC_AFF_MIN_SAMPLES);
++
++		TC_ASSERT_EQ("aff01_no_violation", stc_cpu_violations(i), 0);
++
++		/* And it was seen on the CPU it was pinned to, not merely
++		 * never seen anywhere.
++		 */
++
++		TC_ASSERT_EQ("aff01_seen_target", stc_cpu_seen_mask(i),
++			     (uint32_t)(1u << target));
++	}
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sched_aff02_migrate_running_task
++ *
++ * @testcase             :stc_sched_aff02_migrate_running_task
++ * @brief                :SCN-AFF-02, narrowing affinity migrates a running
++ *                        task
++ * @scenario             :Start one CPU bound task with no restriction and
++ *                        observe where it runs.  Then narrow its mask to
++ *                        exclude the CPU it is on and observe a second
++ *                        window.
++ *                        This is the harder half of affinity: the task is
++ *                        not merely placed at creation but is already
++ *                        running somewhere it is no longer permitted to be,
++ *                        so the scheduler has to move it.  After the change
++ *                        it must never be observed on the excluded CPU
++ *                        again.
++ * @apicovered           :sched_setaffinity, sched_getcpu, task_create
++ * @precondition         :CONFIG_SMP_NCPUS greater than one
++ * @postcondition        :all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_aff02_migrate_running_task(void)
++{
++	struct stc_workload_s wl;
++	cpu_set_t narrowed = 0;
++	int ncpus = stc_ncpus();
++	int target = ncpus - 1;
++	int start_ret;
++	int set_ret = ERROR;
++	int finish_ret;
++	uint32_t seen_after = 0;
++	uint32_t violations_after = 0;
++	uint32_t samples_after = 0;
++
++	stc_workload_init(&wl, 1, SCHED_PRIORITY_DEFAULT, SCHED_RR);
++	wl.window_ms = STC_AFF_WINDOW_MS;
++	wl.sample_cpu = true;
++
++	start_ret = stc_workload_start(&wl);
++
++	if (start_ret == OK) {
++		/* First window: unrestricted, mask of zero means every sample
++		 * is acceptable.
++		 */
++
++		stc_workload_sample(STC_AFF_WINDOW_MS);
++
++		CPU_SET(target, &narrowed);
++		set_ret = sched_setaffinity(stc_worker_pid(0),
++					    sizeof(cpu_set_t), &narrowed);
++
++		/* Judge subsequent samples against the new mask. */
++
++		stc_set_allowed(0, narrowed);
++
++		/* Let the migration actually happen before measuring. */
++
++		usleep(STC_AFF_SETTLE_MS * 1000);
++
++		stc_workload_sample(STC_AFF_WINDOW_MS);
++
++		seen_after = stc_cpu_seen_mask(0);
++		violations_after = stc_cpu_violations(0);
++		samples_after = stc_count(0);
++	}
++
++	finish_ret = stc_workload_finish(1);
++
++	printf("[SCN-AFF-02] narrowed to CPU%d seen_after=0x%x violations=%u\n",
++	       target, (unsigned int)seen_after,
++	       (unsigned int)violations_after);
++
++	TC_ASSERT_EQ("aff02_workload_start", start_ret, OK);
++	TC_ASSERT_EQ("aff02_setaffinity", set_ret, OK);
++	TC_ASSERT_EQ("aff02_workload_finish", finish_ret, OK);
++
++	TC_ASSERT_GT("aff02_sampled", samples_after, STC_AFF_MIN_SAMPLES);
++
++	/* It kept running, and only where it was now allowed to. */
++
++	TC_ASSERT_EQ("aff02_no_violation", violations_after, 0);
++	TC_ASSERT_EQ("aff02_seen_target", seen_after,
++		     (uint32_t)(1u << target));
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sched_aff03_uneven_pinning
++ *
++ * @testcase             :stc_sched_aff03_uneven_pinning
++ * @brief                :SCN-AFF-03, a crowded CPU does not starve a quiet
++ *                        one
++ * @scenario             :Pin two CPU bound tasks to CPU0 and one to the
++ *                        highest numbered CPU, so the two run queues are
++ *                        deliberately unbalanced.  Every task must still
++ *                        make progress, and the lone task on the quiet CPU
++ *                        should complete at least as much work as either of
++ *                        the two sharing the busy one.
++ *                        This catches a scheduler that lets queue depth on
++ *                        one CPU influence decisions on another, and it also
++ *                        confirms that pinned tasks are not silently
++ *                        migrated to balance the load, which would violate
++ *                        their masks.
++ * @apicovered           :sched_setaffinity, sched_getcpu, task_create
++ * @precondition         :CONFIG_SMP_NCPUS greater than one
++ * @postcondition        :all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_aff03_uneven_pinning(void)
++{
++	struct stc_workload_s wl;
++	cpu_set_t masks[3];
++	int ncpus = stc_ncpus();
++	int quiet = ncpus - 1;
++	int nworkers = 3;
++	int run_ret;
++	int i;
++
++	masks[0] = 0;
++	masks[1] = 0;
++	masks[2] = 0;
++	CPU_SET(0, &masks[0]);
++	CPU_SET(0, &masks[1]);
++	CPU_SET(quiet, &masks[2]);
++
++	stc_workload_init(&wl, nworkers, SCHED_PRIORITY_DEFAULT, SCHED_RR);
++	wl.window_ms = STC_AFF_WINDOW_MS;
++	wl.affinities = masks;
++	wl.sample_cpu = true;
++
++	run_ret = stc_run_workload(&wl);
++
++	stc_report("SCN-AFF-03", nworkers);
++
++	TC_ASSERT_EQ("aff03_workload", run_ret, OK);
++
++	/* Nobody starved, and nobody strayed. */
++
++	for (i = 0; i < nworkers; i++) {
++		TC_ASSERT_GT("aff03_all_ran", stc_count(i),
++			     STC_AFF_MIN_SAMPLES);
++		TC_ASSERT_EQ("aff03_no_violation", stc_cpu_violations(i), 0);
++	}
++
++	/* The lone task on the quiet CPU has it to itself, so it cannot have
++	 * done less work than either task sharing the busy one.
++	 */
++
++	TC_ASSERT_GEQ("aff03_quiet_not_starved", stc_count(2), stc_count(0));
++	TC_ASSERT_GEQ("aff03_quiet_not_starved", stc_count(2), stc_count(1));
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sched_aff04_spread_across_cpus
++ *
++ * @testcase             :stc_sched_aff04_spread_across_cpus
++ * @brief                :SCN-AFF-04, unpinned tasks spread across the CPUs
++ * @scenario             :Create exactly as many unpinned CPU bound tasks as
++ *                        there are CPUs.  With no affinity restriction and
++ *                        no oversubscription the scheduler should place one
++ *                        on each CPU, leaving none idle while work is
++ *                        available.
++ *                        The union of the CPUs observed across all workers
++ *                        must therefore cover every CPU.  A scheduler that
++ *                        crowds every task onto one CPU still produces
++ *                        healthy looking per task counters, so counting work
++ *                        alone would not detect it; only the placement
++ *                        observation does.
++ * @apicovered           :sched_getcpu, task_create, sched_getcpucount
++ * @precondition         :CONFIG_SMP_NCPUS greater than one
++ * @postcondition        :all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_aff04_spread_across_cpus(void)
++{
++	struct stc_workload_s wl;
++	uint32_t union_mask = 0;
++	uint32_t all_cpus;
++	int ncpus = stc_ncpus();
++	int run_ret;
++	int i;
++
++	if (ncpus > STC_MAX_WORKERS) {
++		ncpus = STC_MAX_WORKERS;
++	}
++
++	all_cpus = (ncpus >= 32) ? 0xffffffffu : ((1u << ncpus) - 1u);
++
++	stc_workload_init(&wl, ncpus, SCHED_PRIORITY_DEFAULT, SCHED_RR);
++	wl.window_ms = STC_AFF_WINDOW_MS;
++	wl.sample_cpu = true;
++
++	run_ret = stc_run_workload(&wl);
++
++	for (i = 0; i < ncpus; i++) {
++		union_mask |= stc_cpu_seen_mask(i);
++	}
++
++	printf("[SCN-AFF-04] union=0x%x expected=0x%x\n",
++	       (unsigned int)union_mask, (unsigned int)all_cpus);
++
++	TC_ASSERT_EQ("aff04_workload", run_ret, OK);
++
++	for (i = 0; i < ncpus; i++) {
++		TC_ASSERT_GT("aff04_all_ran", stc_count(i),
++			     STC_AFF_MIN_SAMPLES);
++	}
++
++	/* Every CPU carried some of the load. */
++
++	TC_ASSERT_EQ("aff04_all_cpus_used", union_mask, all_cpus);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sched_aff05_idle_rejected
++ *
++ * @testcase             :stc_sched_aff05_idle_rejected
++ * @brief                :SCN-AFF-05, the affinity of an IDLE task cannot be
++ *                        changed
++ * @scenario             :Locate an IDLE task by walking the task lists and
++ *                        picking the one at priority zero, then attempt to
++ *                        change its affinity.
++ *                        The IDLE tasks are the only tasks in the system
++ *                        locked to a CPU, and moving one would leave a CPU
++ *                        with nothing to fall back to, so the request has to
++ *                        be refused with EINVAL.  The task is found by scan
++ *                        rather than by assuming a PID, because the mapping
++ *                        of IDLE tasks to low PIDs is an implementation
++ *                        detail this test should not depend on.
++ * @apicovered           :sched_setaffinity, sched_foreach via the test driver
++ * @precondition         :CONFIG_SMP_NCPUS greater than one
++ * @postcondition        :none
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_aff05_idle_rejected(void)
++{
++	cpu_set_t mask = 0;
++	pid_t idle;
++	int ret;
++
++	idle = stc_aff_find_idle();
++
++	printf("[SCN-AFF-05] idle pid=%d\n", (int)idle);
++
++	TC_ASSERT_GT("aff05_found_idle", idle, 0);
++
++	CPU_SET(0, &mask);
++	ret = sched_setaffinity(idle, sizeof(cpu_set_t), &mask);
++
++	/* TizenRT's sched_setaffinity() returns the negative errno directly
++	 * rather than returning ERROR and setting errno, which is what POSIX
++	 * specifies.  The existing API level test asserts the same thing on
++	 * its non-SMP path, so the convention is settled even though it is
++	 * not the standard one; assert what the implementation does.
++	 */
++
++	TC_ASSERT_EQ("aff05_rejected", ret, -EINVAL);
++
++	TC_SUCCESS_RESULT();
++}
++
++#endif							/* CONFIG_SMP */
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_sched_affinity_main
++ ****************************************************************************/
++
++int stc_sched_affinity_main(void)
++{
++#ifdef CONFIG_SMP
++	if (stc_ncpus() < 2) {
++		printf("[SCN-AFF] skipped, single CPU configuration\n");
++		return 0;
++	}
++
++	printf("[SCN-AFF] affinity and placement scenarios, ncpus=%d\n",
++	       stc_ncpus());
++
++	stc_sched_aff01_pinned_stays_put();
++	stc_sched_aff02_migrate_running_task();
++	stc_sched_aff03_uneven_pinning();
++	stc_sched_aff04_spread_across_cpus();
++	stc_sched_aff05_idle_rejected();
++#else
++	printf("[SCN-AFF] skipped, built without CONFIG_SMP\n");
++#endif
++
++	return 0;
++}
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_common.c b/apps/examples/testcase/le_tc/kernel/stc_sched_common.c
+index ac5c3acf..7e4fa53e 100644
+--- a/apps/examples/testcase/le_tc/kernel/stc_sched_common.c
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_common.c
+@@ -64,6 +64,31 @@ static volatile int g_exited;
+ static int g_policy;
+ static bool g_pinned;
+ static cpu_set_t g_affinity;
++static bool g_sample_cpu;
++
++/* Per worker parameters, resolved from the workload before any worker is
++ * created so that a worker never has to dereference the caller's structure.
++ */
++
++static int g_prio[STC_MAX_WORKERS];
++static cpu_set_t g_mask[STC_MAX_WORKERS];
++static bool g_has_mask[STC_MAX_WORKERS];
++
++/* Mask each worker is expected to stay within.  Separate from g_mask because
++ * a scenario may change a worker's affinity mid flight, and samples taken
++ * after that must be judged against the new mask.
++ */
++
++static volatile cpu_set_t g_allowed[STC_MAX_WORKERS];
++
++static struct stc_cpuobs_s g_cpuobs[STC_MAX_WORKERS];
++static uint32_t g_cpuobs_violations[STC_MAX_WORKERS];
++static uint32_t g_cpuobs_seen[STC_MAX_WORKERS];
++
++/* Caller priority saved across a start and finish pair. */
++
++static struct sched_param g_saved_param;
++static bool g_prio_restore;
+ 
+ /* PIDs of the created workers, for teardown. */
+ 
+@@ -105,15 +130,14 @@ static int stc_spin_worker(int argc, char *argv[])
+ 		return ERROR;
+ 	}
+ 
+-	/* Apply the requested policy at the priority we were created with. */
++	/* Apply the requested policy at this worker's priority. */
+ 
+-	if (sched_getparam(0, &param) == OK) {
+-		(void)sched_setscheduler(0, g_policy, &param);
+-	}
++	param.sched_priority = g_prio[idx];
++	(void)sched_setscheduler(0, g_policy, &param);
+ 
+ #ifdef CONFIG_SMP
+-	if (g_pinned) {
+-		cpu_set_t mask = g_affinity;
++	if (g_has_mask[idx]) {
++		cpu_set_t mask = g_mask[idx];
+ 		(void)sched_setaffinity(0, sizeof(cpu_set_t), &mask);
+ 	}
+ #endif
+@@ -124,6 +148,26 @@ static int stc_spin_worker(int argc, char *argv[])
+ 
+ 	while (g_run) {
+ 		g_worker[idx].count++;
++
++#ifdef CONFIG_SMP
++		if (g_sample_cpu) {
++			int cpu = sched_getcpu();
++			cpu_set_t allowed = g_allowed[idx];
++
++			if (cpu >= 0) {
++				g_cpuobs[idx].seen_mask |= (1u << cpu);
++
++				/* An allowed mask of zero means the worker was
++				 * never constrained, so any CPU is correct.
++				 */
++
++				if (allowed != 0 &&
++				    ((allowed >> cpu) & 1) == 0) {
++					g_cpuobs[idx].violations++;
++				}
++			}
++		}
++#endif
+ 	}
+ 
+ 	g_exited++;
+@@ -140,6 +184,8 @@ static void stc_zero_counters(void)
+ 
+ 	for (i = 0; i < STC_MAX_WORKERS; i++) {
+ 		g_worker[i].count = 0;
++		g_cpuobs[i].seen_mask = 0;
++		g_cpuobs[i].violations = 0;
+ 	}
+ }
+ 
+@@ -185,50 +231,95 @@ int stc_ncpus(void)
+ }
+ 
+ /****************************************************************************
+- * Name: stc_run_workload
++ * Name: stc_workload_init
+  ****************************************************************************/
+ 
+-int stc_run_workload(const struct stc_workload_s *wl)
++void stc_workload_init(struct stc_workload_s *wl, int nworkers, int priority,
++		       int policy)
++{
++	if (wl == NULL) {
++		return;
++	}
++
++	memset(wl, 0, sizeof(struct stc_workload_s));
++	wl->nworkers = nworkers;
++	wl->priority = priority;
++	wl->policy = policy;
++	wl->window_ms = STC_WINDOW_MS;
++}
++
++/****************************************************************************
++ * Name: stc_workload_start
++ ****************************************************************************/
++
++int stc_workload_start(const struct stc_workload_s *wl)
+ {
+-	struct sched_param saved;
+ 	struct sched_param boosted;
+ 	char idxbuf[STC_MAX_WORKERS][8];
+ 	char *argv[2];
+-	bool restore = false;
+-	int window;
+-	int ret = OK;
++	int top;
+ 	int i;
+ 
+ 	if (wl == NULL || wl->nworkers <= 0 || wl->nworkers > STC_MAX_WORKERS) {
+ 		return ERROR;
+ 	}
+ 
+-	window = (wl->window_ms > 0) ? wl->window_ms : STC_WINDOW_MS;
+-
+-	/* Publish the worker parameters before anything can read them. */
++	/* Resolve every per worker parameter now, so that a worker never has
++	 * to reach back into the caller's structure.
++	 */
+ 
+ 	g_policy = wl->policy;
+ 	g_pinned = wl->pinned;
+ 	g_affinity = wl->affinity;
++	g_sample_cpu = wl->sample_cpu;
++
++	top = wl->priority;
++
++	for (i = 0; i < STC_MAX_WORKERS; i++) {
++		g_prio[i] = wl->priority;
++		g_mask[i] = wl->affinity;
++		g_has_mask[i] = wl->pinned;
++		g_allowed[i] = wl->pinned ? wl->affinity : 0;
++	}
++
++	for (i = 0; i < wl->nworkers; i++) {
++		if (wl->priorities != NULL) {
++			g_prio[i] = wl->priorities[i];
++			if (g_prio[i] > top) {
++				top = g_prio[i];
++			}
++		}
++
++		if (wl->affinities != NULL) {
++			g_mask[i] = wl->affinities[i];
++			g_has_mask[i] = (wl->affinities[i] != 0);
++			g_allowed[i] = wl->affinities[i];
++		}
++	}
+ 
+ 	stc_zero_counters();
+ 	memset(g_snapshot, 0, sizeof(g_snapshot));
++	memset(g_cpuobs_violations, 0, sizeof(g_cpuobs_violations));
++	memset(g_cpuobs_seen, 0, sizeof(g_cpuobs_seen));
+ 	memset(g_pid, 0, sizeof(g_pid));
+ 	g_exited = 0;
+ 	g_run = true;
+ 
+-	/* Lift the harness above the workload.  A harness at or below the
+-	 * workload priority competes with the thing it is measuring.
++	/* Lift the harness above the highest priority in the workload.  A
++	 * harness at or below the workload competes with the thing it is
++	 * measuring.
+ 	 */
+ 
+-	if (sched_getparam(0, &saved) == OK) {
+-		boosted.sched_priority = wl->priority + STC_HARNESS_BOOST;
++	g_prio_restore = false;
++
++	if (sched_getparam(0, &g_saved_param) == OK) {
++		boosted.sched_priority = top + STC_HARNESS_BOOST;
+ 		if (boosted.sched_priority > SCHED_PRIORITY_MAX) {
+ 			boosted.sched_priority = SCHED_PRIORITY_MAX;
+ 		}
+ 
+ 		if (sched_setparam(0, &boosted) == OK) {
+-			restore = true;
++			g_prio_restore = true;
+ 		}
+ 	}
+ 
+@@ -237,39 +328,62 @@ int stc_run_workload(const struct stc_workload_s *wl)
+ 		argv[0] = idxbuf[i];
+ 		argv[1] = NULL;
+ 
+-		g_pid[i] = task_create("stcwrk", wl->priority,
++		g_pid[i] = task_create("stcwrk", g_prio[i],
+ 				       STC_WORKER_STACKSIZE, stc_spin_worker,
+ 				       (char * const *)argv);
+ 		if (g_pid[i] < 0) {
+-			ret = ERROR;
+-			break;
++			return ERROR;
+ 		}
+ 	}
+ 
+-	if (ret == OK) {
+-		/* Discard the warm-up.  Zeroing the counters afterwards is a
+-		 * cheaper and more reliable way to drop this period than trying
+-		 * to timestamp its end.
+-		 */
++	/* Discard the warm-up.  Zeroing the counters afterwards is a cheaper
++	 * and more reliable way to drop this period than trying to timestamp
++	 * its end.
++	 */
++
++	usleep(STC_WARMUP_MS * 1000);
++	stc_zero_counters();
+ 
+-		usleep(STC_WARMUP_MS * 1000);
+-		stc_zero_counters();
++	return OK;
++}
+ 
+-		/* Measurement window.  Nothing is printed in here. */
++/****************************************************************************
++ * Name: stc_workload_sample
++ ****************************************************************************/
+ 
+-		usleep(window * 1000);
++void stc_workload_sample(int window_ms)
++{
++	int window = (window_ms > 0) ? window_ms : STC_WINDOW_MS;
++	int i;
+ 
+-		for (i = 0; i < wl->nworkers; i++) {
+-			g_snapshot[i] = g_worker[i].count;
+-		}
++	/* Each sample starts from zero, so consecutive samples describe
++	 * distinct intervals rather than accumulating.
++	 */
++
++	stc_zero_counters();
++
++	usleep(window * 1000);
++
++	for (i = 0; i < STC_MAX_WORKERS; i++) {
++		g_snapshot[i] = g_worker[i].count;
++		g_cpuobs_violations[i] = g_cpuobs[i].violations;
++		g_cpuobs_seen[i] = g_cpuobs[i].seen_mask;
+ 	}
++}
++
++/****************************************************************************
++ * Name: stc_workload_finish
++ ****************************************************************************/
+ 
+-	/* Stop the workers and confirm they are gone. */
++int stc_workload_finish(int nworkers)
++{
++	int ret = OK;
++	int i;
+ 
+ 	g_run = false;
+ 
+-	if (stc_wait_exit(wl->nworkers) != OK) {
+-		for (i = 0; i < wl->nworkers; i++) {
++	if (stc_wait_exit(nworkers) != OK) {
++		for (i = 0; i < nworkers && i < STC_MAX_WORKERS; i++) {
+ 			if (g_pid[i] > 0) {
+ 				(void)task_delete(g_pid[i]);
+ 			}
+@@ -278,8 +392,85 @@ int stc_run_workload(const struct stc_workload_s *wl)
+ 		ret = ERROR;
+ 	}
+ 
+-	if (restore) {
+-		(void)sched_setparam(0, &saved);
++	if (g_prio_restore) {
++		(void)sched_setparam(0, &g_saved_param);
++		g_prio_restore = false;
++	}
++
++	return ret;
++}
++
++/****************************************************************************
++ * Name: stc_worker_pid
++ ****************************************************************************/
++
++pid_t stc_worker_pid(int idx)
++{
++	if (idx < 0 || idx >= STC_MAX_WORKERS) {
++		return 0;
++	}
++
++	return g_pid[idx];
++}
++
++/****************************************************************************
++ * Name: stc_set_allowed
++ ****************************************************************************/
++
++void stc_set_allowed(int idx, cpu_set_t mask)
++{
++	if (idx < 0 || idx >= STC_MAX_WORKERS) {
++		return;
++	}
++
++	g_allowed[idx] = mask;
++}
++
++/****************************************************************************
++ * Name: stc_cpu_violations
++ ****************************************************************************/
++
++uint32_t stc_cpu_violations(int idx)
++{
++	if (idx < 0 || idx >= STC_MAX_WORKERS) {
++		return 0;
++	}
++
++	return g_cpuobs_violations[idx];
++}
++
++/****************************************************************************
++ * Name: stc_cpu_seen_mask
++ ****************************************************************************/
++
++uint32_t stc_cpu_seen_mask(int idx)
++{
++	if (idx < 0 || idx >= STC_MAX_WORKERS) {
++		return 0;
++	}
++
++	return g_cpuobs_seen[idx];
++}
++
++/****************************************************************************
++ * Name: stc_run_workload
++ ****************************************************************************/
++
++int stc_run_workload(const struct stc_workload_s *wl)
++{
++	int ret;
++
++	if (wl == NULL || wl->nworkers <= 0 || wl->nworkers > STC_MAX_WORKERS) {
++		return ERROR;
++	}
++
++	ret = stc_workload_start(wl);
++	if (ret == OK) {
++		stc_workload_sample(wl->window_ms);
++	}
++
++	if (stc_workload_finish(wl->nworkers) != OK) {
++		ret = ERROR;
+ 	}
+ 
+ 	return ret;
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_common.h b/apps/examples/testcase/le_tc/kernel/stc_sched_common.h
+index 4a4b858f..37b2e4c5 100644
+--- a/apps/examples/testcase/le_tc/kernel/stc_sched_common.h
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_common.h
+@@ -48,6 +48,7 @@
+ #include <stdint.h>
+ #include <stdbool.h>
+ #include <sched.h>
++#include <sys/types.h>
+ 
+ /****************************************************************************
+  * Pre-processor Definitions
+@@ -104,7 +105,22 @@ struct stc_worker_s {
+ 	uint8_t pad[STC_CACHELINE - sizeof(uint32_t)];
+ } __attribute__((aligned(STC_CACHELINE)));
+ 
+-/* Description of the load a scenario wants applied. */
++/* Per worker CPU placement observations, gathered when sample_cpu is set.
++ * Isolated in its own cache line for the same reason the counters are.
++ */
++
++struct stc_cpuobs_s {
++	volatile uint32_t seen_mask;	/* Bit set of CPUs this worker ran on */
++	volatile uint32_t violations;	/* Samples taken outside its mask     */
++	uint8_t pad[STC_CACHELINE - 2 * sizeof(uint32_t)];
++} __attribute__((aligned(STC_CACHELINE)));
++
++/* Description of the load a scenario wants applied.
++ *
++ * Always initialise with stc_workload_init() before setting fields.  The
++ * structure has optional members, and a partially initialised one would take
++ * its per worker arrays from whatever was on the stack.
++ */
+ 
+ struct stc_workload_s {
+ 	int nworkers;			/* Number of spin workers to create      */
+@@ -113,6 +129,22 @@ struct stc_workload_s {
+ 	int window_ms;			/* Measurement window, 0 for the default */
+ 	bool pinned;			/* true: apply the affinity mask below   */
+ 	cpu_set_t affinity;		/* Mask applied when pinned is true      */
++
++	/* Optional per worker overrides.  When non NULL each array must hold
++	 * at least nworkers entries and takes precedence over the single
++	 * values above.
++	 */
++
++	const int *priorities;		/* Per worker priority, or NULL          */
++	const cpu_set_t *affinities;	/* Per worker affinity mask, or NULL     */
++
++	/* When true each worker calls sched_getcpu() on every iteration and
++	 * records where it ran.  This turns the progress counter into a count
++	 * of CPU samples rather than of raw loop iterations, so do not compare
++	 * fairness figures between a sampling and a non sampling run.
++	 */
++
++	bool sample_cpu;
+ };
+ 
+ /****************************************************************************
+@@ -125,6 +157,49 @@ struct stc_workload_s {
+ 
+ int stc_ncpus(void);
+ 
++/* Populate a workload with safe defaults: no per worker arrays, no CPU
++ * sampling, not pinned, and the default measurement window.  Every scenario
++ * must call this before setting any field.
++ */
++
++void stc_workload_init(struct stc_workload_s *wl, int nworkers, int priority,
++		       int policy);
++
++/* Split workload lifecycle, for scenarios that need to act while the load is
++ * running, for example to change a task's priority or affinity mid flight.
++ *
++ *   stc_workload_start()   create the workers, discard the warm-up, raise
++ *                          the caller above the workload
++ *   stc_workload_sample()  zero the counters, run for window_ms, snapshot
++ *                          (may be called more than once)
++ *   stc_workload_finish()  stop the workers, wait for them, restore the
++ *                          caller's priority
++ *
++ * stc_run_workload() below is simply the three called in order.
++ */
++
++int stc_workload_start(const struct stc_workload_s *wl);
++void stc_workload_sample(int window_ms);
++int stc_workload_finish(int nworkers);
++
++/* PID of a running worker, for scenarios that act on one mid flight.
++ * Returns 0 when the index is out of range or no worker was created.
++ */
++
++pid_t stc_worker_pid(int idx);
++
++/* Update the CPU mask a worker is expected to stay within.  Call this
++ * alongside sched_setaffinity() so that samples taken after the change are
++ * judged against the new mask rather than the old one.
++ */
++
++void stc_set_allowed(int idx, cpu_set_t mask);
++
++/* CPU placement results, valid when the workload set sample_cpu. */
++
++uint32_t stc_cpu_violations(int idx);
++uint32_t stc_cpu_seen_mask(int idx);
++
+ /* Apply a workload and record the result.
+  *
+  * Creates the workers, discards STC_WARMUP_MS, zeroes the counters, applies
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_priority.c b/apps/examples/testcase/le_tc/kernel/stc_sched_priority.c
+new file mode 100644
+index 00000000..c2b5a694
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_priority.c
+@@ -0,0 +1,482 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file stc_sched_priority.c
++
++/// @brief Scenario test cases for priority and preemption (family B)
++///
++/// Priority is the scheduler's most basic promise: a runnable task never
++/// waits behind a less important one.  The existing API level tests confirm
++/// that a priority can be stored and read back, which says nothing about
++/// whether the scheduler acts on it.  These scenarios put the promise under
++/// load and check the outcome.
++///
++/// Bounds are stated generously throughout.  The failure modes being hunted
++/// are "never runs" and "runs only once the load finishes", both of which
++/// are seconds wide, so a bound in the tens of milliseconds separates them
++/// from correct behaviour with room to spare and without inviting jitter
++/// related flakiness.
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++
++#include <stdio.h>
++#include <time.h>
++#include <unistd.h>
++#include <semaphore.h>
++#include <sched.h>
++
++#include "tc_internal.h"
++#include "stc_sched_common.h"
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++/* Priority band used by these scenarios.  Kept clear of the default so that
++ * unrelated system activity does not land inside the band under test.
++ */
++
++#define STC_PRI_LOW             (SCHED_PRIORITY_DEFAULT)
++#define STC_PRI_STEP            10
++#define STC_PRI_HIGH            (SCHED_PRIORITY_DEFAULT + 50)
++
++/* Bound on how long a released high priority task may take to run while
++ * every CPU is busy with lower priority work.
++ *
++ * Preemption should be immediate: the post itself causes the switch.  The
++ * bound only has to be tight enough to distinguish that from the broken
++ * behaviour, which is waiting for the low priority load to finish, three
++ * seconds later.  Twenty milliseconds is two round-robin slices, far beyond
++ * anything a correct scheduler needs and far below the failure.
++ */
++
++#define STC_PRI_PREEMPT_MS      20
++
++/* Window used when only presence or absence of progress is being checked,
++ * rather than a ratio.  Shorter than the fairness window because no
++ * averaging is needed.
++ */
++
++#define STC_PRI_WINDOW_MS       1000
++
++/****************************************************************************
++ * Private Data
++ ****************************************************************************/
++
++static sem_t g_release_sem;
++static volatile bool g_hp_ran;
++static volatile uint32_t g_hp_latency_ms;
++static struct timespec g_release_ts;
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_pri_elapsed_ms
++ ****************************************************************************/
++
++static uint32_t stc_pri_elapsed_ms(const struct timespec *from,
++				   const struct timespec *to)
++{
++	int32_t sec = (int32_t)(to->tv_sec - from->tv_sec);
++	int32_t nsec = (int32_t)(to->tv_nsec - from->tv_nsec);
++
++	if (nsec < 0) {
++		sec -= 1;
++		nsec += 1000000000;
++	}
++
++	if (sec < 0) {
++		return 0;
++	}
++
++	return (uint32_t)(sec * 1000 + nsec / 1000000);
++}
++
++/****************************************************************************
++ * Name: stc_pri_highprio_task
++ *
++ * Description:
++ *   Blocks until released, then records how long the release took to turn
++ *   into execution.  Nothing else, so the measurement is not diluted by the
++ *   task's own work.
++ *
++ ****************************************************************************/
++
++static int stc_pri_highprio_task(int argc, char *argv[])
++{
++	struct timespec now;
++
++	(void)sem_wait(&g_release_sem);
++
++	(void)clock_gettime(CLOCK_REALTIME, &now);
++	g_hp_latency_ms = stc_pri_elapsed_ms(&g_release_ts, &now);
++	g_hp_ran = true;
++
++	return OK;
++}
++
++/****************************************************************************
++ * Name: stc_sched_pri01_preempt_under_load
++ *
++ * @testcase             :stc_sched_pri01_preempt_under_load
++ * @brief                :SCN-PRI-01, a high priority task preempts a fully
++ *                        loaded system
++ * @scenario             :Saturate every CPU with low priority CPU bound
++ *                        tasks, then release a high priority task that has
++ *                        been blocked on a semaphore.  Measure the interval
++ *                        between the post and the task actually running.
++ *                        Because the low priority tasks never block, the
++ *                        only way the high priority task can run is by
++ *                        preempting one of them.  If preemption does not
++ *                        work it does not run until the load is torn down,
++ *                        which is orders of magnitude outside the bound.
++ * @apicovered           :task_create, sem_post, sem_wait, sched_setscheduler
++ * @precondition         :none
++ * @postcondition        :high priority task exited, all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_pri01_preempt_under_load(void)
++{
++	struct stc_workload_s wl;
++	int ncpus = stc_ncpus();
++	int nworkers = ncpus;
++	pid_t hp;
++	int start_ret;
++	int finish_ret;
++
++	g_hp_ran = false;
++	g_hp_latency_ms = 0;
++
++	if (sem_init(&g_release_sem, 0, 0) != OK) {
++		TC_ASSERT("pri01_sem_init", false);
++	}
++
++	stc_workload_init(&wl, nworkers, STC_PRI_LOW, SCHED_RR);
++
++	start_ret = stc_workload_start(&wl);
++
++	hp = task_create("stchp", STC_PRI_HIGH, STC_WORKER_STACKSIZE,
++			 stc_pri_highprio_task, (char * const *)NULL);
++
++	if (start_ret == OK && hp > 0) {
++		/* Give the high priority task time to reach sem_wait, then
++		 * release it and let it record its own latency.
++		 */
++
++		usleep(100 * 1000);
++
++		(void)clock_gettime(CLOCK_REALTIME, &g_release_ts);
++		(void)sem_post(&g_release_sem);
++
++		usleep(500 * 1000);
++	}
++
++	finish_ret = stc_workload_finish(nworkers);
++
++	if (hp > 0 && !g_hp_ran) {
++		(void)task_delete(hp);
++	}
++
++	(void)sem_destroy(&g_release_sem);
++
++	printf("[SCN-PRI-01] preempt latency=%ums ran=%d\n",
++	       (unsigned int)g_hp_latency_ms, (int)g_hp_ran);
++
++	TC_ASSERT_EQ("pri01_workload_start", start_ret, OK);
++	TC_ASSERT_GT("pri01_task_create", hp, 0);
++	TC_ASSERT_EQ("pri01_workload_finish", finish_ret, OK);
++
++	/* Hard correctness assertion: it ran at all. */
++
++	TC_ASSERT("pri01_highprio_ran", g_hp_ran);
++
++	/* Bounded latency assertion. */
++
++	TC_ASSERT_LEQ("pri01_preempt_latency", g_hp_latency_ms,
++		      STC_PRI_PREEMPT_MS);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sched_pri02_strict_ordering
++ *
++ * @testcase             :stc_sched_pri02_strict_ordering
++ * @brief                :SCN-PRI-02, strict priority ordering when
++ *                        oversubscribed
++ * @scenario             :Create a ladder of CPU bound tasks, each at a
++ *                        distinct priority, with more tasks than CPUs.  None
++ *                        of them ever blocks, so the scheduler has a free
++ *                        choice and priority is the only thing that should
++ *                        decide it.
++ *                        Exactly the top ncpus tasks should accumulate work
++ *                        and every task below them should record exactly
++ *                        zero.  Unlike a fairness ratio this is an absolute
++ *                        statement with no tolerance: a single count on a
++ *                        task that should never have run is a defect.
++ * @apicovered           :task_create, sched_setscheduler, sched_getcpucount
++ * @precondition         :none
++ * @postcondition        :all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_pri02_strict_ordering(void)
++{
++	struct stc_workload_s wl;
++	int prios[STC_MAX_WORKERS];
++	int ncpus = stc_ncpus();
++	int nworkers = ncpus + 2;
++	int run_ret;
++	int i;
++
++	if (nworkers > STC_MAX_WORKERS) {
++		nworkers = STC_MAX_WORKERS;
++	}
++
++	/* Worker 0 is the highest priority, descending from there, so the
++	 * first ncpus entries are the ones that should run.
++	 */
++
++	for (i = 0; i < nworkers; i++) {
++		prios[i] = STC_PRI_LOW + (nworkers - 1 - i) * STC_PRI_STEP;
++	}
++
++	stc_workload_init(&wl, nworkers, prios[0], SCHED_RR);
++	wl.priorities = prios;
++	wl.window_ms = STC_PRI_WINDOW_MS;
++
++	run_ret = stc_run_workload(&wl);
++
++	stc_report("SCN-PRI-02", nworkers);
++
++	TC_ASSERT_EQ("pri02_workload", run_ret, OK);
++
++	/* The top ncpus tasks must all have run. */
++
++	for (i = 0; i < ncpus; i++) {
++		TC_ASSERT_GT("pri02_top_ran", stc_count(i), 0);
++	}
++
++	/* Everything below them must not have run at all. */
++
++	for (i = ncpus; i < nworkers; i++) {
++		TC_ASSERT_EQ("pri02_lower_blocked", stc_count(i), 0);
++	}
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sched_pri03_raise_waiting_task
++ *
++ * @testcase             :stc_sched_pri03_raise_waiting_task
++ * @brief                :SCN-PRI-03, raising a waiting task makes it run
++ * @scenario             :Start ncpus + 1 equal priority CPU bound tasks, so
++ *                        that at least one is always waiting, and confirm
++ *                        over a first window which of them is starved.  Then
++ *                        raise the last worker above the rest with
++ *                        sched_setparam and measure a second window.
++ *                        After the change that worker outranks every other
++ *                        runnable task, so it must accumulate work in the
++ *                        second window regardless of what it did in the
++ *                        first.  This exercises the promotion path for a
++ *                        task that is ready to run but not currently
++ *                        assigned to any CPU, which is a different code path
++ *                        from promoting a running task.
++ * @apicovered           :sched_setparam, task_create, sched_setscheduler
++ * @precondition         :none
++ * @postcondition        :all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_pri03_raise_waiting_task(void)
++{
++	struct stc_workload_s wl;
++	struct sched_param param;
++	int ncpus = stc_ncpus();
++	int nworkers = ncpus + 1;
++	int target = nworkers - 1;
++	int start_ret;
++	int set_ret = ERROR;
++	int finish_ret;
++	uint32_t after = 0;
++
++	stc_workload_init(&wl, nworkers, STC_PRI_LOW, SCHED_RR);
++
++	start_ret = stc_workload_start(&wl);
++
++	if (start_ret == OK) {
++		/* First window establishes the unpromoted baseline. */
++
++		stc_workload_sample(STC_PRI_WINDOW_MS);
++
++		param.sched_priority = STC_PRI_LOW + STC_PRI_STEP;
++		set_ret = sched_setparam(stc_worker_pid(target), &param);
++
++		/* Second window is the one under test. */
++
++		stc_workload_sample(STC_PRI_WINDOW_MS);
++		after = stc_count(target);
++	}
++
++	finish_ret = stc_workload_finish(nworkers);
++
++	printf("[SCN-PRI-03] promoted worker %d count_after=%u\n",
++	       target, (unsigned int)after);
++
++	TC_ASSERT_EQ("pri03_workload_start", start_ret, OK);
++	TC_ASSERT_EQ("pri03_setparam", set_ret, OK);
++	TC_ASSERT_EQ("pri03_workload_finish", finish_ret, OK);
++
++	/* Once promoted it outranks every peer, so it must run. */
++
++	TC_ASSERT_GT("pri03_promoted_ran", after, 0);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sched_pri04_lower_running_task
++ *
++ * @testcase             :stc_sched_pri04_lower_running_task
++ * @brief                :SCN-PRI-04, lowering a task yields the CPU
++ * @scenario             :Start a ladder in which worker 0 outranks the rest
++ *                        and confirm in a first window that the lower
++ *                        workers are held off.  Then lower worker 0 below
++ *                        them with sched_setparam and measure a second
++ *                        window.
++ *                        After the change worker 0 is the least important
++ *                        runnable task, so the previously blocked workers
++ *                        must start making progress.  This is the mirror of
++ *                        SCN-PRI-03 and covers demotion of a task that is
++ *                        currently running, which the promotion path does
++ *                        not reach.
++ * @apicovered           :sched_setparam, task_create, sched_setscheduler
++ * @precondition         :none
++ * @postcondition        :all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_pri04_lower_running_task(void)
++{
++	struct stc_workload_s wl;
++	struct sched_param param;
++	int prios[STC_MAX_WORKERS];
++	int ncpus = stc_ncpus();
++	int nworkers = ncpus + 1;
++	int start_ret;
++	int set_ret = ERROR;
++	int finish_ret;
++	uint32_t blocked_before = 0;
++	uint32_t blocked_after = 0;
++	uint32_t top_before = 0;
++	uint32_t top_after = 0;
++	int i;
++
++	if (nworkers > STC_MAX_WORKERS) {
++		nworkers = STC_MAX_WORKERS;
++	}
++
++	/* Worker 0 on top, everyone else level below it. */
++
++	prios[0] = STC_PRI_LOW + 2 * STC_PRI_STEP;
++	for (i = 1; i < nworkers; i++) {
++		prios[i] = STC_PRI_LOW;
++	}
++
++	stc_workload_init(&wl, nworkers, prios[0], SCHED_RR);
++	wl.priorities = prios;
++
++	start_ret = stc_workload_start(&wl);
++
++	if (start_ret == OK) {
++		stc_workload_sample(STC_PRI_WINDOW_MS);
++		blocked_before = stc_min_range(1, nworkers);
++		top_before = stc_count(0);
++
++		/* Drop worker 0 below the rest. */
++
++		param.sched_priority = STC_PRI_LOW - STC_PRI_STEP;
++		set_ret = sched_setparam(stc_worker_pid(0), &param);
++
++		stc_workload_sample(STC_PRI_WINDOW_MS);
++		blocked_after = stc_min_range(1, nworkers);
++		top_after = stc_count(0);
++	}
++
++	finish_ret = stc_workload_finish(nworkers);
++
++	printf("[SCN-PRI-04] peers min before=%u after=%u   demoted w0 before=%u after=%u\n",
++	       (unsigned int)blocked_before, (unsigned int)blocked_after,
++	       (unsigned int)top_before, (unsigned int)top_after);
++
++	TC_ASSERT_EQ("pri04_workload_start", start_ret, OK);
++	TC_ASSERT_EQ("pri04_setparam", set_ret, OK);
++	TC_ASSERT_EQ("pri04_workload_finish", finish_ret, OK);
++
++	/* Demoting the top task must let every remaining task run.
++	 *
++	 * The minimum is taken over the peers only, deliberately excluding
++	 * worker 0.  After the demotion worker 0 is the least important
++	 * runnable task, so on an oversubscribed machine it is the one that
++	 * should now be starved; including it in the minimum would assert
++	 * the opposite of the property under test.
++	 */
++
++	TC_ASSERT_GT("pri04_blocked_released", blocked_after, 0);
++
++	/* And the demoted task must have given up ground, otherwise the
++	 * peers could be running for some reason unrelated to the demotion.
++	 */
++
++	TC_ASSERT_LT("pri04_demoted_yielded", top_after, top_before);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_sched_priority_main
++ ****************************************************************************/
++
++int stc_sched_priority_main(void)
++{
++	printf("[SCN-PRI] priority and preemption scenarios, ncpus=%d\n",
++	       stc_ncpus());
++
++	stc_sched_pri01_preempt_under_load();
++	stc_sched_pri02_strict_ordering();
++	stc_sched_pri03_raise_waiting_task();
++	stc_sched_pri04_lower_running_task();
++
++	return 0;
++}
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_rr.c b/apps/examples/testcase/le_tc/kernel/stc_sched_rr.c
+index 3bc7e5ab..73a6cfc4 100644
+--- a/apps/examples/testcase/le_tc/kernel/stc_sched_rr.c
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_rr.c
+@@ -154,12 +154,7 @@ static void stc_sched_rr01_fairness_oversubscribed(void)
+ 	int ncpus = stc_ncpus();
+ 	int nworkers = ncpus + 1;
+ 
+-	wl.nworkers = nworkers;
+-	wl.priority = SCHED_PRIORITY_DEFAULT;
+-	wl.policy = SCHED_RR;
+-	wl.window_ms = STC_WINDOW_MS;
+-	wl.pinned = false;
+-	wl.affinity = 0;
++	stc_workload_init(&wl, nworkers, SCHED_PRIORITY_DEFAULT, SCHED_RR);
+ 
+ 	stc_rr_run_monitored(&wl, &res);
+ 
+@@ -212,11 +207,7 @@ static void stc_sched_rr02_fairness_single_cpu(void)
+ 	struct stc_rr_result_s res;
+ 	int nworkers = 3;
+ 
+-	wl.nworkers = nworkers;
+-	wl.priority = SCHED_PRIORITY_DEFAULT;
+-	wl.policy = SCHED_RR;
+-	wl.window_ms = STC_WINDOW_MS;
+-	wl.affinity = 0;
++	stc_workload_init(&wl, nworkers, SCHED_PRIORITY_DEFAULT, SCHED_RR);
+ #ifdef CONFIG_SMP
+ 	CPU_SET(0, &wl.affinity);
+ 	wl.pinned = true;
+@@ -287,12 +278,8 @@ static void stc_sched_rr03_fairness_secondary_cpu(void)
+ 
+ 	target = ncpus - 1;
+ 
+-	wl.nworkers = nworkers;
+-	wl.priority = SCHED_PRIORITY_DEFAULT;
+-	wl.policy = SCHED_RR;
+-	wl.window_ms = STC_WINDOW_MS;
++	stc_workload_init(&wl, nworkers, SCHED_PRIORITY_DEFAULT, SCHED_RR);
+ 	wl.pinned = true;
+-	wl.affinity = 0;
+ 	CPU_SET(target, &wl.affinity);
+ 
+ 	stc_rr_run_monitored(&wl, &res);
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_smp.c b/apps/examples/testcase/le_tc/kernel/stc_sched_smp.c
+index edd315e5..023f6f16 100644
+--- a/apps/examples/testcase/le_tc/kernel/stc_sched_smp.c
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_smp.c
+@@ -79,12 +79,7 @@ static void stc_sched_smp01_starvation_invariant(void)
+ 	int run_ret;
+ 	int stop_ret;
+ 
+-	wl.nworkers = nworkers;
+-	wl.priority = SCHED_PRIORITY_DEFAULT;
+-	wl.policy = SCHED_RR;
+-	wl.window_ms = STC_WINDOW_MS;
+-	wl.pinned = false;
+-	wl.affinity = 0;
++	stc_workload_init(&wl, nworkers, SCHED_PRIORITY_DEFAULT, SCHED_RR);
+ 
+ 	mon_started = stc_monitor_start(SCHED_PRIORITY_DEFAULT);
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_internal.h b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+index e27a329c..6e640736 100644
+--- a/apps/examples/testcase/le_tc/kernel/tc_internal.h
++++ b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+@@ -102,6 +102,8 @@ int itc_timer_main(void);
+ int itc_pthread_main(void);
+ int stc_sched_rr_main(void);
+ int stc_sched_smp_main(void);
++int stc_sched_priority_main(void);
++int stc_sched_affinity_main(void);
+ int tc_get_drvfd(void);
+ 
+ #endif /* __EXAMPLES_TESTCASE_KERNEL_TC_INTERNAL_H */
+-- 
+2.43.0
+
