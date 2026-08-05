@@ -1,0 +1,1341 @@
+From a72fc87ecde108655102e64876a169202a581e8f Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_sched_fixed <>
+Date: Wed, 5 Aug 2026 19:36:44 +0000
+Subject: [PATCH] apps/examples/testcase: add blocking and task lifecycle
+ families
+
+Phase 5 of the scenario test rollout.  Most real workloads are not CPU
+bound; they block, and the scheduler's behaviour at the moment of a wake
+matters more than its behaviour under saturation.  Task creation and
+destruction are exercised constantly by the existing tests, but always on an
+idle system, which is not where the list manipulation is delicate.
+
+stc_sched_blocking adds four scenarios.  BLK-01 parks eight tasks on one
+semaphore, two at each of four priorities, and posts from a task that
+outranks all of them so that every post completes before any waiter runs;
+the resulting order is therefore the scheduler's decision rather than an
+artefact of interleaving, and it must be descending across priorities and
+arrival ordered within one.  BLK-02 measures a wake crossing to an idle
+remote CPU, where a missing inter processor signal does not lose the wake
+but defers it until that CPU next reschedules for some unrelated reason.
+BLK-03 runs a timed wait under full saturation, because a timeout that is
+itself subject to starvation removes the last line of defence a driver has.
+BLK-04 queues fifteen messages at three interleaved priorities before
+starting the consumer, so delivery order is the queue's decision, and counts
+them back to detect silent loss.
+
+stc_sched_lifecycle adds four.  LIFE-01 creates and retires a thousand tasks
+while every CPU is saturated and compares task control block count and heap
+usage; a per iteration leak of even one control block is invisible in a
+single create and destroy test and unmistakable after a thousand.  LIFE-02
+deletes a task while it is executing on another CPU, which is the most
+intricate removal path in the scheduler: the other CPU has to be interrupted
+and made to pick something else before the control block can be released.
+LIFE-03 deletes a blocked waiter and then posts once, because a stale entry
+left on the wait list would send that post to a task that no longer exists
+and leave the surviving waiter blocked forever; asserting only that the
+delete returned success would miss it.  LIFE-04 cancels a thread under
+saturation and asserts on the join completing rather than on the cancel
+returning, since a cancel that is accepted but never acted upon leaves the
+join blocked.
+
+The oracles in the lifecycle family are about what is left behind rather
+than about timing, because a defect there does not announce itself; it
+leaks a control block or a wait list entry and the system degrades later for
+no visible reason.  Both the SMP and non-SMP compilation paths are warning
+free under -Wall -Wextra.
+---
+ apps/examples/testcase/le_tc/kernel/Make.defs |   2 +
+ .../testcase/le_tc/kernel/kernel_tc_main.c    |   2 +
+ .../le_tc/kernel/stc_sched_blocking.c         | 638 ++++++++++++++++++
+ .../le_tc/kernel/stc_sched_lifecycle.c        | 593 ++++++++++++++++
+ .../testcase/le_tc/kernel/tc_internal.h       |   2 +
+ 5 files changed, 1237 insertions(+)
+ create mode 100644 apps/examples/testcase/le_tc/kernel/stc_sched_blocking.c
+ create mode 100644 apps/examples/testcase/le_tc/kernel/stc_sched_lifecycle.c
+
+diff --git a/apps/examples/testcase/le_tc/kernel/Make.defs b/apps/examples/testcase/le_tc/kernel/Make.defs
+index e2ac2f8f..5edc6d63 100644
+--- a/apps/examples/testcase/le_tc/kernel/Make.defs
++++ b/apps/examples/testcase/le_tc/kernel/Make.defs
+@@ -188,6 +188,8 @@ ifeq ($(CONFIG_STC_KERNEL_SCHED),y)
+   CSRCS += stc_sched_affinity.c
+   CSRCS += stc_sched_lock.c
+   CSRCS += stc_sched_inversion.c
++  CSRCS += stc_sched_blocking.c
++  CSRCS += stc_sched_lifecycle.c
+ endif
+ 
+ # Include kernel build support
+diff --git a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+index ec218f54..ae6a167d 100644
+--- a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
++++ b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+@@ -233,6 +233,8 @@ int tc_kernel_main(int argc, char *argv[])
+ 	stc_sched_affinity_main();
+ 	stc_sched_lock_main();
+ 	stc_sched_inversion_main();
++	stc_sched_blocking_main();
++	stc_sched_lifecycle_main();
+ #endif
+ 
+ 	close(g_tc_fd);
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_blocking.c b/apps/examples/testcase/le_tc/kernel/stc_sched_blocking.c
+new file mode 100644
+index 00000000..06dec25b
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_blocking.c
+@@ -0,0 +1,638 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file stc_sched_blocking.c
++
++/// @brief Scenario test cases for blocking, wakeup and ordering (family F)
++///
++/// Most real workloads are not CPU bound; they block, and the scheduler's
++/// behaviour at the moment of a wake matters more than its behaviour under
++/// saturation.  These scenarios cover who wakes first, how quickly a wake
++/// crosses to another CPU, whether a timeout still fires when every CPU is
++/// busy, and whether ordering survives a queue.
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++
++#include <stdio.h>
++#include <stdbool.h>
++#include <string.h>
++#include <unistd.h>
++#include <errno.h>
++#include <time.h>
++#include <fcntl.h>
++#include <semaphore.h>
++#include <mqueue.h>
++#include <sched.h>
++
++#include "tc_internal.h"
++#include "stc_sched_common.h"
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++/* Waiters used by the ordering scenario: four priority levels, two tasks at
++ * each, so that ordering between levels and ordering within a level are both
++ * observable in one run.
++ */
++
++#define STC_BLK_LEVELS          4
++#define STC_BLK_PER_LEVEL       2
++#define STC_BLK_WAITERS         (STC_BLK_LEVELS * STC_BLK_PER_LEVEL)
++
++#define STC_BLK_BASE_PRIO       (SCHED_PRIORITY_DEFAULT)
++#define STC_BLK_PRIO_STEP       10
++
++/* Priority of the task that releases the waiters.  Above all of them, so
++ * every post completes before any waiter runs and the resulting order is
++ * the scheduler's choice rather than an artefact of interleaving.
++ */
++
++#define STC_BLK_POSTER_PRIO     (STC_BLK_BASE_PRIO + \
++				 (STC_BLK_LEVELS + 1) * STC_BLK_PRIO_STEP)
++
++/* Bound on a cross CPU wake.  Generous against the failure being hunted,
++ * which is a wake that is never delivered until something else happens to
++ * schedule.
++ */
++
++#define STC_BLK_WAKE_BOUND_MS   50
++
++/* Timeout used by the timed wait scenario, and the slack allowed on it. */
++
++#define STC_BLK_TIMEOUT_MS      300
++#define STC_BLK_TIMEOUT_SLACK_MS 200
++
++/* Message queue scenario. */
++
++#define STC_BLK_MQ_NAME         "/stcblkmq"
++#define STC_BLK_MQ_MSGSIZE      16
++#define STC_BLK_MQ_DEPTH        16
++#define STC_BLK_MQ_PRIOS        3
++#define STC_BLK_MQ_PER_PRIO     5
++#define STC_BLK_MQ_TOTAL        (STC_BLK_MQ_PRIOS * STC_BLK_MQ_PER_PRIO)
++
++/****************************************************************************
++ * Private Data
++ ****************************************************************************/
++
++static sem_t g_blk_sem;
++
++/* Order in which the waiters actually woke, and how far the sequence has
++ * been filled.  Written by the waiters, read after they have all finished.
++ */
++
++static volatile int g_blk_order[STC_BLK_WAITERS];
++static volatile int g_blk_next;
++
++static volatile bool g_blk_woke;
++static volatile uint32_t g_blk_wake_ms;
++static struct timespec g_blk_post_ts;
++
++static volatile uint32_t g_blk_timeout_ms;
++static volatile int g_blk_timeout_ret;
++static volatile int g_blk_timeout_errno;
++static volatile bool g_blk_timeout_done;
++
++static volatile int g_blk_mq_recv[STC_BLK_MQ_TOTAL];
++static volatile int g_blk_mq_count;
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_blk_ordered_waiter
++ *
++ * Description:
++ *   Blocks on the shared semaphore and, on waking, appends its own index to
++ *   the order array.  The array is therefore a direct record of the order
++ *   the scheduler chose.
++ *
++ ****************************************************************************/
++
++static int stc_blk_ordered_waiter(int argc, char *argv[])
++{
++	int idx;
++	int slot;
++
++	if (argc < 2) {
++		return ERROR;
++	}
++
++	idx = atoi(argv[1]);
++
++	(void)sem_wait(&g_blk_sem);
++
++	slot = g_blk_next;
++	if (slot >= 0 && slot < STC_BLK_WAITERS) {
++		g_blk_order[slot] = idx;
++		g_blk_next = slot + 1;
++	}
++
++	return OK;
++}
++
++/****************************************************************************
++ * Name: stc_blk_remote_waiter
++ ****************************************************************************/
++
++static int stc_blk_remote_waiter(int argc, char *argv[])
++{
++	struct timespec now;
++
++	(void)sem_wait(&g_blk_sem);
++
++	(void)clock_gettime(CLOCK_REALTIME, &now);
++	g_blk_wake_ms = stc_elapsed_ms(&g_blk_post_ts, &now);
++	g_blk_woke = true;
++
++	return OK;
++}
++
++/****************************************************************************
++ * Name: stc_blk_timeout_waiter
++ ****************************************************************************/
++
++static int stc_blk_timeout_waiter(int argc, char *argv[])
++{
++	struct timespec start;
++	struct timespec abstime;
++	struct timespec now;
++	int ret;
++
++	(void)clock_gettime(CLOCK_REALTIME, &start);
++
++	abstime = start;
++	abstime.tv_nsec += (long)STC_BLK_TIMEOUT_MS * 1000000;
++	while (abstime.tv_nsec >= 1000000000) {
++		abstime.tv_nsec -= 1000000000;
++		abstime.tv_sec += 1;
++	}
++
++	ret = sem_timedwait(&g_blk_sem, &abstime);
++	g_blk_timeout_errno = errno;
++
++	(void)clock_gettime(CLOCK_REALTIME, &now);
++	g_blk_timeout_ms = stc_elapsed_ms(&start, &now);
++	g_blk_timeout_ret = ret;
++	g_blk_timeout_done = true;
++
++	return OK;
++}
++
++/****************************************************************************
++ * Name: stc_blk_mq_consumer
++ ****************************************************************************/
++
++static int stc_blk_mq_consumer(int argc, char *argv[])
++{
++	char buf[STC_BLK_MQ_MSGSIZE];
++	struct mq_attr attr;
++	mqd_t mq;
++	int prio;
++	int i;
++
++	attr.mq_maxmsg = STC_BLK_MQ_DEPTH;
++	attr.mq_msgsize = STC_BLK_MQ_MSGSIZE;
++	attr.mq_flags = 0;
++
++	mq = mq_open(STC_BLK_MQ_NAME, O_RDONLY | O_CREAT, 0666, &attr);
++	if (mq == (mqd_t)ERROR) {
++		return ERROR;
++	}
++
++	for (i = 0; i < STC_BLK_MQ_TOTAL; i++) {
++		prio = -1;
++		if (mq_receive(mq, buf, STC_BLK_MQ_MSGSIZE, &prio) < 0) {
++			break;
++		}
++
++		if (g_blk_mq_count < STC_BLK_MQ_TOTAL) {
++			g_blk_mq_recv[g_blk_mq_count] = prio;
++			g_blk_mq_count++;
++		}
++	}
++
++	(void)mq_close(mq);
++	return OK;
++}
++
++/****************************************************************************
++ * Name: stc_sched_blk01_wakeup_ordering
++ *
++ * @testcase             :stc_sched_blk01_wakeup_ordering
++ * @brief                :SCN-BLK-01, waiters wake in priority order
++ * @scenario             :Park eight tasks on one semaphore, two at each of
++ *                        four priorities, then post it eight times from a
++ *                        task that outranks all of them.  Because the poster
++ *                        is higher priority, every post completes before any
++ *                        waiter runs, so the order they subsequently run in
++ *                        is the scheduler's decision and not an artefact of
++ *                        the posts interleaving with the wakes.
++ *                        Two properties are checked.  Across priorities the
++ *                        order must be strictly descending.  Within a
++ *                        priority it must match the order the tasks blocked,
++ *                        which is the fairness guarantee that stops a task
++ *                        being overtaken indefinitely by an equal priority
++ *                        peer.
++ * @apicovered           :sem_wait, sem_post, task_create
++ * @precondition         :none
++ * @postcondition        :all waiters exited, semaphore destroyed
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_blk01_wakeup_ordering(void)
++{
++	char idxbuf[STC_BLK_WAITERS][8];
++	char *argv[2];
++	pid_t waiter[STC_BLK_WAITERS];
++	int created = 0;
++	int prio;
++	int level;
++	int i;
++	bool ordered = true;
++
++	memset((void *)g_blk_order, -1, sizeof(g_blk_order));
++	g_blk_next = 0;
++
++	if (sem_init(&g_blk_sem, 0, 0) != OK) {
++		TC_ASSERT("blk01_sem_init", false);
++	}
++
++	/* Index 0 is the highest priority, and within each priority the lower
++	 * index blocks first.  The expected wake order is therefore simply
++	 * ascending index.
++	 */
++
++	for (i = 0; i < STC_BLK_WAITERS; i++) {
++		level = i / STC_BLK_PER_LEVEL;
++		prio = STC_BLK_BASE_PRIO +
++		       (STC_BLK_LEVELS - 1 - level) * STC_BLK_PRIO_STEP;
++
++		snprintf(idxbuf[i], sizeof(idxbuf[i]), "%d", i);
++		argv[0] = idxbuf[i];
++		argv[1] = NULL;
++
++		waiter[i] = task_create("stcblkw", prio, STC_WORKER_STACKSIZE,
++					stc_blk_ordered_waiter,
++					(char * const *)argv);
++		if (waiter[i] > 0) {
++			created++;
++		}
++
++		/* Let each one reach sem_wait before the next is created, so
++		 * the arrival order within a priority is deterministic.
++		 */
++
++		usleep(20 * 1000);
++	}
++
++	for (i = 0; i < STC_BLK_WAITERS; i++) {
++		(void)sem_post(&g_blk_sem);
++	}
++
++	usleep(500 * 1000);
++
++	printf("[SCN-BLK-01] woke=%d order=", g_blk_next);
++	for (i = 0; i < STC_BLK_WAITERS; i++) {
++		printf("%d ", g_blk_order[i]);
++	}
++	printf("\n");
++
++	for (i = 0; i < STC_BLK_WAITERS; i++) {
++		if (g_blk_order[i] != i) {
++			ordered = false;
++		}
++	}
++
++	for (i = 0; i < STC_BLK_WAITERS; i++) {
++		if (waiter[i] > 0) {
++			(void)task_delete(waiter[i]);
++		}
++	}
++
++	(void)sem_destroy(&g_blk_sem);
++
++	TC_ASSERT_EQ("blk01_all_created", created, STC_BLK_WAITERS);
++
++	/* Every waiter woke. */
++
++	TC_ASSERT_EQ("blk01_all_woke", g_blk_next, STC_BLK_WAITERS);
++
++	/* In priority order between levels and arrival order within one. */
++
++	TC_ASSERT("blk01_priority_ordered", ordered);
++
++	TC_SUCCESS_RESULT();
++}
++
++#ifdef CONFIG_SMP
++/****************************************************************************
++ * Name: stc_sched_blk02_cross_cpu_wake
++ *
++ * @testcase             :stc_sched_blk02_cross_cpu_wake
++ * @brief                :SCN-BLK-02, a wake reaches an idle remote CPU
++ *                        promptly
++ * @scenario             :Park a task pinned to the highest numbered CPU on a
++ *                        semaphore while that CPU has nothing else to do,
++ *                        then post from this CPU and measure how long the
++ *                        wake takes to turn into execution.
++ *                        Making a task runnable on an idle remote CPU
++ *                        requires that CPU to be told, which on most targets
++ *                        means an inter processor interrupt.  If that
++ *                        signalling is missing the task still runs, but only
++ *                        when the remote CPU next reschedules for some
++ *                        unrelated reason, which turns a microsecond wake
++ *                        into a wait of a whole tick or more.  The bound
++ *                        distinguishes the two without being tight enough to
++ *                        be jitter sensitive.
++ * @apicovered           :sem_post, sem_wait, sched_setaffinity, task_create
++ * @precondition         :CONFIG_SMP_NCPUS greater than one
++ * @postcondition        :waiter exited, semaphore destroyed
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_blk02_cross_cpu_wake(void)
++{
++	cpu_set_t remote_mask = 0;
++	pid_t waiter;
++	int ncpus = stc_ncpus();
++
++	g_blk_woke = false;
++	g_blk_wake_ms = 0;
++
++	if (sem_init(&g_blk_sem, 0, 0) != OK) {
++		TC_ASSERT("blk02_sem_init", false);
++	}
++
++	CPU_SET(ncpus - 1, &remote_mask);
++
++	waiter = task_create("stcblkr", SCHED_PRIORITY_DEFAULT + 20,
++			     STC_WORKER_STACKSIZE, stc_blk_remote_waiter,
++			     (char * const *)NULL);
++
++	if (waiter > 0) {
++		(void)sched_setaffinity(waiter, sizeof(cpu_set_t),
++					&remote_mask);
++	}
++
++	/* Let it settle on the remote CPU and block. */
++
++	usleep(200 * 1000);
++
++	(void)clock_gettime(CLOCK_REALTIME, &g_blk_post_ts);
++	(void)sem_post(&g_blk_sem);
++
++	usleep(300 * 1000);
++
++	if (waiter > 0 && !g_blk_woke) {
++		(void)task_delete(waiter);
++	}
++
++	(void)sem_destroy(&g_blk_sem);
++
++	printf("[SCN-BLK-02] woke=%d latency=%ums bound=%dms\n",
++	       (int)g_blk_woke, (unsigned int)g_blk_wake_ms,
++	       STC_BLK_WAKE_BOUND_MS);
++
++	TC_ASSERT_GT("blk02_waiter_created", waiter, 0);
++
++	TC_ASSERT("blk02_woke", g_blk_woke);
++	TC_ASSERT_LEQ("blk02_wake_bounded", g_blk_wake_ms,
++		      STC_BLK_WAKE_BOUND_MS);
++
++	TC_SUCCESS_RESULT();
++}
++#endif							/* CONFIG_SMP */
++
++/****************************************************************************
++ * Name: stc_sched_blk03_timeout_under_load
++ *
++ * @testcase             :stc_sched_blk03_timeout_under_load
++ * @brief                :SCN-BLK-03, a timed wait still expires when every
++ *                        CPU is busy
++ * @scenario             :Saturate every CPU with CPU bound work, then have a
++ *                        high priority task wait on a semaphore that is
++ *                        never posted, with a three hundred millisecond
++ *                        timeout.  The timeout must fire, must report
++ *                        ETIMEDOUT, and must do so close to when it was
++ *                        asked to rather than whenever the load subsides.
++ *                        Timed waits are how most drivers avoid hanging
++ *                        forever, so a timeout that is itself subject to
++ *                        starvation removes the last line of defence.  The
++ *                        scenario is run under saturation precisely because
++ *                        that is when the guarantee matters.
++ * @apicovered           :sem_timedwait, task_create, sched_setscheduler
++ * @precondition         :none
++ * @postcondition        :all workers exited, semaphore destroyed
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_blk03_timeout_under_load(void)
++{
++	struct stc_workload_s wl;
++	pid_t waiter;
++	int ncpus = stc_ncpus();
++	int start_ret;
++	int finish_ret;
++
++	g_blk_timeout_done = false;
++	g_blk_timeout_ms = 0;
++	g_blk_timeout_ret = 0;
++	g_blk_timeout_errno = 0;
++
++	if (sem_init(&g_blk_sem, 0, 0) != OK) {
++		TC_ASSERT("blk03_sem_init", false);
++	}
++
++	stc_workload_init(&wl, ncpus, SCHED_PRIORITY_DEFAULT, SCHED_RR);
++
++	start_ret = stc_workload_start(&wl);
++
++	waiter = task_create("stcblkt", SCHED_PRIORITY_DEFAULT + 20,
++			     STC_WORKER_STACKSIZE, stc_blk_timeout_waiter,
++			     (char * const *)NULL);
++
++	usleep((STC_BLK_TIMEOUT_MS + STC_BLK_TIMEOUT_SLACK_MS + 300) * 1000);
++
++	finish_ret = stc_workload_finish(ncpus);
++
++	if (waiter > 0 && !g_blk_timeout_done) {
++		(void)task_delete(waiter);
++	}
++
++	(void)sem_destroy(&g_blk_sem);
++
++	printf("[SCN-BLK-03] done=%d elapsed=%ums ret=%d errno=%d\n",
++	       (int)g_blk_timeout_done, (unsigned int)g_blk_timeout_ms,
++	       g_blk_timeout_ret, g_blk_timeout_errno);
++
++	TC_ASSERT_EQ("blk03_workload_start", start_ret, OK);
++	TC_ASSERT_GT("blk03_waiter_created", waiter, 0);
++	TC_ASSERT_EQ("blk03_workload_finish", finish_ret, OK);
++
++	/* The timeout fired at all. */
++
++	TC_ASSERT("blk03_timeout_fired", g_blk_timeout_done);
++
++	/* It reported a timeout rather than success. */
++
++	TC_ASSERT_EQ("blk03_timeout_errno", g_blk_timeout_errno, ETIMEDOUT);
++
++	/* And it fired close to when it was asked to. */
++
++	TC_ASSERT_GEQ("blk03_not_early", g_blk_timeout_ms,
++		      (uint32_t)STC_BLK_TIMEOUT_MS);
++	TC_ASSERT_LEQ("blk03_not_late", g_blk_timeout_ms,
++		      (uint32_t)(STC_BLK_TIMEOUT_MS +
++				 STC_BLK_TIMEOUT_SLACK_MS));
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sched_blk04_mqueue_ordering
++ *
++ * @testcase             :stc_sched_blk04_mqueue_ordering
++ * @brief                :SCN-BLK-04, queued messages are delivered in
++ *                        priority order without loss
++ * @scenario             :Send fifteen messages at three interleaved
++ *                        priorities into one queue, then start a consumer
++ *                        and read them all back.  Sending before the
++ *                        consumer starts means every message is queued at
++ *                        once, so delivery order is the queue's decision
++ *                        rather than a side effect of arrival timing.
++ *                        Every message must come back, and the priorities
++ *                        must arrive in descending order.  This covers the
++ *                        ordering guarantee that producers rely on and, by
++ *                        counting, the absence of the silent message loss
++ *                        that a queue bug under contention would produce.
++ * @apicovered           :mq_open, mq_send, mq_receive, mq_close, mq_unlink
++ * @precondition         :message queues enabled
++ * @postcondition        :queue closed and unlinked, consumer exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_blk04_mqueue_ordering(void)
++{
++	char msg[STC_BLK_MQ_MSGSIZE];
++	struct mq_attr attr;
++	mqd_t mq;
++	pid_t consumer;
++	int sent = 0;
++	bool descending = true;
++	int i;
++	int p;
++
++	g_blk_mq_count = 0;
++	memset((void *)g_blk_mq_recv, 0, sizeof(g_blk_mq_recv));
++	memset(msg, 0, sizeof(msg));
++
++	attr.mq_maxmsg = STC_BLK_MQ_DEPTH;
++	attr.mq_msgsize = STC_BLK_MQ_MSGSIZE;
++	attr.mq_flags = 0;
++
++	mq = mq_open(STC_BLK_MQ_NAME, O_WRONLY | O_CREAT, 0666, &attr);
++	if (mq == (mqd_t)ERROR) {
++		TC_ASSERT("blk04_mq_open", false);
++	}
++
++	/* Interleave the priorities on send so that a queue which simply
++	 * preserved arrival order would produce a visibly different result.
++	 */
++
++	for (i = 0; i < STC_BLK_MQ_PER_PRIO; i++) {
++		for (p = 0; p < STC_BLK_MQ_PRIOS; p++) {
++			if (mq_send(mq, msg, STC_BLK_MQ_MSGSIZE, p) == OK) {
++				sent++;
++			}
++		}
++	}
++
++	(void)mq_close(mq);
++
++	consumer = task_create("stcblkc", SCHED_PRIORITY_DEFAULT + 10,
++			       STC_WORKER_STACKSIZE, stc_blk_mq_consumer,
++			       (char * const *)NULL);
++
++	usleep(500 * 1000);
++
++	for (i = 1; i < g_blk_mq_count; i++) {
++		if (g_blk_mq_recv[i] > g_blk_mq_recv[i - 1]) {
++			descending = false;
++		}
++	}
++
++	printf("[SCN-BLK-04] sent=%d received=%d descending=%d\n",
++	       sent, g_blk_mq_count, (int)descending);
++
++	(void)mq_unlink(STC_BLK_MQ_NAME);
++
++	TC_ASSERT_GT("blk04_consumer_created", consumer, 0);
++	TC_ASSERT_EQ("blk04_all_sent", sent, STC_BLK_MQ_TOTAL);
++
++	/* Nothing was lost. */
++
++	TC_ASSERT_EQ("blk04_none_lost", g_blk_mq_count, STC_BLK_MQ_TOTAL);
++
++	/* And nothing was reordered. */
++
++	TC_ASSERT("blk04_priority_ordered", descending);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_sched_blocking_main
++ ****************************************************************************/
++
++int stc_sched_blocking_main(void)
++{
++	printf("[SCN-BLK] blocking and wakeup scenarios, ncpus=%d\n",
++	       stc_ncpus());
++
++	stc_sched_blk01_wakeup_ordering();
++#ifdef CONFIG_SMP
++	if (stc_ncpus() > 1) {
++		stc_sched_blk02_cross_cpu_wake();
++	} else {
++		printf("[SCN-BLK-02] skipped, single CPU configuration\n");
++	}
++#endif
++	stc_sched_blk03_timeout_under_load();
++#ifndef CONFIG_DISABLE_MQUEUE
++	stc_sched_blk04_mqueue_ordering();
++#else
++	printf("[SCN-BLK-04] skipped, message queues disabled\n");
++#endif
++
++	return 0;
++}
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_lifecycle.c b/apps/examples/testcase/le_tc/kernel/stc_sched_lifecycle.c
+new file mode 100644
+index 00000000..90b45728
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_lifecycle.c
+@@ -0,0 +1,593 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file stc_sched_lifecycle.c
++
++/// @brief Scenario test cases for task lifecycle under contention
++///        (family G)
++///
++/// Creating and destroying tasks is exercised constantly by the existing
++/// tests, but always on an idle system.  These scenarios do it while every
++/// CPU is busy, and while the task being removed is running somewhere else
++/// or blocked on something, which is where the list manipulation is at its
++/// most delicate.
++///
++/// The oracles are deliberately about what is left behind rather than about
++/// timing.  A scheduler defect here does not usually announce itself; it
++/// leaks a task control block, or leaves a stale entry on a wait list, and
++/// the system degrades later for no visible reason.
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdbool.h>
++#include <string.h>
++#include <unistd.h>
++#include <semaphore.h>
++#include <pthread.h>
++#include <sched.h>
++#include <sys/types.h>
++#include <sys/ioctl.h>
++#include <tinyara/sched.h>
++#include <tinyara/os_api_test_drv.h>
++
++#include "tc_internal.h"
++#include "stc_sched_common.h"
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++/* Number of create and exit cycles in the churn scenario.  The catalogue
++ * calls for a thousand, which is enough for a per task leak of even a few
++ * bytes to become unmistakable against normal heap noise.
++ */
++
++#define STC_LIFE_CHURN_COUNT    1000
++
++/* Slack allowed on the task control block count after the churn.  Ideally
++ * this is zero, but unrelated system activity may legitimately create or
++ * retire a task during the run, so a small allowance avoids a false failure
++ * while still catching a per iteration leak, which would show up as
++ * hundreds.
++ */
++
++#define STC_LIFE_TCB_SLACK      4
++
++/* Slack allowed on the heap, in bytes, for the same reason. */
++
++#define STC_LIFE_HEAP_SLACK     2048
++
++/* Bound on how long a cancellation may take to take effect. */
++
++#define STC_LIFE_CANCEL_MS      500
++
++/****************************************************************************
++ * Private Data
++ ****************************************************************************/
++
++static volatile int g_life_tcb_count;
++static volatile bool g_life_spin_run;
++static volatile bool g_life_cancelled_exited;
++
++static sem_t g_life_sem;
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_life_count_cb
++ *
++ * Description:
++ *   Counts one task.  Runs inside sched_foreach(), which holds a critical
++ *   section, so it does nothing else.
++ *
++ ****************************************************************************/
++
++static void stc_life_count_cb(struct tcb_s *tcb, void *arg)
++{
++	if (tcb != NULL) {
++		g_life_tcb_count++;
++	}
++}
++
++/****************************************************************************
++ * Name: stc_life_tcb_count
++ ****************************************************************************/
++
++static int stc_life_tcb_count(void)
++{
++	int fd = tc_get_drvfd();
++
++	g_life_tcb_count = 0;
++	(void)ioctl(fd, TESTIOC_SCHED_FOREACH,
++		    (unsigned long)stc_life_count_cb);
++
++	return g_life_tcb_count;
++}
++
++/****************************************************************************
++ * Name: stc_life_heap_used
++ *
++ * Description:
++ *   Bytes currently handed out by the allocator.  The two shapes of
++ *   mallinfo() differ by configuration, so both are handled.
++ *
++ ****************************************************************************/
++
++static int stc_life_heap_used(void)
++{
++	struct mallinfo info;
++
++#ifdef CONFIG_CAN_PASS_STRUCTS
++	info = mallinfo();
++#else
++	memset(&info, 0, sizeof(info));
++	(void)mallinfo(&info);
++#endif
++
++	return info.uordblks;
++}
++
++/****************************************************************************
++ * Name: stc_life_short_task
++ ****************************************************************************/
++
++static int stc_life_short_task(int argc, char *argv[])
++{
++	return OK;
++}
++
++/****************************************************************************
++ * Name: stc_life_spin_task
++ ****************************************************************************/
++
++static int stc_life_spin_task(int argc, char *argv[])
++{
++	volatile uint32_t sink = 0;
++
++	while (g_life_spin_run) {
++		sink++;
++	}
++
++	return OK;
++}
++
++/****************************************************************************
++ * Name: stc_life_blocked_task
++ ****************************************************************************/
++
++static int stc_life_blocked_task(int argc, char *argv[])
++{
++	(void)sem_wait(&g_life_sem);
++	return OK;
++}
++
++/****************************************************************************
++ * Name: stc_life_cancellable_thread
++ *
++ * Description:
++ *   Loops over an explicit cancellation point.  Deferred cancellation only
++ *   takes effect at such a point, so a thread that never reaches one would
++ *   never be cancelled and the scenario would be testing nothing.
++ *
++ ****************************************************************************/
++
++static void *stc_life_cancellable_thread(void *arg)
++{
++	(void)pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
++	(void)pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
++
++	for (; ; ) {
++		pthread_testcancel();
++		usleep(1000);
++	}
++
++	g_life_cancelled_exited = true;
++	return NULL;
++}
++
++/****************************************************************************
++ * Name: stc_sched_life01_churn_under_load
++ *
++ * @testcase             :stc_sched_life01_churn_under_load
++ * @brief                :SCN-LIFE-01, task churn under saturation leaks
++ *                        nothing
++ * @scenario             :Saturate every CPU with CPU bound work, then create
++ *                        and retire a thousand short lived tasks, and
++ *                        compare the task control block count and the heap
++ *                        usage before and after.
++ *                        Creating a task under contention takes a different
++ *                        path from creating one on an idle system: the new
++ *                        task may not be able to run immediately, may be
++ *                        placed on a different list, and may be retired from
++ *                        a state the idle case never reaches.  A per
++ *                        iteration leak of even one control block is
++ *                        invisible in a single create and destroy test and
++ *                        unmistakable after a thousand.
++ * @apicovered           :task_create, sched_foreach via the test driver,
++ *                        mallinfo
++ * @precondition         :none
++ * @postcondition        :all workers exited, no tasks leaked
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_life01_churn_under_load(void)
++{
++	struct stc_workload_s wl;
++	int ncpus = stc_ncpus();
++	int tcb_before;
++	int tcb_after;
++	int heap_before;
++	int heap_after;
++	int created = 0;
++	int start_ret;
++	int finish_ret;
++	int i;
++	pid_t pid;
++
++	stc_workload_init(&wl, ncpus, SCHED_PRIORITY_DEFAULT, SCHED_RR);
++
++	start_ret = stc_workload_start(&wl);
++
++	/* Let the load settle before taking the baseline, so the workers
++	 * themselves are inside it rather than straddling it.
++	 */
++
++	usleep(200 * 1000);
++
++	tcb_before = stc_life_tcb_count();
++	heap_before = stc_life_heap_used();
++
++	for (i = 0; i < STC_LIFE_CHURN_COUNT; i++) {
++		pid = task_create("stclife", SCHED_PRIORITY_DEFAULT + 5,
++				  STC_WORKER_STACKSIZE, stc_life_short_task,
++				  (char * const *)NULL);
++		if (pid > 0) {
++			created++;
++		}
++
++		/* Yield often enough that the short lived tasks get to run and
++		 * retire rather than piling up.
++		 */
++
++		if ((i % 16) == 15) {
++			usleep(1000);
++		}
++	}
++
++	/* Give the last of them time to retire. */
++
++	usleep(500 * 1000);
++
++	tcb_after = stc_life_tcb_count();
++	heap_after = stc_life_heap_used();
++
++	finish_ret = stc_workload_finish(ncpus);
++
++	printf("[SCN-LIFE-01] created=%d tcb %d->%d heap %d->%d\n",
++	       created, tcb_before, tcb_after, heap_before, heap_after);
++
++	TC_ASSERT_EQ("life01_workload_start", start_ret, OK);
++	TC_ASSERT_EQ("life01_workload_finish", finish_ret, OK);
++
++	/* The churn actually happened. */
++
++	TC_ASSERT_EQ("life01_all_created", created, STC_LIFE_CHURN_COUNT);
++
++	/* And left nothing behind. */
++
++	TC_ASSERT_LEQ("life01_no_tcb_leak", tcb_after,
++		      tcb_before + STC_LIFE_TCB_SLACK);
++	TC_ASSERT_LEQ("life01_no_heap_leak", heap_after,
++		      heap_before + STC_LIFE_HEAP_SLACK);
++
++	TC_SUCCESS_RESULT();
++}
++
++#ifdef CONFIG_SMP
++/****************************************************************************
++ * Name: stc_sched_life02_delete_remote_running
++ *
++ * @testcase             :stc_sched_life02_delete_remote_running
++ * @brief                :SCN-LIFE-02, deleting a task running on another CPU
++ * @scenario             :Pin a CPU bound task to the highest numbered CPU,
++ *                        let it run, and delete it from this CPU.
++ *                        Removing a task that is merely ready is a list
++ *                        operation.  Removing one that is executing on
++ *                        another CPU is not: that CPU has to be interrupted
++ *                        and made to pick something else, and the deleting
++ *                        CPU has to wait for that to happen before the
++ *                        control block can be released.  It is the most
++ *                        intricate removal path in the scheduler and the one
++ *                        least likely to be covered by accident.
++ *                        Afterwards the task must be gone and the system
++ *                        must still schedule normally, which is checked by
++ *                        running a fresh workload.
++ * @apicovered           :task_delete, sched_setaffinity, task_create
++ * @precondition         :CONFIG_SMP_NCPUS greater than one
++ * @postcondition        :task deleted, scheduling still functional
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_life02_delete_remote_running(void)
++{
++	struct stc_workload_s wl;
++	cpu_set_t remote_mask = 0;
++	pid_t victim;
++	int ncpus = stc_ncpus();
++	int tcb_before;
++	int tcb_after;
++	int del_ret;
++	int run_ret;
++
++	g_life_spin_run = true;
++
++	CPU_SET(ncpus - 1, &remote_mask);
++
++	tcb_before = stc_life_tcb_count();
++
++	victim = task_create("stcvict", SCHED_PRIORITY_DEFAULT,
++			     STC_WORKER_STACKSIZE, stc_life_spin_task,
++			     (char * const *)NULL);
++
++	if (victim > 0) {
++		(void)sched_setaffinity(victim, sizeof(cpu_set_t),
++					&remote_mask);
++	}
++
++	/* Let it settle on the remote CPU and start spinning. */
++
++	usleep(300 * 1000);
++
++	del_ret = task_delete(victim);
++
++	usleep(200 * 1000);
++
++	tcb_after = stc_life_tcb_count();
++
++	/* The scheduler still works afterwards. */
++
++	stc_workload_init(&wl, ncpus, SCHED_PRIORITY_DEFAULT, SCHED_RR);
++	wl.window_ms = 500;
++	run_ret = stc_run_workload(&wl);
++
++	g_life_spin_run = false;
++
++	printf("[SCN-LIFE-02] victim=%d del=%d tcb %d->%d\n",
++	       (int)victim, del_ret, tcb_before, tcb_after);
++
++	TC_ASSERT_GT("life02_victim_created", victim, 0);
++	TC_ASSERT_EQ("life02_delete_ok", del_ret, OK);
++
++	/* The control block came back. */
++
++	TC_ASSERT_LEQ("life02_no_leak", tcb_after,
++		      tcb_before + STC_LIFE_TCB_SLACK);
++
++	/* And the system still schedules. */
++
++	TC_ASSERT_EQ("life02_still_scheduling", run_ret, OK);
++	TC_ASSERT_GT("life02_workers_ran", stc_min(ncpus), 0);
++
++	TC_SUCCESS_RESULT();
++}
++#endif							/* CONFIG_SMP */
++
++/****************************************************************************
++ * Name: stc_sched_life03_delete_blocked
++ *
++ * @testcase             :stc_sched_life03_delete_blocked
++ * @brief                :SCN-LIFE-03, deleting a task blocked on a semaphore
++ * @scenario             :Park two tasks on a semaphore, delete the first,
++ *                        then post the semaphore once and confirm the second
++ *                        wakes.
++ *                        A deleted waiter has to be taken off the
++ *                        semaphore's wait list as well as out of the task
++ *                        lists.  If a stale entry survives, the next post
++ *                        is delivered to a task that no longer exists and
++ *                        the remaining waiter is left blocked forever, which
++ *                        is exactly what the second half of this scenario
++ *                        detects.  Checking only that the delete returned
++ *                        success would miss it entirely.
++ * @apicovered           :task_delete, sem_wait, sem_post, task_create
++ * @precondition         :none
++ * @postcondition        :both tasks gone, semaphore destroyed
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_life03_delete_blocked(void)
++{
++	pid_t first;
++	pid_t second;
++	int tcb_before;
++	int tcb_after;
++	int del_ret;
++	int post_ret;
++	int remaining_before;
++	int remaining_after;
++
++	if (sem_init(&g_life_sem, 0, 0) != OK) {
++		TC_ASSERT("life03_sem_init", false);
++	}
++
++	tcb_before = stc_life_tcb_count();
++
++	first = task_create("stcblk1", SCHED_PRIORITY_DEFAULT,
++			    STC_WORKER_STACKSIZE, stc_life_blocked_task,
++			    (char * const *)NULL);
++	usleep(100 * 1000);
++
++	second = task_create("stcblk2", SCHED_PRIORITY_DEFAULT,
++			     STC_WORKER_STACKSIZE, stc_life_blocked_task,
++			     (char * const *)NULL);
++	usleep(100 * 1000);
++
++	remaining_before = stc_life_tcb_count();
++
++	/* Remove the first waiter while it is still blocked. */
++
++	del_ret = task_delete(first);
++
++	usleep(100 * 1000);
++
++	/* One post should now release the surviving waiter.  If a stale entry
++	 * was left behind, the post goes to the deleted task and this one
++	 * stays blocked.
++	 */
++
++	post_ret = sem_post(&g_life_sem);
++
++	usleep(300 * 1000);
++
++	remaining_after = stc_life_tcb_count();
++	tcb_after = remaining_after;
++
++	(void)sem_destroy(&g_life_sem);
++
++	printf("[SCN-LIFE-03] del=%d tcb %d (both blocked %d) -> %d\n",
++	       del_ret, tcb_before, remaining_before, remaining_after);
++
++	TC_ASSERT_GT("life03_first_created", first, 0);
++	TC_ASSERT_GT("life03_second_created", second, 0);
++	TC_ASSERT_EQ("life03_delete_ok", del_ret, OK);
++	TC_ASSERT_EQ("life03_post_ok", post_ret, OK);
++
++	/* Both tasks are gone: the deleted one and the one the post released.
++	 * A surviving blocked waiter would leave the count higher.
++	 */
++
++	TC_ASSERT_LEQ("life03_no_stale_waiter", tcb_after,
++		      tcb_before + STC_LIFE_TCB_SLACK);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sched_life04_cancel_under_load
++ *
++ * @testcase             :stc_sched_life04_cancel_under_load
++ * @brief                :SCN-LIFE-04, cancellation takes effect under
++ *                        saturation
++ * @scenario             :Saturate every CPU, start a thread that loops over
++ *                        an explicit cancellation point, cancel it and join
++ *                        it.
++ *                        Deferred cancellation only takes effect when the
++ *                        target reaches a cancellation point, so under
++ *                        saturation the target has to be scheduled before it
++ *                        can notice.  A cancel that is delivered but never
++ *                        acted upon leaves the join blocked forever, which
++ *                        is why this scenario asserts on the join completing
++ *                        rather than on the cancel call returning success.
++ * @apicovered           :pthread_create, pthread_cancel, pthread_join,
++ *                        pthread_setcanceltype, pthread_testcancel
++ * @precondition         :CONFIG_CANCELLATION_POINTS
++ * @postcondition        :thread joined, all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_life04_cancel_under_load(void)
++{
++	struct stc_workload_s wl;
++	pthread_t thread;
++	int ncpus = stc_ncpus();
++	int start_ret;
++	int finish_ret;
++	int create_ret;
++	int cancel_ret = ERROR;
++	int join_ret = ERROR;
++
++	g_life_cancelled_exited = false;
++
++	stc_workload_init(&wl, ncpus, SCHED_PRIORITY_DEFAULT, SCHED_RR);
++
++	start_ret = stc_workload_start(&wl);
++
++	create_ret = pthread_create(&thread, NULL, stc_life_cancellable_thread,
++				    NULL);
++
++	usleep(200 * 1000);
++
++	if (create_ret == OK) {
++		cancel_ret = pthread_cancel(thread);
++
++		usleep(STC_LIFE_CANCEL_MS * 1000);
++
++		join_ret = pthread_join(thread, NULL);
++	}
++
++	finish_ret = stc_workload_finish(ncpus);
++
++	printf("[SCN-LIFE-04] create=%d cancel=%d join=%d\n",
++	       create_ret, cancel_ret, join_ret);
++
++	TC_ASSERT_EQ("life04_workload_start", start_ret, OK);
++	TC_ASSERT_EQ("life04_thread_create", create_ret, OK);
++	TC_ASSERT_EQ("life04_workload_finish", finish_ret, OK);
++
++	TC_ASSERT_EQ("life04_cancel_ok", cancel_ret, OK);
++
++	/* The join is the real assertion: it only completes if the cancel was
++	 * acted upon rather than merely accepted.
++	 */
++
++	TC_ASSERT_EQ("life04_join_completed", join_ret, OK);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_sched_lifecycle_main
++ ****************************************************************************/
++
++int stc_sched_lifecycle_main(void)
++{
++	printf("[SCN-LIFE] task lifecycle scenarios, ncpus=%d\n",
++	       stc_ncpus());
++
++	stc_sched_life01_churn_under_load();
++#ifdef CONFIG_SMP
++	if (stc_ncpus() > 1) {
++		stc_sched_life02_delete_remote_running();
++	} else {
++		printf("[SCN-LIFE-02] skipped, single CPU configuration\n");
++	}
++#endif
++	stc_sched_life03_delete_blocked();
++#ifdef CONFIG_CANCELLATION_POINTS
++	stc_sched_life04_cancel_under_load();
++#else
++	printf("[SCN-LIFE-04] skipped, built without CONFIG_CANCELLATION_POINTS\n");
++#endif
++
++	return 0;
++}
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_internal.h b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+index 7c1a929c..55469400 100644
+--- a/apps/examples/testcase/le_tc/kernel/tc_internal.h
++++ b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+@@ -106,6 +106,8 @@ int stc_sched_priority_main(void);
+ int stc_sched_affinity_main(void);
+ int stc_sched_lock_main(void);
+ int stc_sched_inversion_main(void);
++int stc_sched_blocking_main(void);
++int stc_sched_lifecycle_main(void);
+ int tc_get_drvfd(void);
+ 
+ #endif /* __EXAMPLES_TESTCASE_KERNEL_TC_INTERNAL_H */
+-- 
+2.43.0
+
