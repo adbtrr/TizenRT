@@ -274,47 +274,100 @@ static void heap_check(struct mm_heap_s *heap, int checker_pid, int *leak_cnt)
 
 static struct mm_heap_s * init_mem_leak_checker(int checker_pid, char *bin_name);
 
-static void ram_check(struct mm_heap_s *heap, int checker_pid, char *bin_name, int *leak_cnt)
+/****************************************************************************
+ * Name: ram_check
+ *
+ * Description:
+ *   Visit every place a reference to a chunk of the checked heap can be
+ *   kept, and mark the referenced chunks.
+ *
+ *   The set of places to visit does not depend on which heap is checked.
+ *   A chunk of the kernel heap can be referenced by an application just as
+ *   an application chunk can be referenced by the kernel, so all data
+ *   regions and all heaps have to be visited in either case.
+ *
+ *   Checking the kernel used to visit the kernel data regions and the
+ *   kernel heap only. Every kernel chunk which was referenced from an
+ *   application was reported as a leak, because the reference itself was
+ *   never visited. That is not limited to a corner case: with XIP the data,
+ *   bss and heap of an application are placed by the user space linker
+ *   script instead of being carved out of the kernel heap, so no part of
+ *   the application memory was visited by the kernel check at all.
+ *
+ ****************************************************************************/
+
+static void ram_check(struct mm_heap_s *heap, int checker_pid, int *leak_cnt)
 {
-	
+	int mem_region_idx;
+	int target_visited = 0;
+	struct mm_heap_s *kheap;
 #ifdef CONFIG_APP_BINARY_SEPARATION
 	bin_addr_info_t *info;
-	struct mm_heap_s *kheap;
+	struct mm_heap_s *app_heap;
 	int bin_idx;
-
-	info = (bin_addr_info_t *)get_bin_addr_list();
-	for (bin_idx = 0; bin_idx <= CONFIG_NUM_APPS; bin_idx++) {
-		if (strncmp(BIN_NAME(bin_idx), bin_name, strlen(bin_name)) == 0) {
-			break;
-		}
-	}
 #endif
-	/* Visit all the data regions
-	 */
-	int mem_region_idx;
+
+	/* Visit all the data regions of the kernel */
+
 	for (mem_region_idx = 0; mem_region_idx < MEM_VAR_REGION_COUNT; mem_region_idx++) {
 		search_addr(variable_region_start_addr[mem_region_idx], variable_region_end_addr[mem_region_idx], leak_cnt);
 	}
 
 #ifdef CONFIG_APP_BINARY_SEPARATION
-	if (strncmp(bin_name, "kernel", strlen("kernel") + 1) == 0) {
-		/* do nothing */
-	} else {
-#ifdef CONFIG_SUPPORT_COMMON_BINARY
-		search_addr((void *)info[CMN_BIN_IDX].data_addr, (void *)(info[CMN_BIN_IDX].data_addr + info[CMN_BIN_IDX].data_size), leak_cnt);
-		search_addr((void *)info[CMN_BIN_IDX].bss_addr, (void *)(info[CMN_BIN_IDX].bss_addr + info[CMN_BIN_IDX].bss_size), leak_cnt);
-#endif
-		/* search the bss and data region of the loadable app */
+	info = (bin_addr_info_t *)get_bin_addr_list();
+
+	/* Visit the data and the bss region of every loaded binary. Index
+	 * CMN_BIN_IDX is the common binary and is covered by the same loop, so
+	 * the binary which owns the checked heap does not have to be looked up
+	 * by name any more.
+	 */
+
+	for (bin_idx = CMN_BIN_IDX; bin_idx <= CONFIG_NUM_APPS; bin_idx++) {
+		if (info[bin_idx].text_addr == 0) {
+			/* This binary is not loaded */
+			continue;
+		}
 		search_addr((void *)info[bin_idx].data_addr, (void *)(info[bin_idx].data_addr + info[bin_idx].data_size), leak_cnt);
 		search_addr((void *)info[bin_idx].bss_addr, (void *)(info[bin_idx].bss_addr + info[bin_idx].bss_size), leak_cnt);
-		/* search the kernel heap first */
-		kheap = kmm_get_baseheap();
-		heap_check(kheap, checker_pid, leak_cnt);
 	}
 #endif
 
-	/* Visit heap region */
-	heap_check(heap, checker_pid, leak_cnt);
+	/* Visit the kernel heap */
+
+	kheap = kmm_get_baseheap();
+	heap_check(kheap, checker_pid, leak_cnt);
+	if (heap == kheap) {
+		target_visited = 1;
+	}
+
+#ifdef CONFIG_APP_BINARY_SEPARATION
+	/* Visit the heap of every loaded application. Index CMN_BIN_IDX is
+	 * skipped because the common binary has no heap of its own.
+	 */
+
+	for (bin_idx = CMN_BIN_IDX + 1; bin_idx <= CONFIG_NUM_APPS; bin_idx++) {
+		if (info[bin_idx].text_addr == 0) {
+			continue;
+		}
+		app_heap = mm_get_app_heap_with_name(BIN_NAME(bin_idx));
+		if (app_heap == NULL) {
+			continue;
+		}
+		heap_check(app_heap, checker_pid, leak_cnt);
+		if (heap == app_heap) {
+			target_visited = 1;
+		}
+	}
+#endif
+
+	/* The checked heap is normally one of the heaps visited above. Visit it
+	 * here if it was not, so that a reference kept by the checked heap
+	 * itself can never be missed.
+	 */
+
+	if (!target_visited) {
+		heap_check(heap, checker_pid, leak_cnt);
+	}
 }
 
 static void print_mem_hex_dump(void *addr, size_t alloc_size)
@@ -427,7 +480,7 @@ int run_mem_leak_checker(int checker_pid, char *bin_name)
 	fill_hash_table(heap, &leak_cnt, &broken_cnt);
 
 	/* Visit RAM region */
-	ram_check(heap, checker_pid, bin_name, &leak_cnt);
+	ram_check(heap, checker_pid, &leak_cnt);
 
 	print_info(heap, leak_cnt, broken_cnt);
 
