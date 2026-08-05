@@ -1,0 +1,899 @@
+From b18149c298cc8a7e47629bab8741ab0cdc54b3cb Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_sched_fixed <>
+Date: Wed, 5 Aug 2026 19:36:45 +0000
+Subject: [PATCH] apps/examples/testcase: complete the round-robin and SMP
+ scenario families
+
+Adds the six remaining catalogued scenarios, closing out families A and H.
+
+The harness gains per worker scheduling policy, so one workload can mix
+SCHED_FIFO and SCHED_RR tasks, and a switch detection mode in which each
+worker notices when control has been away and come back.  Summed across
+workers that counts how many times the scheduler moved the CPU between them,
+which is what makes a rotation rate measurable from application code at all.
+
+RR-04 puts a SCHED_FIFO task and a SCHED_RR task at equal priority on one
+CPU, with the FIFO task created first so it owns the CPU when the other
+appears.  A scheduler that rotates on timeslice expiry without consulting
+the policy passes every other scenario in the family and fails here.
+
+RR-05 runs an oversubscribed workload alongside continuous scheduler lock
+churn and checks that every worker still gets a share.  It targets the
+timeslice refill defect: a slice that expires while the scheduler is locked
+and is refilled rather than left expired lets the running task earn a fresh
+full slice every time, so with the lock taken continuously it never rotates.
+The distinction from the throughput scenario in the inversion family is
+deliberate, that one asks whether the system still does work and this asks
+whether the work is still shared.
+
+RR-06 measures how often the CPU actually changes hands and compares it
+against the window divided by CONFIG_RR_INTERVAL.  Every other scenario asks
+whether rotation happens; this asks how often, which catches a timeslice
+decremented once per CPU per tick rather than once per tick.  That defect
+still rotates, and still shares fairly, just at a multiple of the configured
+rate.
+
+SMP-02 takes a CPU offline and brings it back under load, checking that no
+task is lost or stranded on a CPU that is no longer there.  SMP-03 asks the
+narrower question of whether timeslicing still behaves afterwards, since a
+CPU returning with stale accounting would keep every task alive and still
+leave the shares permanently skewed.  SMP-04 samples which task occupies
+each CPU by walking the task lists, because a CPU left idle while work is
+queued is invisible to per task counters: the tasks that did run look fine
+and the ones that did not simply look slow.
+
+SMP-03 is narrower than the catalogue states, and the source records why.
+The catalogue frames it around a power management sleep and wake cycle;
+only the part the scheduler owns is covered, namely taking the secondary
+CPUs down and back, which is what the power management path itself does
+first.  Driving a real sleep would require the board to actually sleep,
+which a test cannot do unattended, so tick compensation across a sleep
+remains uncovered.
+
+Both the SMP and non-SMP compilation paths are warning free under -Wall
+-Wextra.
+---
+ .../testcase/le_tc/kernel/stc_sched_common.c  |  44 ++-
+ .../testcase/le_tc/kernel/stc_sched_common.h  |  19 +-
+ .../testcase/le_tc/kernel/stc_sched_rr.c      | 237 ++++++++++++
+ .../testcase/le_tc/kernel/stc_sched_smp.c     | 358 ++++++++++++++++++
+ 4 files changed, 656 insertions(+), 2 deletions(-)
+
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_common.c b/apps/examples/testcase/le_tc/kernel/stc_sched_common.c
+index 27abe67f..60d1af7c 100644
+--- a/apps/examples/testcase/le_tc/kernel/stc_sched_common.c
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_common.c
+@@ -66,12 +66,21 @@ static int g_policy;
+ static bool g_pinned;
+ static cpu_set_t g_affinity;
+ static bool g_sample_cpu;
++static bool g_detect_switch;
++
++/* Index of the worker that ran most recently.  Shared, but written only on a
++ * transition rather than on every iteration, so it does not become a hot
++ * line in its own right.
++ */
++
++static volatile int g_last_runner;
+ 
+ /* Per worker parameters, resolved from the workload before any worker is
+  * created so that a worker never has to dereference the caller's structure.
+  */
+ 
+ static int g_prio[STC_MAX_WORKERS];
++static int g_pol[STC_MAX_WORKERS];
+ static cpu_set_t g_mask[STC_MAX_WORKERS];
+ static bool g_has_mask[STC_MAX_WORKERS];
+ 
+@@ -85,6 +94,7 @@ static volatile cpu_set_t g_allowed[STC_MAX_WORKERS];
+ static struct stc_cpuobs_s g_cpuobs[STC_MAX_WORKERS];
+ static uint32_t g_cpuobs_violations[STC_MAX_WORKERS];
+ static uint32_t g_cpuobs_seen[STC_MAX_WORKERS];
++static uint32_t g_cpuobs_transitions[STC_MAX_WORKERS];
+ 
+ /* Caller priority saved across a start and finish pair. */
+ 
+@@ -134,7 +144,7 @@ static int stc_spin_worker(int argc, char *argv[])
+ 	/* Apply the requested policy at this worker's priority. */
+ 
+ 	param.sched_priority = g_prio[idx];
+-	(void)sched_setscheduler(0, g_policy, &param);
++	(void)sched_setscheduler(0, g_pol[idx], &param);
+ 
+ #ifdef CONFIG_SMP
+ 	if (g_has_mask[idx]) {
+@@ -150,6 +160,15 @@ static int stc_spin_worker(int argc, char *argv[])
+ 	while (g_run) {
+ 		g_worker[idx].count++;
+ 
++		if (g_detect_switch && g_last_runner != idx) {
++			/* Control was elsewhere and has come back, so the
++			 * scheduler moved the CPU between us at least once.
++			 */
++
++			g_cpuobs[idx].transitions++;
++			g_last_runner = idx;
++		}
++
+ #ifdef CONFIG_SMP
+ 		if (g_sample_cpu) {
+ 			int cpu = sched_getcpu();
+@@ -187,6 +206,7 @@ static void stc_zero_counters(void)
+ 		g_worker[i].count = 0;
+ 		g_cpuobs[i].seen_mask = 0;
+ 		g_cpuobs[i].violations = 0;
++		g_cpuobs[i].transitions = 0;
+ 	}
+ }
+ 
+@@ -273,11 +293,14 @@ int stc_workload_start(const struct stc_workload_s *wl)
+ 	g_pinned = wl->pinned;
+ 	g_affinity = wl->affinity;
+ 	g_sample_cpu = wl->sample_cpu;
++	g_detect_switch = wl->detect_switch;
++	g_last_runner = -1;
+ 
+ 	top = wl->priority;
+ 
+ 	for (i = 0; i < STC_MAX_WORKERS; i++) {
+ 		g_prio[i] = wl->priority;
++		g_pol[i] = wl->policy;
+ 		g_mask[i] = wl->affinity;
+ 		g_has_mask[i] = wl->pinned;
+ 		g_allowed[i] = wl->pinned ? wl->affinity : 0;
+@@ -291,6 +314,10 @@ int stc_workload_start(const struct stc_workload_s *wl)
+ 			}
+ 		}
+ 
++		if (wl->policies != NULL) {
++			g_pol[i] = wl->policies[i];
++		}
++
+ 		if (wl->affinities != NULL) {
+ 			g_mask[i] = wl->affinities[i];
+ 			g_has_mask[i] = (wl->affinities[i] != 0);
+@@ -302,6 +329,7 @@ int stc_workload_start(const struct stc_workload_s *wl)
+ 	memset(g_snapshot, 0, sizeof(g_snapshot));
+ 	memset(g_cpuobs_violations, 0, sizeof(g_cpuobs_violations));
+ 	memset(g_cpuobs_seen, 0, sizeof(g_cpuobs_seen));
++	memset(g_cpuobs_transitions, 0, sizeof(g_cpuobs_transitions));
+ 	memset(g_pid, 0, sizeof(g_pid));
+ 	g_exited = 0;
+ 	g_run = true;
+@@ -369,6 +397,7 @@ void stc_workload_sample(int window_ms)
+ 		g_snapshot[i] = g_worker[i].count;
+ 		g_cpuobs_violations[i] = g_cpuobs[i].violations;
+ 		g_cpuobs_seen[i] = g_cpuobs[i].seen_mask;
++		g_cpuobs_transitions[i] = g_cpuobs[i].transitions;
+ 	}
+ }
+ 
+@@ -607,6 +636,19 @@ int stc_fair_pct(int nworkers)
+ 	return (int)(lo * 100 / hi);
+ }
+ 
++/****************************************************************************
++ * Name: stc_transitions
++ ****************************************************************************/
++
++uint32_t stc_transitions(int idx)
++{
++	if (idx < 0 || idx >= STC_MAX_WORKERS) {
++		return 0;
++	}
++
++	return g_cpuobs_transitions[idx];
++}
++
+ /****************************************************************************
+  * Name: stc_elapsed_ms
+  ****************************************************************************/
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_common.h b/apps/examples/testcase/le_tc/kernel/stc_sched_common.h
+index 9fde4560..321dd8a1 100644
+--- a/apps/examples/testcase/le_tc/kernel/stc_sched_common.h
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_common.h
+@@ -113,7 +113,8 @@ struct stc_worker_s {
+ struct stc_cpuobs_s {
+ 	volatile uint32_t seen_mask;	/* Bit set of CPUs this worker ran on */
+ 	volatile uint32_t violations;	/* Samples taken outside its mask     */
+-	uint8_t pad[STC_CACHELINE - 2 * sizeof(uint32_t)];
++	volatile uint32_t transitions;	/* Times control came back to it      */
++	uint8_t pad[STC_CACHELINE - 3 * sizeof(uint32_t)];
+ } __attribute__((aligned(STC_CACHELINE)));
+ 
+ /* Description of the load a scenario wants applied.
+@@ -138,6 +139,7 @@ struct stc_workload_s {
+ 
+ 	const int *priorities;		/* Per worker priority, or NULL          */
+ 	const cpu_set_t *affinities;	/* Per worker affinity mask, or NULL     */
++	const int *policies;		/* Per worker policy, or NULL            */
+ 
+ 	/* When true each worker calls sched_getcpu() on every iteration and
+ 	 * records where it ran.  This turns the progress counter into a count
+@@ -146,6 +148,14 @@ struct stc_workload_s {
+ 	 */
+ 
+ 	bool sample_cpu;
++
++	/* When true each worker notices when control has been away and come
++	 * back, which counts transfers between workers.  Used to measure how
++	 * often the scheduler actually rotates rather than merely whether it
++	 * does.  Meaningful only when the workers share one CPU.
++	 */
++
++	bool detect_switch;
+ };
+ 
+ /****************************************************************************
+@@ -201,6 +211,13 @@ void stc_set_allowed(int idx, cpu_set_t mask);
+ uint32_t stc_cpu_violations(int idx);
+ uint32_t stc_cpu_seen_mask(int idx);
+ 
++/* Transfers of control observed by a worker, valid when the workload set
++ * detect_switch.  Summed across workers this is the number of times the
++ * scheduler moved the CPU from one worker to another.
++ */
++
++uint32_t stc_transitions(int idx);
++
+ /* Apply a workload and record the result.
+  *
+  * Creates the workers, discards STC_WARMUP_MS, zeroes the counters, applies
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_rr.c b/apps/examples/testcase/le_tc/kernel/stc_sched_rr.c
+index 73a6cfc4..4bd88e4e 100644
+--- a/apps/examples/testcase/le_tc/kernel/stc_sched_rr.c
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_rr.c
+@@ -41,6 +41,8 @@
+ #include <tinyara/config.h>
+ 
+ #include <stdio.h>
++#include <stdbool.h>
++#include <unistd.h>
+ #include <sched.h>
+ 
+ #include "tc_internal.h"
+@@ -71,6 +73,26 @@
+ 
+ #define STC_RR_FAIR_PINNED      80
+ 
++/* Fairness floor for the lock churn scenario.  Looser than the undisturbed
++ * cases because the churn task competes for CPU in its own right, but still
++ * far above the failure mode, which is a peer that stops rotating entirely.
++ */
++
++#define STC_RR_FAIR_CHURN       30
++
++/* Tolerance on the observed rotation rate, as a percentage of the expected
++ * rate.  Slice boundaries are quantised against a one millisecond tick and
++ * the first and last slices of the window are partial, so the measured count
++ * is never exact; twenty five percent accommodates that without admitting a
++ * rate that is wrong by a factor.
++ */
++
++#define STC_RR_RATE_TOLERANCE   25
++
++/* Window for the rotation rate scenario, in milliseconds. */
++
++#define STC_RR_RATE_WINDOW_MS   3000
++
+ /****************************************************************************
+  * Private Types
+  ****************************************************************************/
+@@ -305,6 +327,218 @@ static void stc_sched_rr03_fairness_secondary_cpu(void)
+ }
+ #endif							/* CONFIG_SMP */
+ 
++/****************************************************************************
++ * Name: stc_sched_rr04_fifo_not_preempted
++ *
++ * @testcase             :stc_sched_rr04_fifo_not_preempted
++ * @brief                :SCN-RR-04, a first-in first-out task is not
++ *                        rotated out by an equal priority peer
++ * @scenario             :Put one SCHED_FIFO task and one SCHED_RR task at
++ *                        the same priority on the same CPU, with the FIFO
++ *                        task created first so it holds the CPU when the
++ *                        other appears.
++ *                        SCHED_FIFO means exactly that the task runs until
++ *                        it blocks or yields; an equal priority peer must
++ *                        never displace it.  Round-robin rotation is
++ *                        therefore something the scheduler must apply
++ *                        selectively, by policy, and not to whatever
++ *                        happens to be running when a timeslice expires.
++ *                        A scheduler that rotates on timeslice expiry
++ *                        without consulting the policy passes every other
++ *                        scenario in this family and fails here.
++ * @apicovered           :sched_setscheduler, sched_setaffinity, task_create
++ * @precondition         :CONFIG_RR_INTERVAL greater than zero
++ * @postcondition        :all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_rr04_fifo_not_preempted(void)
++{
++	struct stc_workload_s wl;
++	int policies[2];
++	int nworkers = 2;
++	int run_ret;
++
++	/* Worker 0 is the FIFO task and is created first, so it owns the CPU
++	 * before worker 1 exists.
++	 */
++
++	policies[0] = SCHED_FIFO;
++	policies[1] = SCHED_RR;
++
++	stc_workload_init(&wl, nworkers, SCHED_PRIORITY_DEFAULT, SCHED_RR);
++	wl.policies = policies;
++#ifdef CONFIG_SMP
++	CPU_SET(0, &wl.affinity);
++	wl.pinned = true;
++#endif
++
++	run_ret = stc_run_workload(&wl);
++
++	stc_report("SCN-RR-04", nworkers);
++
++	TC_ASSERT_EQ("rr04_workload", run_ret, OK);
++
++	/* The FIFO task kept the CPU. */
++
++	TC_ASSERT_GT("rr04_fifo_ran", stc_count(0), 0);
++
++	/* And was never rotated out in favour of its equal priority peer. */
++
++	TC_ASSERT_EQ("rr04_rr_peer_held_off", stc_count(1), 0);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sched_rr05_fairness_under_lock_churn
++ *
++ * @testcase             :stc_sched_rr05_fairness_under_lock_churn
++ * @brief                :SCN-RR-05, rotation survives scheduler lock churn
++ * @scenario             :Run an oversubscribed equal priority workload
++ *                        alongside a task that takes and releases the
++ *                        scheduler lock as fast as it can, and check that
++ *                        every worker still gets a share.
++ *                        This targets the timeslice refill defect.  If a
++ *                        timeslice that expires while the scheduler is
++ *                        locked is refilled instead of being left expired,
++ *                        the running task earns a fresh full slice every
++ *                        time the lock happens to be held at a tick.  With
++ *                        the lock being taken continuously that condition
++ *                        recurs indefinitely and the running task never
++ *                        rotates, so a waiting peer starves.
++ *                        The distinction from the throughput scenario in the
++ *                        inversion family is deliberate: that one asks
++ *                        whether the system still does work, this one asks
++ *                        whether the work is still shared.
++ * @apicovered           :sched_lock, sched_unlock, task_create
++ * @precondition         :CONFIG_RR_INTERVAL greater than zero
++ * @postcondition        :churn task exited, all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static volatile bool g_rr_churn_run;
++
++static int stc_rr_churn_task(int argc, char *argv[])
++{
++	while (g_rr_churn_run) {
++		(void)sched_lock();
++		(void)sched_unlock();
++	}
++
++	return OK;
++}
++
++static void stc_sched_rr05_fairness_under_lock_churn(void)
++{
++	struct stc_workload_s wl;
++	int ncpus = stc_ncpus();
++	int nworkers = ncpus + 1;
++	pid_t churn;
++	int run_ret;
++
++	g_rr_churn_run = true;
++
++	churn = task_create("stcrrch", SCHED_PRIORITY_DEFAULT,
++			    STC_WORKER_STACKSIZE, stc_rr_churn_task,
++			    (char * const *)NULL);
++
++	stc_workload_init(&wl, nworkers, SCHED_PRIORITY_DEFAULT, SCHED_RR);
++
++	run_ret = stc_run_workload(&wl);
++
++	g_rr_churn_run = false;
++	usleep(200 * 1000);
++
++	stc_report("SCN-RR-05", nworkers);
++
++	TC_ASSERT_GT("rr05_churn_created", churn, 0);
++	TC_ASSERT_EQ("rr05_workload", run_ret, OK);
++
++	/* Hard correctness assertion: nobody was frozen out by the churn. */
++
++	TC_ASSERT_GT("rr05_all_workers_ran", stc_min(nworkers), 0);
++
++	/* And the shares stayed within reach of each other. */
++
++	TC_ASSERT_GEQ("rr05_fair_share", stc_fair_pct(nworkers),
++		      STC_RR_FAIR_CHURN);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sched_rr06_rotation_rate
++ *
++ * @testcase             :stc_sched_rr06_rotation_rate
++ * @brief                :SCN-RR-06, the CPU changes hands at the configured
++ *                        rate
++ * @scenario             :Put two equal priority tasks on one CPU and have
++ *                        each of them notice when control has been away and
++ *                        come back.  Summed, those observations count how
++ *                        many times the scheduler moved the CPU between
++ *                        them.  Over a known window the expected count is
++ *                        simply the window divided by CONFIG_RR_INTERVAL.
++ *                        Every other scenario in this family asks whether
++ *                        rotation happens.  This one asks how often, which
++ *                        catches a class of defect the others cannot: a
++ *                        timeslice that is decremented once per CPU per tick
++ *                        rather than once per tick still rotates, but at a
++ *                        multiple of the configured rate, and the resulting
++ *                        share is still perfectly fair.
++ * @apicovered           :sched_setaffinity, task_create, sched_setscheduler
++ * @precondition         :CONFIG_RR_INTERVAL greater than zero
++ * @postcondition        :all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_rr06_rotation_rate(void)
++{
++	struct stc_workload_s wl;
++	int nworkers = 2;
++	uint32_t expected;
++	uint32_t observed;
++	uint32_t lo;
++	uint32_t hi;
++	int run_ret;
++
++	stc_workload_init(&wl, nworkers, SCHED_PRIORITY_DEFAULT, SCHED_RR);
++	wl.window_ms = STC_RR_RATE_WINDOW_MS;
++	wl.detect_switch = true;
++#ifdef CONFIG_SMP
++	CPU_SET(0, &wl.affinity);
++	wl.pinned = true;
++#endif
++
++	run_ret = stc_run_workload(&wl);
++
++	observed = stc_transitions(0) + stc_transitions(1);
++	expected = (uint32_t)(STC_RR_RATE_WINDOW_MS / CONFIG_RR_INTERVAL);
++
++	lo = expected - (expected * STC_RR_RATE_TOLERANCE) / 100;
++	hi = expected + (expected * STC_RR_RATE_TOLERANCE) / 100;
++
++	printf("[SCN-RR-06] transitions=%u expected=%u window=[%u,%u]\n",
++	       (unsigned int)observed, (unsigned int)expected,
++	       (unsigned int)lo, (unsigned int)hi);
++
++	TC_ASSERT_EQ("rr06_workload", run_ret, OK);
++
++	/* Hard correctness assertion: the CPU changed hands at all. */
++
++	TC_ASSERT_GT("rr06_rotated", observed, 0);
++
++	/* And at something close to the configured rate. */
++
++	TC_ASSERT_GEQ("rr06_rate_not_too_slow", observed, lo);
++	TC_ASSERT_LEQ("rr06_rate_not_too_fast", observed, hi);
++
++	TC_SUCCESS_RESULT();
++}
++
+ /****************************************************************************
+  * Public Functions
+  ****************************************************************************/
+@@ -323,6 +557,9 @@ int stc_sched_rr_main(void)
+ #ifdef CONFIG_SMP
+ 	stc_sched_rr03_fairness_secondary_cpu();
+ #endif
++	stc_sched_rr04_fifo_not_preempted();
++	stc_sched_rr05_fairness_under_lock_churn();
++	stc_sched_rr06_rotation_rate();
+ 
+ 	return 0;
+ }
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_smp.c b/apps/examples/testcase/le_tc/kernel/stc_sched_smp.c
+index 023f6f16..b497e983 100644
+--- a/apps/examples/testcase/le_tc/kernel/stc_sched_smp.c
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_smp.c
+@@ -35,10 +35,102 @@
+ #include <stdio.h>
+ #include <sched.h>
+ 
++#include <stdbool.h>
++#include <unistd.h>
++#include <sys/types.h>
++#include <sys/ioctl.h>
++#include <tinyara/sched.h>
++#include <tinyara/os_api_test_drv.h>
++
+ #include "tc_internal.h"
+ #include "stc_sched_common.h"
+ #include "stc_sched_monitor.h"
+ 
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++#ifdef CONFIG_SMP
++
++/* Sampling period for the per CPU occupancy scan. */
++
++#define STC_SMP_SAMPLE_MS       10
++
++/* Window over which occupancy is measured. */
++
++#define STC_SMP_UTIL_WINDOW_MS  2000
++
++/* Largest share of samples on which a CPU may be found idle while there is
++ * work available, as a percentage.  Some idle time is unavoidable: the scan
++ * itself runs somewhere, and a CPU is briefly idle between one task leaving
++ * and the next arriving.  Ten percent is far above that and far below the
++ * failure being hunted, which is a CPU that never picks up work at all.
++ */
++
++#define STC_SMP_MAX_IDLE_PCT    10
++
++/****************************************************************************
++ * Private Data
++ ****************************************************************************/
++
++/* Per CPU occupancy, filled by the scan callback. */
++
++static volatile int g_smp_idle_samples[CONFIG_SMP_NCPUS];
++static volatile int g_smp_busy_samples[CONFIG_SMP_NCPUS];
++static volatile pid_t g_smp_scan_self;
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_smp_occupancy_cb
++ *
++ * Description:
++ *   Records, for the running task on each CPU, whether that task is an IDLE
++ *   task.  The IDLE tasks are the only ones in the system at priority zero,
++ *   so the test is simply that.
++ *
++ *   Runs inside sched_foreach(), which holds a critical section, so this
++ *   only compares and counts.
++ *
++ ****************************************************************************/
++
++static void stc_smp_occupancy_cb(struct tcb_s *tcb, void *arg)
++{
++	int cpu;
++
++	if (tcb == NULL || tcb->task_state != TSTATE_TASK_RUNNING) {
++		return;
++	}
++
++	cpu = (int)tcb->cpu;
++	if (cpu < 0 || cpu >= CONFIG_SMP_NCPUS) {
++		return;
++	}
++
++	if (tcb->sched_priority == 0) {
++		g_smp_idle_samples[cpu]++;
++	} else {
++		g_smp_busy_samples[cpu]++;
++	}
++}
++
++/****************************************************************************
++ * Name: stc_smp_sample_occupancy
++ ****************************************************************************/
++
++static void stc_smp_sample_occupancy(void)
++{
++	int fd = tc_get_drvfd();
++
++	g_smp_scan_self = getpid();
++	(void)ioctl(fd, TESTIOC_SCHED_FOREACH,
++		    (unsigned long)stc_smp_occupancy_cb);
++}
++
++#endif							/* CONFIG_SMP */
++
+ /****************************************************************************
+  * Private Functions
+  ****************************************************************************/
+@@ -112,6 +204,258 @@ static void stc_sched_smp01_starvation_invariant(void)
+ 	TC_SUCCESS_RESULT();
+ }
+ 
++#ifdef CONFIG_SMP
++/****************************************************************************
++ * Name: stc_sched_smp02_hotplug_cycle
++ *
++ * @testcase             :stc_sched_smp02_hotplug_cycle
++ * @brief                :SCN-SMP-02, tasks survive a CPU being taken offline
++ *                        and brought back
++ * @scenario             :Run an unpinned equal priority workload, take the
++ *                        highest numbered CPU offline while it is running,
++ *                        measure again, bring the CPU back and measure a
++ *                        third time.
++ *                        Taking a CPU offline has to move whatever it was
++ *                        running somewhere else, which is task migration
++ *                        driven by an external event rather than by the
++ *                        task.  The risks are losing a task outright and
++ *                        leaving one assigned to a CPU that is no longer
++ *                        there, where it would simply never run again.  The
++ *                        scenario checks both: every worker must still be
++ *                        making progress in every window, and the task
++ *                        control block count must not drop.
++ * @apicovered           :sched_cpuoff, sched_cpuon, task_create
++ * @precondition         :CONFIG_CPU_HOTPLUG and more than one CPU
++ * @postcondition        :CPU back online, all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_smp02_hotplug_cycle(void)
++{
++	struct stc_workload_s wl;
++	int ncpus = stc_ncpus();
++	int nworkers = ncpus + 1;
++	int target = ncpus - 1;
++	int start_ret;
++	int finish_ret;
++	int off_ret;
++	int on_ret;
++	uint32_t min_before;
++	uint32_t min_offline = 0;
++	uint32_t min_after = 0;
++
++	stc_workload_init(&wl, nworkers, SCHED_PRIORITY_DEFAULT, SCHED_RR);
++
++	start_ret = stc_workload_start(&wl);
++
++	stc_workload_sample(700);
++	min_before = stc_min(nworkers);
++
++	off_ret = sched_cpuoff(target);
++	usleep(100 * 1000);
++
++	stc_workload_sample(700);
++	min_offline = stc_min(nworkers);
++
++	on_ret = sched_cpuon(target);
++	usleep(100 * 1000);
++
++	stc_workload_sample(700);
++	min_after = stc_min(nworkers);
++
++	finish_ret = stc_workload_finish(nworkers);
++
++	printf("[SCN-SMP-02] cpu%d off=%d on=%d min before=%u offline=%u after=%u\n",
++	       target, off_ret, on_ret, (unsigned int)min_before,
++	       (unsigned int)min_offline, (unsigned int)min_after);
++
++	TC_ASSERT_EQ("smp02_workload_start", start_ret, OK);
++	TC_ASSERT_EQ("smp02_cpuoff", off_ret, OK);
++	TC_ASSERT_EQ("smp02_cpuon", on_ret, OK);
++	TC_ASSERT_EQ("smp02_workload_finish", finish_ret, OK);
++
++	/* Nobody was lost or stranded at any point in the cycle. */
++
++	TC_ASSERT_GT("smp02_progress_before", min_before, 0);
++	TC_ASSERT_GT("smp02_progress_offline", min_offline, 0);
++	TC_ASSERT_GT("smp02_progress_after", min_after, 0);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sched_smp03_rotation_after_cpu_cycle
++ *
++ * @testcase             :stc_sched_smp03_rotation_after_cpu_cycle
++ * @brief                :SCN-SMP-03, round-robin resumes correctly after a
++ *                        CPU cycle
++ * @scenario             :Take the highest numbered CPU offline and bring it
++ *                        back with an oversubscribed equal priority workload
++ *                        running, then measure fairness in the window that
++ *                        follows.
++ *                        Where SCN-SMP-02 asks whether anything was lost,
++ *                        this asks whether timeslicing still behaves.  A
++ *                        CPU returning with stale scheduler state, or with
++ *                        timeslice accounting that was not restarted, would
++ *                        keep every task alive and still leave the shares
++ *                        permanently skewed.
++ *
++ *                        Scope note: the catalogue frames this scenario
++ *                        around a power management sleep and wake cycle.
++ *                        Only the part of that cycle which the scheduler
++ *                        owns is covered here, namely taking the secondary
++ *                        CPUs down and bringing them back, which is what the
++ *                        power management path itself does first.  Driving a
++ *                        real sleep would require the board to actually
++ *                        sleep, which is not something a test can do
++ *                        unattended, so tick compensation across a sleep
++ *                        remains uncovered.
++ * @apicovered           :sched_cpuoff, sched_cpuon, task_create
++ * @precondition         :CONFIG_CPU_HOTPLUG and more than one CPU
++ * @postcondition        :CPU back online, all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_smp03_rotation_after_cpu_cycle(void)
++{
++	struct stc_workload_s wl;
++	int ncpus = stc_ncpus();
++	int nworkers = ncpus + 1;
++	int target = ncpus - 1;
++	int start_ret;
++	int finish_ret;
++	int off_ret;
++	int on_ret;
++	int fair_after = 0;
++	uint32_t min_after = 0;
++
++	stc_workload_init(&wl, nworkers, SCHED_PRIORITY_DEFAULT, SCHED_RR);
++
++	start_ret = stc_workload_start(&wl);
++
++	stc_workload_sample(500);
++
++	off_ret = sched_cpuoff(target);
++	usleep(200 * 1000);
++
++	on_ret = sched_cpuon(target);
++	usleep(200 * 1000);
++
++	/* The window under test is entirely after the cycle. */
++
++	stc_workload_sample(1500);
++	min_after = stc_min(nworkers);
++	fair_after = stc_fair_pct(nworkers);
++
++	finish_ret = stc_workload_finish(nworkers);
++
++	printf("[SCN-SMP-03] cpu%d off=%d on=%d min_after=%u fair_after=%d%%\n",
++	       target, off_ret, on_ret, (unsigned int)min_after, fair_after);
++
++	TC_ASSERT_EQ("smp03_workload_start", start_ret, OK);
++	TC_ASSERT_EQ("smp03_cpuoff", off_ret, OK);
++	TC_ASSERT_EQ("smp03_cpuon", on_ret, OK);
++	TC_ASSERT_EQ("smp03_workload_finish", finish_ret, OK);
++
++	/* Rotation resumed rather than merely survival. */
++
++	TC_ASSERT_GT("smp03_all_ran_after", min_after, 0);
++	TC_ASSERT_GEQ("smp03_fair_after", fair_after, 30);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sched_smp04_cpu_utilisation
++ *
++ * @testcase             :stc_sched_smp04_cpu_utilisation
++ * @brief                :SCN-SMP-04, no CPU sits idle while work is queued
++ * @scenario             :Saturate the machine with as many unpinned CPU
++ *                        bound tasks as there are CPUs, and sample which
++ *                        task is running on each CPU every ten milliseconds
++ *                        by walking the task lists.  A sample where a CPU is
++ *                        running its IDLE task is a sample where that CPU
++ *                        had nothing to do while runnable work existed.
++ *                        Per task counters cannot detect this.  A scheduler
++ *                        that crowds every task onto one CPU produces
++ *                        counters that look merely slow, not wrong, and one
++ *                        that leaves a CPU idle while a task waits produces
++ *                        counters that look fine for the tasks that did run.
++ *                        Only occupancy sampled from outside shows it.
++ * @apicovered           :sched_foreach via the test driver, task_create
++ * @precondition         :CONFIG_SMP_NCPUS greater than one
++ * @postcondition        :all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_smp04_cpu_utilisation(void)
++{
++	struct stc_workload_s wl;
++	int ncpus = stc_ncpus();
++	int start_ret;
++	int finish_ret;
++	int elapsed = 0;
++	int idle_pct[CONFIG_SMP_NCPUS];
++	int total;
++	int cpu;
++
++	for (cpu = 0; cpu < CONFIG_SMP_NCPUS; cpu++) {
++		g_smp_idle_samples[cpu] = 0;
++		g_smp_busy_samples[cpu] = 0;
++		idle_pct[cpu] = 0;
++	}
++
++	stc_workload_init(&wl, ncpus, SCHED_PRIORITY_DEFAULT, SCHED_RR);
++
++	start_ret = stc_workload_start(&wl);
++
++	/* Sample from this task rather than a dedicated one, so the sampler is
++	 * not itself an extra runnable task competing for a CPU.
++	 */
++
++	while (elapsed < STC_SMP_UTIL_WINDOW_MS) {
++		usleep(STC_SMP_SAMPLE_MS * 1000);
++		stc_smp_sample_occupancy();
++		elapsed += STC_SMP_SAMPLE_MS;
++	}
++
++	finish_ret = stc_workload_finish(ncpus);
++
++	printf("[SCN-SMP-04] ");
++	for (cpu = 0; cpu < ncpus; cpu++) {
++		total = g_smp_idle_samples[cpu] + g_smp_busy_samples[cpu];
++		if (total > 0) {
++			idle_pct[cpu] = (g_smp_idle_samples[cpu] * 100) / total;
++		}
++
++		printf("cpu%d idle=%d%% (%d/%d) ", cpu, idle_pct[cpu],
++		       g_smp_idle_samples[cpu], total);
++	}
++	printf("\n");
++
++	TC_ASSERT_EQ("smp04_workload_start", start_ret, OK);
++	TC_ASSERT_EQ("smp04_workload_finish", finish_ret, OK);
++
++	for (cpu = 0; cpu < ncpus; cpu++) {
++		total = g_smp_idle_samples[cpu] + g_smp_busy_samples[cpu];
++
++		/* A CPU with no samples at all would make its idle percentage
++		 * meaningless, so require evidence before judging it.
++		 */
++
++		TC_ASSERT_GT("smp04_cpu_sampled", total, 0);
++
++		TC_ASSERT_LEQ("smp04_cpu_not_idle", idle_pct[cpu],
++			      STC_SMP_MAX_IDLE_PCT);
++	}
++
++	TC_SUCCESS_RESULT();
++}
++#endif							/* CONFIG_SMP */
++
+ /****************************************************************************
+  * Public Functions
+  ****************************************************************************/
+@@ -127,5 +471,19 @@ int stc_sched_smp_main(void)
+ 
+ 	stc_sched_smp01_starvation_invariant();
+ 
++#ifdef CONFIG_SMP
++	if (stc_ncpus() > 1) {
++#ifdef CONFIG_CPU_HOTPLUG
++		stc_sched_smp02_hotplug_cycle();
++		stc_sched_smp03_rotation_after_cpu_cycle();
++#else
++		printf("[SCN-SMP-02/03] skipped, built without CONFIG_CPU_HOTPLUG\n");
++#endif
++		stc_sched_smp04_cpu_utilisation();
++	} else {
++		printf("[SCN-SMP-02/03/04] skipped, single CPU configuration\n");
++	}
++#endif
++
+ 	return 0;
+ }
+-- 
+2.43.0
+
