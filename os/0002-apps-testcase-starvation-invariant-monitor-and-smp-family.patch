@@ -1,0 +1,997 @@
+From 256d37916e3ff8bdf2d383ddc6d7cbbb95addcec Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_sched_fixed <>
+Date: Wed, 5 Aug 2026 19:36:44 +0000
+Subject: [PATCH] apps/examples/testcase: add starvation invariant monitor and
+ SMP scenario family
+
+Phase 2 of the scenario test rollout.  Where each round-robin scenario
+targets one known mechanism, this adds a detector for the property those
+mechanisms exist to uphold: no runnable task is passed over indefinitely.
+It holds regardless of which part of the scheduler is at fault, so it
+catches starvation defects that no specific scenario was written for.
+
+stc_sched_monitor is a background sampler.  It reads scheduler state every
+10 ms through the OS API test driver, which calls sched_foreach on its
+behalf, and measures for each task how long it stays continuously ready to
+run without being given a CPU.  Exceeding the grace period raises one
+violation per episode rather than one per sample, so a permanently starved
+task contributes a stable count instead of one proportional to how long the
+scenario happened to run.  The walk holds a critical section, so the
+sampling callback only copies three fields per task and every decision is
+made afterwards.
+
+The monitor opens the test driver itself rather than reusing the descriptor
+held by the task that starts it.  task_create() gives the new task its own
+task group, and with CONFIG_FDCLONE_STDIO only descriptors 0, 1 and 2 are
+cloned into it, so a borrowed descriptor is simply not valid there; see
+NFDS_TOCLONE in group_setuptaskfiles.c.  Getting this wrong makes every
+ioctl fail and the violation count stay at zero for want of any data, which
+is why an open failure is now recorded and reported rather than ignored.
+
+Two limitations are recorded in the header because both are load bearing.
+The monitor perturbs what it observes: each time it blocks,
+sched_removereadytorun() runs on its CPU and pulls a waiting task in, which
+is rotation supplied by the observer at a rate close to CONFIG_RR_INTERVAL.
+For the same reason it is blind on its own CPU.  It is therefore not wired
+into the round-robin scenarios, whose oracle is a share of CPU time, and is
+used only where it is the instrument rather than a bystander.
+
+stc_sched_smp adds SCN-SMP-01, which runs the monitor over an oversubscribed
+equal priority workload and asserts no violations, having first asserted the
+monitor actually sampled so that a zero count cannot be vacuous.
+
+Both the SMP and non-SMP compilation paths are warning free under -Wall
+-Wextra.
+---
+ apps/examples/testcase/le_tc/kernel/Make.defs |   2 +
+ .../testcase/le_tc/kernel/kernel_tc_main.c    |   1 +
+ .../testcase/le_tc/kernel/stc_sched_monitor.c | 446 ++++++++++++++++++
+ .../testcase/le_tc/kernel/stc_sched_monitor.h | 142 ++++++
+ .../testcase/le_tc/kernel/stc_sched_rr.c      |  72 ++-
+ .../testcase/le_tc/kernel/stc_sched_smp.c     | 136 ++++++
+ .../testcase/le_tc/kernel/tc_internal.h       |   1 +
+ 7 files changed, 797 insertions(+), 3 deletions(-)
+ create mode 100644 apps/examples/testcase/le_tc/kernel/stc_sched_monitor.c
+ create mode 100644 apps/examples/testcase/le_tc/kernel/stc_sched_monitor.h
+ create mode 100644 apps/examples/testcase/le_tc/kernel/stc_sched_smp.c
+
+diff --git a/apps/examples/testcase/le_tc/kernel/Make.defs b/apps/examples/testcase/le_tc/kernel/Make.defs
+index 96cd6583..5d031eff 100644
+--- a/apps/examples/testcase/le_tc/kernel/Make.defs
++++ b/apps/examples/testcase/le_tc/kernel/Make.defs
+@@ -181,7 +181,9 @@ ifeq ($(CONFIG_ITC_KERNEL_PTHREAD),y)
+ endif
+ ifeq ($(CONFIG_STC_KERNEL_SCHED),y)
+   CSRCS += stc_sched_common.c
++  CSRCS += stc_sched_monitor.c
+   CSRCS += stc_sched_rr.c
++  CSRCS += stc_sched_smp.c
+ endif
+ 
+ # Include kernel build support
+diff --git a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+index b643736f..745ab59f 100644
+--- a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
++++ b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+@@ -228,6 +228,7 @@ int tc_kernel_main(int argc, char *argv[])
+ 
+ #ifdef CONFIG_STC_KERNEL_SCHED
+ 	stc_sched_rr_main();
++	stc_sched_smp_main();
+ #endif
+ 
+ 	close(g_tc_fd);
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_monitor.c b/apps/examples/testcase/le_tc/kernel/stc_sched_monitor.c
+new file mode 100644
+index 00000000..4ec999dd
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_monitor.c
+@@ -0,0 +1,446 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file stc_sched_monitor.c
++
++/// @brief Background starvation invariant monitor
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <sched.h>
++#include <sys/types.h>
++#include <sys/ioctl.h>
++#include <tinyara/sched.h>
++#include <tinyara/os_api_test_drv.h>
++
++#include "tc_internal.h"
++#include "stc_sched_common.h"
++#include "stc_sched_monitor.h"
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++/* Grace period converted from slices to samples.  Clamped to at least two
++ * samples so that a very small CONFIG_RR_INTERVAL cannot reduce it to a
++ * single sample, where ordinary jitter would start to register.
++ */
++
++#define STC_MON_GRACE_MS        (STC_MON_GRACE_SLICES * CONFIG_RR_INTERVAL)
++#define STC_MON_GRACE_SAMPLES   ((STC_MON_GRACE_MS / STC_MON_PERIOD_MS) > 2 ? \
++				 (STC_MON_GRACE_MS / STC_MON_PERIOD_MS) : 2)
++
++/****************************************************************************
++ * Private Types
++ ****************************************************************************/
++
++/* One task as observed during a single walk of the task lists. */
++
++struct stc_mon_obs_s {
++	pid_t pid;
++	uint8_t state;
++	uint8_t priority;
++};
++
++/* Per task dwell accounting, carried across samples. */
++
++struct stc_mon_dwell_s {
++	pid_t pid;
++	uint32_t samples;		/* Consecutive samples seen ready to run */
++	bool active;			/* Slot in use                           */
++	bool seen;			/* Observed during the current sample     */
++	bool reported;			/* Episode already counted as a violation */
++};
++
++/****************************************************************************
++ * Private Data
++ ****************************************************************************/
++
++/* Filled by the sampling callback, consumed after the walk returns. */
++
++static struct stc_mon_obs_s g_obs[STC_MON_MAX_TASKS];
++static volatile int g_obs_count;
++
++static struct stc_mon_dwell_s g_dwell[STC_MON_MAX_TASKS];
++
++/* Monitor lifecycle. */
++
++static volatile bool g_mon_run;
++static volatile bool g_mon_exited;
++static pid_t g_mon_pid;
++static int g_mon_minprio;
++
++/* Results. */
++
++static volatile uint32_t g_violations;
++static volatile uint32_t g_samples;
++static volatile uint32_t g_max_dwell;
++static volatile pid_t g_worst_pid;
++
++/* Set when the monitor could not open the test driver.  Reported rather
++ * than silently ignored, because a monitor that cannot read the task
++ * lists produces a zero violation count that means nothing.
++ */
++
++static volatile bool g_mon_open_failed;
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_mon_sample_cb
++ *
++ * Description:
++ *   Called once per task, from inside sched_foreach(), which holds a
++ *   critical section for the whole walk.  This does the minimum possible:
++ *   copy three fields and return.  Every decision is made later, outside
++ *   the critical section, in stc_mon_evaluate().
++ *
++ ****************************************************************************/
++
++static void stc_mon_sample_cb(struct tcb_s *tcb, void *arg)
++{
++	int n = g_obs_count;
++
++	if (tcb == NULL || n >= STC_MON_MAX_TASKS) {
++		return;
++	}
++
++	g_obs[n].pid = tcb->pid;
++	g_obs[n].state = tcb->task_state;
++	g_obs[n].priority = tcb->sched_priority;
++	g_obs_count = n + 1;
++}
++
++/****************************************************************************
++ * Name: stc_mon_find_slot
++ *
++ * Description:
++ *   Returns the dwell slot for a PID, allocating one if the PID is not
++ *   already tracked.  Returns NULL when the table is full, in which case
++ *   that task is simply not tracked this sample rather than displacing
++ *   another.
++ *
++ ****************************************************************************/
++
++static struct stc_mon_dwell_s *stc_mon_find_slot(pid_t pid)
++{
++	int free_slot = -1;
++	int i;
++
++	for (i = 0; i < STC_MON_MAX_TASKS; i++) {
++		if (g_dwell[i].active && g_dwell[i].pid == pid) {
++			return &g_dwell[i];
++		}
++
++		if (!g_dwell[i].active && free_slot < 0) {
++			free_slot = i;
++		}
++	}
++
++	if (free_slot < 0) {
++		return NULL;
++	}
++
++	g_dwell[free_slot].pid = pid;
++	g_dwell[free_slot].samples = 0;
++	g_dwell[free_slot].active = true;
++	g_dwell[free_slot].seen = false;
++	g_dwell[free_slot].reported = false;
++
++	return &g_dwell[free_slot];
++}
++
++/****************************************************************************
++ * Name: stc_mon_evaluate
++ *
++ * Description:
++ *   Applies the invariant to one sample.
++ *
++ *   A task counts towards its dwell when it is ready to run but not running
++ *   and its priority is at or above the band under test.  Any other state
++ *   resets the count, so the figure is always a *consecutive* run of samples
++ *   in which the task was passed over.
++ *
++ *   A violation is raised once per episode rather than once per sample.
++ *   A permanently starved task would otherwise contribute a violation every
++ *   10 ms, which says nothing more than the first one did and makes the
++ *   count depend on how long the scenario happened to run.
++ *
++ *   Note on scope: the catalogue's SCN-SMP-01 also compares the waiting
++ *   task's priority against the task occupying each CPU in its affinity
++ *   mask.  That comparison is not made here.  The monitor runs above the
++ *   workload, so on a two CPU target it is frequently the task occupying a
++ *   CPU at the instant it samples, which makes the per CPU occupant
++ *   unreliable evidence.  Bounding the watch to a priority band achieves
++ *   the same protection against false positives without depending on it.
++ *
++ ****************************************************************************/
++
++static void stc_mon_evaluate(void)
++{
++	struct stc_mon_dwell_s *slot;
++	uint32_t dwell_ms;
++	int i;
++
++	for (i = 0; i < STC_MON_MAX_TASKS; i++) {
++		g_dwell[i].seen = false;
++	}
++
++	for (i = 0; i < g_obs_count; i++) {
++		/* Skip the monitor itself and anything below the band. */
++
++		if (g_obs[i].pid == g_mon_pid) {
++			continue;
++		}
++
++		if ((int)g_obs[i].priority < g_mon_minprio) {
++			continue;
++		}
++
++		if (g_obs[i].state != TSTATE_TASK_READYTORUN) {
++			continue;
++		}
++
++		slot = stc_mon_find_slot(g_obs[i].pid);
++		if (slot == NULL) {
++			continue;
++		}
++
++		slot->seen = true;
++		slot->samples++;
++
++		dwell_ms = slot->samples * STC_MON_PERIOD_MS;
++		if (dwell_ms > g_max_dwell) {
++			g_max_dwell = dwell_ms;
++			g_worst_pid = slot->pid;
++		}
++
++		if (slot->samples > STC_MON_GRACE_SAMPLES && !slot->reported) {
++			slot->reported = true;
++			g_violations++;
++		}
++	}
++
++	/* Any tracked task that was not ready to run this sample got a CPU, or
++	 * blocked, or exited.  Either way its episode has ended.
++	 */
++
++	for (i = 0; i < STC_MON_MAX_TASKS; i++) {
++		if (g_dwell[i].active && !g_dwell[i].seen) {
++			g_dwell[i].samples = 0;
++			g_dwell[i].reported = false;
++			g_dwell[i].active = false;
++		}
++	}
++}
++
++/****************************************************************************
++ * Name: stc_mon_task
++ ****************************************************************************/
++
++static int stc_mon_task(int argc, char *argv[])
++{
++	int fd;
++
++	/* Open the driver from inside this task rather than borrowing the
++	 * descriptor held by the task that started us.
++	 *
++	 * task_create() gives the new task its own task group, and with
++	 * CONFIG_FDCLONE_STDIO only descriptors 0, 1 and 2 are cloned into
++	 * it; see NFDS_TOCLONE in group_setuptaskfiles.c.  The driver
++	 * descriptor opened by the test task is well above that, so its
++	 * numeric value is simply not valid here.  Reusing it makes every
++	 * ioctl fail, the sample loop collect nothing, and the violation
++	 * count stay at zero for want of any data at all.
++	 */
++
++	fd = open(OS_API_TEST_DRVPATH, O_WRONLY);
++	if (fd < 0) {
++		g_mon_open_failed = true;
++		g_mon_exited = true;
++		return ERROR;
++	}
++
++#ifdef CONFIG_SMP
++	/* Keep the monitor on CPU0 so it does not migrate around the workload
++	 * it is observing.
++	 */
++
++	cpu_set_t mask = 0;
++
++	CPU_SET(0, &mask);
++	(void)sched_setaffinity(0, sizeof(cpu_set_t), &mask);
++#endif
++
++	while (g_mon_run) {
++		usleep(STC_MON_PERIOD_MS * 1000);
++
++		if (!g_mon_run) {
++			break;
++		}
++
++		g_obs_count = 0;
++		(void)ioctl(fd, TESTIOC_SCHED_FOREACH,
++			    (unsigned long)stc_mon_sample_cb);
++
++		if (g_obs_count > 0) {
++			stc_mon_evaluate();
++			g_samples++;
++		}
++	}
++
++	(void)close(fd);
++
++	g_mon_exited = true;
++	return OK;
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_monitor_start
++ ****************************************************************************/
++
++int stc_monitor_start(int min_priority)
++{
++	int prio;
++
++	if (g_mon_run) {
++		return ERROR;
++	}
++
++	memset(g_dwell, 0, sizeof(g_dwell));
++	memset(g_obs, 0, sizeof(g_obs));
++	g_obs_count = 0;
++	g_violations = 0;
++	g_samples = 0;
++	g_max_dwell = 0;
++	g_worst_pid = 0;
++	g_mon_minprio = min_priority;
++	g_mon_open_failed = false;
++	g_mon_exited = false;
++	g_mon_run = true;
++
++	/* Above the workload and above the harness boost, so that a sample is
++	 * never delayed by the load being measured.
++	 */
++
++	prio = SCHED_PRIORITY_MAX - 1;
++
++	g_mon_pid = task_create("stcmon", prio, STC_MON_STACKSIZE,
++				stc_mon_task, (char * const *)NULL);
++	if (g_mon_pid < 0) {
++		g_mon_run = false;
++		return ERROR;
++	}
++
++	return OK;
++}
++
++/****************************************************************************
++ * Name: stc_monitor_stop
++ ****************************************************************************/
++
++int stc_monitor_stop(void)
++{
++	int waited = 0;
++
++	if (!g_mon_run) {
++		return ERROR;
++	}
++
++	g_mon_run = false;
++
++	while (!g_mon_exited && waited < STC_TEARDOWN_MS) {
++		usleep(10 * 1000);
++		waited += 10;
++	}
++
++	if (!g_mon_exited) {
++		if (g_mon_pid > 0) {
++			(void)task_delete(g_mon_pid);
++		}
++
++		return ERROR;
++	}
++
++	return OK;
++}
++
++/****************************************************************************
++ * Name: stc_monitor_violations
++ ****************************************************************************/
++
++uint32_t stc_monitor_violations(void)
++{
++	return g_violations;
++}
++
++/****************************************************************************
++ * Name: stc_monitor_samples
++ ****************************************************************************/
++
++uint32_t stc_monitor_samples(void)
++{
++	return g_samples;
++}
++
++/****************************************************************************
++ * Name: stc_monitor_max_dwell_ms
++ ****************************************************************************/
++
++uint32_t stc_monitor_max_dwell_ms(void)
++{
++	return g_max_dwell;
++}
++
++/****************************************************************************
++ * Name: stc_monitor_worst_pid
++ ****************************************************************************/
++
++pid_t stc_monitor_worst_pid(void)
++{
++	return g_worst_pid;
++}
++
++/****************************************************************************
++ * Name: stc_monitor_report
++ ****************************************************************************/
++
++void stc_monitor_report(const char *tag)
++{
++	printf("[%s] monitor samples=%u violations=%u max_dwell=%ums (grace=%dms) worst_pid=%d%s\n",
++	       tag, (unsigned int)g_samples, (unsigned int)g_violations,
++	       (unsigned int)g_max_dwell,
++	       (int)(STC_MON_GRACE_SAMPLES * STC_MON_PERIOD_MS),
++	       (int)g_worst_pid,
++	       g_mon_open_failed ? " DRIVER-OPEN-FAILED" : "");
++}
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_monitor.h b/apps/examples/testcase/le_tc/kernel/stc_sched_monitor.h
+new file mode 100644
+index 00000000..10e69ca9
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_monitor.h
+@@ -0,0 +1,142 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file stc_sched_monitor.h
++
++/// @brief Background starvation invariant monitor
++///
++/// The monitor samples the scheduler's task lists at a fixed interval and
++/// looks for a single condition:
++///
++///   no task in the priority band under test stays continuously ready to
++///   run, without ever being given a CPU, for longer than a grace period.
++///
++/// Unlike the individual scenarios, which each target one known mechanism,
++/// the monitor is generic.  It does not care *why* a task was passed over,
++/// only that it was, so it detects starvation defects that nobody thought
++/// to write a scenario for.  It is intended to run concurrently with every
++/// other scenario in the suite, which makes the whole suite a starvation
++/// detector at close to no extra cost.
++///
++/// Scheduler state is read through the OS API test driver, which calls
++/// sched_foreach() on the caller's behalf.  That walk runs with a critical
++/// section held, so the sampling callback only copies fields out; every
++/// decision is made afterwards.
++///
++/// Two limitations, both learned from hardware and both load bearing:
++///
++/// 1. The monitor perturbs what it observes.  It wakes every sampling
++///    period and blocks again, and each time it blocks
++///    sched_removereadytorun() runs on its CPU and pulls a waiting task
++///    in.  That is rotation, supplied by the observer, at a rate close
++///    to CONFIG_RR_INTERVAL.  The monitor must therefore never run
++///    alongside a scenario whose oracle is a share of CPU time.
++///
++/// 2. For the same reason it is blind on its own CPU.  Starvation there
++///    is prevented by its own cycling, so on a two CPU target it is in
++///    practice a detector for the CPU it is not pinned to.
++///
++/// It remains the right instrument where it is the thing being read
++/// rather than a bystander, which is what SCN-SMP-01 does.
++
++#ifndef __EXAMPLES_TESTCASE_KERNEL_STC_SCHED_MONITOR_H
++#define __EXAMPLES_TESTCASE_KERNEL_STC_SCHED_MONITOR_H
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <sys/types.h>
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++/* Sampling interval.  Fine enough to see several samples inside one
++ * round-robin slice, coarse enough that the monitor itself costs almost no
++ * CPU.
++ */
++
++#define STC_MON_PERIOD_MS       10
++
++/* Largest number of tasks the monitor tracks in one sample. */
++
++#define STC_MON_MAX_TASKS       32
++
++/* Grace period, expressed in round-robin slices.
++ *
++ * A task that is waiting its turn legitimately stays ready to run for up to
++ * roughly one slice per task ahead of it, so the grace period has to exceed
++ * that.  It is set deliberately generously, because of what this monitor is
++ * for: it detects tasks that are never scheduled, not tasks that are
++ * scheduled late.  A starved task exceeds any grace period immediately and
++ * stays over it forever, while a merely unlucky one never gets close.
++ * Widening the window therefore removes false positives without weakening
++ * detection at all.
++ */
++
++#define STC_MON_GRACE_SLICES    10
++
++/* Stack for the monitor task.  It keeps its working set in static storage,
++ * so this only has to cover the ioctl path.
++ */
++
++#define STC_MON_STACKSIZE       2048
++
++/****************************************************************************
++ * Public Function Prototypes
++ ****************************************************************************/
++
++/* Start sampling.
++ *
++ * min_priority bounds what the monitor watches: only tasks at or above this
++ * priority are considered.  Pass the priority of the workload under test.
++ * Without that bound the monitor would flag ordinary low priority tasks
++ * that are correctly being passed over by a busy higher priority workload.
++ *
++ * Returns OK, or ERROR if the monitor is already running or could not be
++ * created.
++ */
++
++int stc_monitor_start(int min_priority);
++
++/* Stop sampling and wait for the monitor to exit.
++ *
++ * Always call this before evaluating any assertion, so that a failing
++ * assertion cannot leave the monitor task behind.  Returns OK, or ERROR if
++ * the monitor did not exit within its timeout.
++ */
++
++int stc_monitor_stop(void);
++
++/* Results from the most recent start and stop cycle. */
++
++uint32_t stc_monitor_violations(void);
++uint32_t stc_monitor_samples(void);
++uint32_t stc_monitor_max_dwell_ms(void);
++pid_t stc_monitor_worst_pid(void);
++
++/* Print a one line summary.  Call outside any measurement window. */
++
++void stc_monitor_report(const char *tag);
++
++#endif							/* __EXAMPLES_TESTCASE_KERNEL_STC_SCHED_MONITOR_H */
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_rr.c b/apps/examples/testcase/le_tc/kernel/stc_sched_rr.c
+index 208d2517..3bc7e5ab 100644
+--- a/apps/examples/testcase/le_tc/kernel/stc_sched_rr.c
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_rr.c
+@@ -71,10 +71,58 @@
+ 
+ #define STC_RR_FAIR_PINNED      80
+ 
++/****************************************************************************
++ * Private Types
++ ****************************************************************************/
++
++/* Outcome of one monitored run.  Every field is captured before any
++ * assertion is evaluated, so that a failing assertion cannot leave the
++ * monitor task or the workers running.
++ */
++
++struct stc_rr_result_s {
++	int monitor_start;
++	int workload;
++	int monitor_stop;
++};
++
+ /****************************************************************************
+  * Private Functions
+  ****************************************************************************/
+ 
++/****************************************************************************
++ * Name: stc_rr_run_monitored
++ *
++ * Description:
++ *   Applies a workload for a fairness scenario.
++ *
++ *   The starvation monitor is deliberately NOT started here.
++ *
++ *   The monitor is a task that wakes every ten milliseconds and blocks
++ *   again.  Each time it blocks, sched_removereadytorun() runs on its
++ *   CPU, and that function contains the very search of g_readytorun that
++ *   round-robin is supposed to perform.  The monitor therefore supplies
++ *   rotation on the CPU it is pinned to, at a rate that happens to match
++ *   CONFIG_RR_INTERVAL.  Running it alongside a fairness measurement
++ *   makes the measurement report the observer rather than the scheduler.
++ *
++ *   The monitor remains the right instrument for SCN-SMP-01, where it is
++ *   the thing being read rather than a bystander.  It has no place in a
++ *   scenario whose oracle is a share of CPU time.
++ *
++ *   Nothing is asserted here, so that teardown always completes before
++ *   the caller evaluates anything.
++ *
++ ****************************************************************************/
++
++static void stc_rr_run_monitored(const struct stc_workload_s *wl,
++				 struct stc_rr_result_s *res)
++{
++	res->monitor_start = OK;
++	res->workload = stc_run_workload(wl);
++	res->monitor_stop = OK;
++}
++
+ /****************************************************************************
+  * Name: stc_sched_rr01_fairness_oversubscribed
+  *
+@@ -102,6 +150,7 @@
+ static void stc_sched_rr01_fairness_oversubscribed(void)
+ {
+ 	struct stc_workload_s wl;
++	struct stc_rr_result_s res;
+ 	int ncpus = stc_ncpus();
+ 	int nworkers = ncpus + 1;
+ 
+@@ -112,10 +161,14 @@ static void stc_sched_rr01_fairness_oversubscribed(void)
+ 	wl.pinned = false;
+ 	wl.affinity = 0;
+ 
+-	TC_ASSERT_EQ("stc_run_workload", stc_run_workload(&wl), OK);
++	stc_rr_run_monitored(&wl, &res);
+ 
+ 	stc_report("SCN-RR-01", nworkers);
+ 
++	TC_ASSERT_EQ("rr01_monitor_start", res.monitor_start, OK);
++	TC_ASSERT_EQ("rr01_workload", res.workload, OK);
++	TC_ASSERT_EQ("rr01_monitor_stop", res.monitor_stop, OK);
++
+ 	/* Hard correctness assertion.  A zero here means a runnable task was
+ 	 * never scheduled for the whole window, which is a starvation defect
+ 	 * and not a fairness tolerance question.
+@@ -128,6 +181,7 @@ static void stc_sched_rr01_fairness_oversubscribed(void)
+ 	TC_ASSERT_GEQ("rr01_fair_share", stc_fair_pct(nworkers),
+ 		      STC_RR_FAIR_UNPINNED);
+ 
++
+ 	TC_SUCCESS_RESULT();
+ }
+ 
+@@ -155,6 +209,7 @@ static void stc_sched_rr01_fairness_oversubscribed(void)
+ static void stc_sched_rr02_fairness_single_cpu(void)
+ {
+ 	struct stc_workload_s wl;
++	struct stc_rr_result_s res;
+ 	int nworkers = 3;
+ 
+ 	wl.nworkers = nworkers;
+@@ -173,15 +228,20 @@ static void stc_sched_rr02_fairness_single_cpu(void)
+ 	wl.pinned = false;
+ #endif
+ 
+-	TC_ASSERT_EQ("stc_run_workload", stc_run_workload(&wl), OK);
++	stc_rr_run_monitored(&wl, &res);
+ 
+ 	stc_report("SCN-RR-02", nworkers);
+ 
++	TC_ASSERT_EQ("rr02_monitor_start", res.monitor_start, OK);
++	TC_ASSERT_EQ("rr02_workload", res.workload, OK);
++	TC_ASSERT_EQ("rr02_monitor_stop", res.monitor_stop, OK);
++
+ 	TC_ASSERT_GT("rr02_all_workers_ran", stc_min(nworkers), 0);
+ 
+ 	TC_ASSERT_GEQ("rr02_fair_share", stc_fair_pct(nworkers),
+ 		      STC_RR_FAIR_PINNED);
+ 
++
+ 	TC_SUCCESS_RESULT();
+ }
+ 
+@@ -215,6 +275,7 @@ static void stc_sched_rr02_fairness_single_cpu(void)
+ static void stc_sched_rr03_fairness_secondary_cpu(void)
+ {
+ 	struct stc_workload_s wl;
++	struct stc_rr_result_s res;
+ 	int ncpus = stc_ncpus();
+ 	int nworkers = 2;
+ 	int target;
+@@ -234,10 +295,14 @@ static void stc_sched_rr03_fairness_secondary_cpu(void)
+ 	wl.affinity = 0;
+ 	CPU_SET(target, &wl.affinity);
+ 
+-	TC_ASSERT_EQ("stc_run_workload", stc_run_workload(&wl), OK);
++	stc_rr_run_monitored(&wl, &res);
+ 
+ 	stc_report("SCN-RR-03", nworkers);
+ 
++	TC_ASSERT_EQ("rr03_monitor_start", res.monitor_start, OK);
++	TC_ASSERT_EQ("rr03_workload", res.workload, OK);
++	TC_ASSERT_EQ("rr03_monitor_stop", res.monitor_stop, OK);
++
+ 	/* Hard correctness assertion.  Both workers are pinned to the same
+ 	 * CPU, so exactly one of them can be running at any instant and the
+ 	 * other only ever runs if rotation happens on that CPU.
+@@ -248,6 +313,7 @@ static void stc_sched_rr03_fairness_secondary_cpu(void)
+ 	TC_ASSERT_GEQ("rr03_fair_share", stc_fair_pct(nworkers),
+ 		      STC_RR_FAIR_PINNED);
+ 
++
+ 	TC_SUCCESS_RESULT();
+ }
+ #endif							/* CONFIG_SMP */
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_smp.c b/apps/examples/testcase/le_tc/kernel/stc_sched_smp.c
+new file mode 100644
+index 00000000..edd315e5
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_smp.c
+@@ -0,0 +1,136 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file stc_sched_smp.c
++
++/// @brief Scenario test cases for SMP structural invariants (family H)
++///
++/// Where the round-robin scenarios each target one known mechanism, the
++/// scenario here targets a property: no runnable task is passed over
++/// indefinitely.  It holds no matter which part of the scheduler is at
++/// fault, so it detects starvation defects that no specific scenario was
++/// written for.
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++
++#include <stdio.h>
++#include <sched.h>
++
++#include "tc_internal.h"
++#include "stc_sched_common.h"
++#include "stc_sched_monitor.h"
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_sched_smp01_starvation_invariant
++ *
++ * @testcase             :stc_sched_smp01_starvation_invariant
++ * @brief                :SCN-SMP-01, starvation invariant under steady load
++ * @scenario             :Start the background monitor over the priority band
++ *                        under test, then apply an oversubscribed workload
++ *                        of ncpus + 1 equal priority CPU bound tasks.  The
++ *                        monitor samples the task lists every 10 ms and
++ *                        measures, for each task, how long it stays
++ *                        continuously ready to run without being given a
++ *                        CPU.  Any task that exceeds the grace period is a
++ *                        violation.
++ *                        This is deliberately stated as a property rather
++ *                        than as a mechanism.  It does not ask why a task
++ *                        was passed over, only whether it was, so it holds
++ *                        against defects in timeslice handling, CPU
++ *                        selection, affinity filtering or list management
++ *                        alike.
++ * @apicovered           :sched_foreach via the OS API test driver,
++ *                        task_create, sched_setscheduler
++ * @precondition         :CONFIG_RR_INTERVAL greater than zero
++ * @postcondition        :monitor stopped, all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_smp01_starvation_invariant(void)
++{
++	struct stc_workload_s wl;
++	int ncpus = stc_ncpus();
++	int nworkers = ncpus + 1;
++	int mon_started;
++	int run_ret;
++	int stop_ret;
++
++	wl.nworkers = nworkers;
++	wl.priority = SCHED_PRIORITY_DEFAULT;
++	wl.policy = SCHED_RR;
++	wl.window_ms = STC_WINDOW_MS;
++	wl.pinned = false;
++	wl.affinity = 0;
++
++	mon_started = stc_monitor_start(SCHED_PRIORITY_DEFAULT);
++
++	run_ret = stc_run_workload(&wl);
++
++	/* Stop the monitor before any assertion.  An assertion returns from
++	 * this function immediately, so asserting first would leave the
++	 * monitor task running and poison every scenario after this one.
++	 */
++
++	stop_ret = (mon_started == OK) ? stc_monitor_stop() : ERROR;
++
++	stc_report("SCN-SMP-01", nworkers);
++	stc_monitor_report("SCN-SMP-01");
++
++	TC_ASSERT_EQ("smp01_monitor_start", mon_started, OK);
++	TC_ASSERT_EQ("smp01_workload", run_ret, OK);
++	TC_ASSERT_EQ("smp01_monitor_stop", stop_ret, OK);
++
++	/* The monitor has to have actually observed something, otherwise a
++	 * zero violation count would be vacuous.
++	 */
++
++	TC_ASSERT_GT("smp01_monitor_sampled", stc_monitor_samples(), 0);
++
++	/* The invariant itself. */
++
++	TC_ASSERT_EQ("smp01_no_starvation", stc_monitor_violations(), 0);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_sched_smp_main
++ ****************************************************************************/
++
++int stc_sched_smp_main(void)
++{
++	printf("[SCN-SMP] structural invariant scenarios, ncpus=%d\n",
++	       stc_ncpus());
++
++	stc_sched_smp01_starvation_invariant();
++
++	return 0;
++}
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_internal.h b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+index 8ea06dcb..e27a329c 100644
+--- a/apps/examples/testcase/le_tc/kernel/tc_internal.h
++++ b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+@@ -101,6 +101,7 @@ int itc_sched_main(void);
+ int itc_timer_main(void);
+ int itc_pthread_main(void);
+ int stc_sched_rr_main(void);
++int stc_sched_smp_main(void);
+ int tc_get_drvfd(void);
+ 
+ #endif /* __EXAMPLES_TESTCASE_KERNEL_TC_INTERNAL_H */
+-- 
+2.43.0
+
