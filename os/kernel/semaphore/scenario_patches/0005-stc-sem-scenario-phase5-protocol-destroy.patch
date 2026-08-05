@@ -1,0 +1,1713 @@
+From b6a05b1218a5a66a52344a7de1eb8caf986f258b Mon Sep 17 00:00:00 2001
+From: adbtrr_work_5 <adbtrr_work_5@local>
+Date: Wed, 5 Aug 2026 11:58:45 +0000
+Subject: [PATCH 5/6] apps/examples/testcase: Add semaphore scenario test tier,
+ phase 5
+
+Phase 5: families D, G and the testable part of family H, plus the robust
+mutex scenario deferred from phase 4.
+
+Family D, protocol and flavour, new stc_sem_protocol.c:
+- SCN-PIP-01 is the behavioural test section 1.2 of the catalogue says is
+  missing. tc_semaphore_sem_setprotocol() asks the kernel to disable
+  inheritance and asserts the call returned zero; this asserts that the
+  holder's priority does not move.
+- SCN-PIP-02 flips the protocol back and requires the boost to return.
+  Without it, SCN-PIP-01 would also pass on a kernel where nothing ever
+  boosts, so the pair is what distinguishes the two.
+- SCN-PIP-03 is the regression for the PRIOINHERIT_FLAGS_DISABLE check
+  inside sem_findhighestwaiter(). A holder owns a disabled semaphore and
+  a normal one; releasing the normal one makes the restore walk visit the
+  disabled entry, whose waiter must not set the holder's priority.
+- SCN-PIP-04 asserts that a zero initialised semaphore records no holder,
+  so the awakened waiter never becomes a permanent one. That is the
+  failure mode sem_setprotocol()'s own documentation describes, and the
+  FLAGS_SIGSEM auto-detection is meant to make the manual fix unnecessary.
+- SCN-PIP-05 covers PTHREAD_PRIO_INHERIT against PTHREAD_PRIO_NONE and
+  checks the mutex count invariant at every step.
+
+Family G, destruction and reset, new stc_sem_destroy.c:
+- SCN-DES-01 destroys a semaphore with two live holders that each also
+  hold a second one, then makes both post the survivor. That post walks
+  each task's holdsem list during the priority restore, so a holder freed
+  from the semaphore but left linked on the task faults exactly there.
+- SCN-DES-02 destroys a semaphore with a blocked waiter. POSIX leaves
+  this undefined and the scenario asserts no particular count, only that
+  the undefined case is survivable and the blocked task still deletes
+  cleanly, which is what error path cleanup actually needs to know.
+- SCN-DES-03 and SCN-DES-04 run inside the driver. sem_reset() is
+  declared in tinyara/semaphore.h and is not a syscall, so it cannot be
+  reached from user space; the sequence is a new TESTIOC_SEM_RESET_TEST
+  handler in os/drivers/os_api_test/kernel/test_sem.c, in the same style
+  as the existing tick wait test, triggered from the scenario.
+- SCN-DES-05 churns both flavours through init and destroy, checking the
+  holder record is freed each cycle.
+
+Family H is partly not implementable, and that is stated rather than
+worked around. SCN-BIN-01 to SCN-BIN-03 need a loadable user binary that
+can be faulted on demand, which is fixture work rather than test case
+work; the manual procedure is written into the header of
+stc_sem_destroy.c. SCN-BIN-04, the scope limit that a signalling
+semaphore is never registered for binary recovery, is covered in process,
+and the run log prints a notice naming what is still missing so the gap
+is visible outside the catalogue.
+
+SCN-REC-04, the robust mutex EOWNERDEAD path, is added to
+stc_sem_recovery.c under !CONFIG_PTHREAD_MUTEX_UNSAFE. On the reference
+platform it reports a skip naming the configuration needed, because
+CONFIG_PTHREAD_MUTEX_UNSAFE=y leaves the whole robust mutex
+implementation out of the build. Oracle 3 is the interesting one: if the
+mutex were released both by pthread_mutex_inconsistent() and by
+sem_release_all(), the count would end one too high, which on a
+FLAGS_SEM_MUTEX semaphore is an assertion rather than a quiet corruption.
+
+Not build verified: no target toolchain in this environment. The
+application sources were syntax checked with gcc -Wall -Wextra against
+stub headers in four configurations, including one with
+CONFIG_PTHREAD_MUTEX_UNSAFE set to cover the skip path, all clean. The
+kernel side driver changes are not covered by that check.
+---
+ apps/examples/testcase/le_tc/kernel/Make.defs |   2 +-
+ .../testcase/le_tc/kernel/kernel_tc_main.c    |   2 +
+ .../testcase/le_tc/kernel/stc_sem_destroy.c   | 532 +++++++++++++
+ .../testcase/le_tc/kernel/stc_sem_protocol.c  | 736 ++++++++++++++++++
+ .../testcase/le_tc/kernel/stc_sem_recovery.c  | 175 ++++-
+ .../testcase/le_tc/kernel/tc_internal.h       |   2 +
+ os/drivers/os_api_test/kernel/test_sem.c      |  70 ++
+ os/drivers/os_api_test/os_api_test_drv.c      |   1 +
+ os/include/tinyara/os_api_test_drv.h          |   1 +
+ 9 files changed, 1515 insertions(+), 6 deletions(-)
+ create mode 100644 apps/examples/testcase/le_tc/kernel/stc_sem_destroy.c
+ create mode 100644 apps/examples/testcase/le_tc/kernel/stc_sem_protocol.c
+
+diff --git a/apps/examples/testcase/le_tc/kernel/Make.defs b/apps/examples/testcase/le_tc/kernel/Make.defs
+index a620a4e4..a5ca0500 100644
+--- a/apps/examples/testcase/le_tc/kernel/Make.defs
++++ b/apps/examples/testcase/le_tc/kernel/Make.defs
+@@ -126,7 +126,7 @@ ifeq ($(CONFIG_TC_KERNEL_SCHED),y)
+   CSRCS += tc_sched.c
+ endif
+ ifeq ($(CONFIG_TC_KERNEL_SEM_SCENARIO),y)
+-  CSRCS += stc_sem_common.c stc_sem_inherit.c stc_sem_monitor.c stc_sem_cancel.c stc_sem_recovery.c
++  CSRCS += stc_sem_common.c stc_sem_inherit.c stc_sem_monitor.c stc_sem_cancel.c stc_sem_recovery.c stc_sem_protocol.c stc_sem_destroy.c
+ endif
+ ifeq ($(CONFIG_TC_KERNEL_SIGNAL),y)
+   CSRCS += tc_signal.c
+diff --git a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+index be79cbaa..4d49b290 100644
+--- a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
++++ b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+@@ -168,6 +168,8 @@ int tc_kernel_main(int argc, char *argv[])
+ 	stc_sem_monitor_main();
+ 	stc_sem_cancel_main();
+ 	stc_sem_recovery_main();
++	stc_sem_protocol_main();
++	stc_sem_destroy_main();
+ #endif
+ 
+ #ifdef CONFIG_TC_KERNEL_SIGNAL
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sem_destroy.c b/apps/examples/testcase/le_tc/kernel/stc_sem_destroy.c
+new file mode 100644
+index 00000000..7a66d65d
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/stc_sem_destroy.c
+@@ -0,0 +1,532 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file stc_sem_destroy.c
++/// @brief Families G and H of the Priority Inheritance and Semaphore Recovery
++///        Scenario Test Catalogue.
++///
++/// Family G - destruction, reset and list integrity
++///   SCN-DES-01  destroy a semaphore that still has live holders
++///   SCN-DES-02  destroy a semaphore that has a blocked waiter
++///   SCN-DES-03  sem_reset() count arithmetic          (driver side)
++///   SCN-DES-04  sem_reset() argument validation       (driver side)
++///   SCN-DES-05  repeated init and destroy cycles
++///
++/// Family H - binary manager fault recovery
++///   SCN-BIN-01 to SCN-BIN-03 are NOT implemented here, and cannot be: they
++///   require faulting a loadable user binary, which needs the binary manager
++///   test fixture rather than a task inside the kernel test app.  Writing
++///   something that merely looked like fault injection would be worse than
++///   leaving the gap visible, so what ships here is SCN-BIN-04 - the scope
++///   limit that is testable in process - plus an explicit notice naming what
++///   is missing.
++///
++///   The manual procedure for SCN-BIN-01 to SCN-BIN-03, for whoever builds the
++///   fixture:
++///     1. Build with CONFIG_BINMGR_RECOVERY=y and at least one loadable user
++///        binary that takes a kernel semaphore and then faults on demand.
++///     2. Have a kernel task block on the same semaphore.
++///     3. Trigger the fault.  binary_manager_deactivate_binary() runs
++///        binary_manager_recover_tcb() per thread, then
++///        binary_manager_release_binary_sem() walks g_sem_list.
++///     4. Assert that the kernel task resumes and owns the semaphore, that a
++///        second binary's semaphore is untouched, and that the mutex
++///        invariant semcount < 2 held throughout.
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <unistd.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <sched.h>
++#include <semaphore.h>
++#include <sys/types.h>
++#include <tinyara/os_api_test_drv.h>
++
++#include "tc_common.h"
++#include "tc_internal.h"
++#include "stc_sem_common.h"
++#include "stc_sem_monitor.h"
++
++#ifdef CONFIG_PRIORITY_INHERITANCE
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++#define STAGE_STARTED           1
++#define STAGE_HELD              2
++#define STAGE_SECOND_POSTED     3
++
++#define SLOT_HOLDER             0
++#define SLOT_HOLDER2            1
++#define SLOT_WAITER             2
++
++#define DESTROY_CYCLES          100
++
++/****************************************************************************
++ * Private Data
++ ****************************************************************************/
++
++static sem_t g_doomed;			/* the semaphore that gets destroyed      */
++static sem_t g_survivor;		/* held by the same tasks, must stay sane */
++static bool g_survivor_valid;
++
++/****************************************************************************
++ * Private Functions - actors
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: dual_holder_actor
++ *
++ * Description:
++ *   Takes a count of both semaphores, then - after the harness has destroyed
++ *   the first one - posts only the survivor.  Posting the destroyed semaphore
++ *   would be undefined behaviour and is not what the scenario is checking:
++ *   the question is whether the destroy left this task's holdsem list in a
++ *   state that makes the *survivor's* post fault.
++ *
++ ****************************************************************************/
++
++static int dual_holder_actor(int argc, char *argv[])
++{
++	int slot = atoi(argv[1]);
++
++	(void)argc;
++
++	if (sem_wait(&g_doomed) != OK || sem_wait(&g_survivor) != OK) {
++		stc_actor_done(slot);
++		return ERROR;
++	}
++
++	stc_stage(slot, STAGE_HELD);
++	stc_wait_go(slot);
++
++	(void)sem_post(&g_survivor);
++	stc_stage(slot, STAGE_SECOND_POSTED);
++
++	stc_actor_done(slot);
++	return OK;
++}
++
++static int doomed_waiter_actor(int argc, char *argv[])
++{
++	int slot = atoi(argv[1]);
++
++	(void)argc;
++
++	stc_stage(slot, STAGE_STARTED);
++
++	if (sem_wait(&g_doomed) == OK) {
++		(void)sem_post(&g_doomed);
++	}
++
++	stc_actor_done(slot);
++	return OK;
++}
++
++static int simple_holder_actor(int argc, char *argv[])
++{
++	int slot = atoi(argv[1]);
++
++	(void)argc;
++
++	if (sem_wait(&g_doomed) != OK) {
++		stc_actor_done(slot);
++		return ERROR;
++	}
++
++	stc_stage(slot, STAGE_HELD);
++	stc_wait_go(slot);
++
++	(void)sem_post(&g_doomed);
++
++	stc_actor_done(slot);
++	return OK;
++}
++
++/****************************************************************************
++ * Private Functions - helpers
++ ****************************************************************************/
++
++static int scenario_begin(int doomed_count, bool with_survivor)
++{
++	if (stc_reset() != OK) {
++		return ERROR;
++	}
++
++	if (sem_init(&g_doomed, 0, doomed_count) != OK) {
++		return ERROR;
++	}
++
++	stc_mon_register_sem(&g_doomed);
++
++	if (with_survivor) {
++		if (sem_init(&g_survivor, 0, 2) != OK) {
++			return ERROR;
++		}
++
++		g_survivor_valid = true;
++		stc_mon_register_sem(&g_survivor);
++	}
++
++	return OK;
++}
++
++static int scenario_end(void)
++{
++	int leaked = stc_teardown();
++
++	(void)sem_destroy(&g_doomed);
++
++	if (g_survivor_valid) {
++		(void)sem_destroy(&g_survivor);
++		g_survivor_valid = false;
++	}
++
++	return leaked;
++}
++
++/****************************************************************************
++ * Private Functions - scenarios
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_sem_des01_destroy_with_live_holders
++ *
++ * Scenario: SCN-DES-01
++ *   A semaphore is destroyed while two live tasks hold counts on it.  Both
++ *   tasks also hold a count of a second semaphore.
++ *
++ * Oracle:
++ *   both tasks can still post the second semaphore without faulting <- HARD
++ *
++ * Defect signature:
++ *   sem_destroyholder() has to unlink each holder record from two lists: the
++ *   semaphore's own, and the holder task's holdsem list.  A free that skipped
++ *   the second leaves a dangling entry whose sem pointer refers to a destroyed
++ *   semaphore - and the very next priority restore walks holdsem and
++ *   dereferences it.  Posting the survivor is what triggers that walk.
++ *
++ ****************************************************************************/
++
++static void stc_sem_des01_destroy_with_live_holders(void)
++{
++	uint32_t violations;
++	int ret;
++	pid_t pid;
++
++	ret = scenario_begin(2, true);
++	TC_ASSERT_EQ("des01_begin", ret, OK);
++
++	pid = stc_spawn("stc_da", STC_PRIO_LOW, dual_holder_actor, SLOT_HOLDER);
++	TC_ASSERT_NEQ_CLEANUP("des01_spawn_h1", pid, (pid_t)ERROR, scenario_end());
++
++	ret = stc_wait_stage(SLOT_HOLDER, STAGE_HELD);
++	TC_ASSERT_EQ_CLEANUP("des01_h1_held", ret, OK, scenario_end());
++
++	pid = stc_spawn("stc_db", STC_PRIO_LOW2, dual_holder_actor, SLOT_HOLDER2);
++	TC_ASSERT_NEQ_CLEANUP("des01_spawn_h2", pid, (pid_t)ERROR, scenario_end());
++
++	ret = stc_wait_stage(SLOT_HOLDER2, STAGE_HELD);
++	TC_ASSERT_EQ_CLEANUP("des01_h2_held", ret, OK, scenario_end());
++
++	/* Destroy out from under both of them. */
++
++	ret = sem_destroy(&g_doomed);
++	TC_ASSERT_EQ_CLEANUP("des01_destroy", ret, OK, scenario_end());
++
++	/* The survivor's post walks each task's holdsem list during the priority
++	 * restore.  A stale entry pointing at the destroyed semaphore faults here.
++	 */
++
++	stc_go(SLOT_HOLDER);
++	ret = stc_wait_stage(SLOT_HOLDER, STAGE_SECOND_POSTED);
++	TC_ASSERT_EQ_CLEANUP("des01_h1_survivor_post", ret, OK, scenario_end());
++
++	stc_go(SLOT_HOLDER2);
++	ret = stc_wait_stage(SLOT_HOLDER2, STAGE_SECOND_POSTED);
++	TC_ASSERT_EQ_CLEANUP("des01_h2_survivor_post", ret, OK, scenario_end());
++
++	ret = stc_wait_count(&g_survivor, 2);
++	TC_ASSERT_EQ_CLEANUP("des01_survivor_drained", ret, OK, scenario_end());
++
++	violations = stc_mon_violations();
++	TC_ASSERT_EQ_CLEANUP("des01_no_boost_leak", violations, 0, scenario_end());
++
++	ret = scenario_end();
++	TC_ASSERT_EQ("des01_no_leaked_actor", ret, 0);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sem_des02_destroy_with_blocked_waiter
++ *
++ * Scenario: SCN-DES-02
++ *   A semaphore is destroyed while a task is blocked on it.
++ *
++ * Oracle:
++ *   (1) nothing asserts and nothing faults                         <- HARD
++ *   (2) the blocked task can still be deleted cleanly              <- HARD
++ *
++ * Note:
++ *   POSIX leaves this undefined, and sem_destroy() says so: it leaves a
++ *   negative count untouched and returns OK.  The scenario pins down that the
++ *   undefined case is survivable rather than fatal, which is what a caller
++ *   doing error path cleanup actually needs to know.  It does not assert any
++ *   particular count, because there is no defined answer to assert.
++ *
++ ****************************************************************************/
++
++static void stc_sem_des02_destroy_with_blocked_waiter(void)
++{
++	uint32_t violations;
++	int ret;
++	pid_t pid;
++
++	ret = scenario_begin(1, false);
++	TC_ASSERT_EQ("des02_begin", ret, OK);
++
++	pid = stc_spawn("stc_hold", STC_PRIO_LOW, simple_holder_actor, SLOT_HOLDER);
++	TC_ASSERT_NEQ_CLEANUP("des02_spawn_holder", pid, (pid_t)ERROR, scenario_end());
++
++	ret = stc_wait_stage(SLOT_HOLDER, STAGE_HELD);
++	TC_ASSERT_EQ_CLEANUP("des02_held", ret, OK, scenario_end());
++
++	pid = stc_spawn("stc_doom", STC_PRIO_HIGH, doomed_waiter_actor, SLOT_WAITER);
++	TC_ASSERT_NEQ_CLEANUP("des02_spawn_waiter", pid, (pid_t)ERROR, scenario_end());
++
++	ret = stc_wait_count(&g_doomed, -1);
++	TC_ASSERT_EQ_CLEANUP("des02_blocked", ret, OK, scenario_end());
++
++	ret = sem_destroy(&g_doomed);
++	TC_ASSERT_EQ_CLEANUP("des02_destroy_returns_ok", ret, OK, scenario_end());
++
++	/* The blocked task is still blocked, on a semaphore that no longer exists.
++	 * Deleting it must be clean: sem_recover() runs against the same memory.
++	 */
++
++	ret = task_delete(g_stc_actor[SLOT_WAITER].pid);
++	TC_ASSERT_EQ_CLEANUP("des02_delete_waiter", ret, OK, scenario_end());
++
++	stc_actor_forget(SLOT_WAITER);
++
++	/* And the holder can still be released. */
++
++	stc_go(SLOT_HOLDER);
++	ret = stc_wait_finished(SLOT_HOLDER);
++	TC_ASSERT_EQ_CLEANUP("des02_holder_done", ret, OK, scenario_end());
++
++	violations = stc_mon_violations();
++	TC_ASSERT_EQ_CLEANUP("des02_no_boost_leak", violations, 0, scenario_end());
++
++	ret = scenario_end();
++	TC_ASSERT_EQ("des02_no_leaked_actor", ret, 0);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sem_des0304_reset
++ *
++ * Scenario: SCN-DES-03 and SCN-DES-04
++ *   sem_reset() count arithmetic and argument validation.
++ *
++ * Oracle:
++ *   the driver side sequence returns OK                            <- HARD
++ *
++ * Note:
++ *   sem_reset() is declared in tinyara/semaphore.h and is not exported
++ *   through the syscall table, so it cannot be called from a user space
++ *   scenario at all.  The sequence runs inside the OS API test driver, in the
++ *   same style as the existing tc_semaphore_sem_tickwait() test, and this
++ *   scenario is the user space trigger for it.
++ *
++ ****************************************************************************/
++
++static void stc_sem_des0304_reset(void)
++{
++	int fd = tc_get_drvfd();
++	int ret;
++
++	TC_ASSERT_GEQ("des0304_drvfd", fd, 0);
++
++	ret = ioctl(fd, TESTIOC_SEM_RESET_TEST, 0);
++	TC_ASSERT_EQ("des0304_reset_sequence", ret, OK);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sem_des05_init_destroy_churn
++ *
++ * Scenario: SCN-DES-05
++ *   Repeated init and destroy cycles of both flavours.
++ *
++ * Oracle:
++ *   (1) every cycle leaves no holder record behind                 <- SOFT
++ *   (2) a signalling semaphore destroys cleanly                    <- HARD
++ *
++ * Note on the registration rule:
++ *   sem_init() registers a semaphore into g_sem_list only when its initial
++ *   count is non zero and it lives in the kernel region, so a signalling
++ *   semaphore is never registered - and sem_destroy() correspondingly skips
++ *   the unregister for FLAGS_SIGSEM.  The list itself is kernel state with no
++ *   accessor, so this scenario cannot inspect it directly; what it can do is
++ *   churn both flavours hard enough that a mismatched register and unregister
++ *   pair would corrupt the list and take the next traversal with it.
++ *
++ ****************************************************************************/
++
++static void stc_sem_des05_init_destroy_churn(void)
++{
++	struct sem_snapshot_s snap;
++	sem_t counting;
++	sem_t signalling;
++	int ret;
++	int i;
++
++	for (i = 0; i < DESTROY_CYCLES; i++) {
++		ret = sem_init(&counting, 0, 1);
++		TC_ASSERT_EQ("des05_init_counting", ret, OK);
++
++		ret = sem_init(&signalling, 0, 0);
++		TC_ASSERT_EQ("des05_init_signalling", ret, OK);
++
++		if (stc_snapshot(&signalling, &snap) == OK) {
++			TC_ASSERT_EQ_CLEANUP("des05_sigsem_flag", (snap.flags & FLAGS_SIGSEM) != 0, true,
++								 (void)sem_destroy(&counting); (void)sem_destroy(&signalling));
++			TC_ASSERT_EQ_CLEANUP("des05_sigsem_no_holder", snap.nholders, 0,
++								 (void)sem_destroy(&counting); (void)sem_destroy(&signalling));
++		}
++
++		ret = sem_wait(&counting);
++		TC_ASSERT_EQ_CLEANUP("des05_take", ret, OK,
++							 (void)sem_destroy(&counting); (void)sem_destroy(&signalling));
++
++		ret = sem_post(&counting);
++		TC_ASSERT_EQ_CLEANUP("des05_give", ret, OK,
++							 (void)sem_destroy(&counting); (void)sem_destroy(&signalling));
++
++		if (stc_snapshot(&counting, &snap) == OK) {
++			TC_ASSERT_EQ_CLEANUP("des05_record_freed", snap.nholders, 0,
++								 (void)sem_destroy(&counting); (void)sem_destroy(&signalling));
++		}
++
++		ret = sem_destroy(&counting);
++		TC_ASSERT_EQ_CLEANUP("des05_destroy_counting", ret, OK, (void)sem_destroy(&signalling));
++
++		ret = sem_destroy(&signalling);
++		TC_ASSERT_EQ("des05_destroy_signalling", ret, OK);
++	}
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sem_bin04_scope_limit
++ *
++ * Scenario: SCN-BIN-04, the testable part of family H
++ *   A signalling semaphore is never registered for binary manager recovery,
++ *   because sem_init() registers only semaphores whose initial count is non
++ *   zero.
++ *
++ * Oracle:
++ *   a signalling semaphore carries FLAGS_SIGSEM and holds no records <- SOFT
++ *
++ * Note:
++ *   SCN-BIN-01 to SCN-BIN-03 need a loadable user binary that can be faulted
++ *   on demand.  That is fixture work, not test-case work, and it is described
++ *   in the header of this file.  This scenario covers the one part of family H
++ *   that is observable from inside the kernel test app, and prints a notice
++ *   naming what is still missing so the gap is visible in the run log rather
++ *   than only in the catalogue.
++ *
++ ****************************************************************************/
++
++static void stc_sem_bin04_scope_limit(void)
++{
++	struct sem_snapshot_s snap;
++	sem_t signalling;
++	int ret;
++
++	ret = sem_init(&signalling, 0, 0);
++	TC_ASSERT_EQ("bin04_init", ret, OK);
++
++	if (stc_snapshot(&signalling, &snap) == OK) {
++		TC_ASSERT_EQ_CLEANUP("bin04_sigsem", (snap.flags & FLAGS_SIGSEM) != 0, true,
++							 (void)sem_destroy(&signalling));
++		TC_ASSERT_EQ_CLEANUP("bin04_no_holders", snap.nholders, 0, (void)sem_destroy(&signalling));
++	}
++
++	ret = sem_destroy(&signalling);
++	TC_ASSERT_EQ("bin04_destroy", ret, OK);
++
++	printf("[bin04] NOTE: SCN-BIN-01..03 require the binary manager fault "
++		   "fixture and are not covered by this tier\n");
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++int stc_sem_destroy_main(void)
++{
++	if (stc_harness_begin() != OK) {
++		printf("\n[stc_sem_destroy] FAIL : cannot raise the harness priority\n");
++		total_fail++;
++		return ERROR;
++	}
++
++	if (stc_mon_start() != OK) {
++		printf("\n[stc_sem_destroy] FAIL : cannot start the boost-leak monitor\n");
++		total_fail++;
++		stc_harness_end();
++		return ERROR;
++	}
++
++	stc_sem_des01_destroy_with_live_holders();
++	stc_sem_des02_destroy_with_blocked_waiter();
++	stc_sem_des0304_reset();
++	stc_sem_des05_init_destroy_churn();
++	stc_sem_bin04_scope_limit();
++
++	stc_mon_stop();
++	stc_harness_end();
++
++	return OK;
++}
++
++#else							/* CONFIG_PRIORITY_INHERITANCE */
++
++int stc_sem_destroy_main(void)
++{
++	printf("\n[stc_sem_destroy] SKIP : CONFIG_PRIORITY_INHERITANCE is not enabled\n");
++	return OK;
++}
++
++#endif							/* CONFIG_PRIORITY_INHERITANCE */
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sem_protocol.c b/apps/examples/testcase/le_tc/kernel/stc_sem_protocol.c
+new file mode 100644
+index 00000000..9e1409ba
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/stc_sem_protocol.c
+@@ -0,0 +1,736 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file stc_sem_protocol.c
++/// @brief Family D of the Priority Inheritance and Semaphore Recovery
++///        Scenario Test Catalogue - protocol and flavour.
++///
++/// SCN-PIP-01  SEM_PRIO_NONE suppresses the boost
++/// SCN-PIP-02  SEM_PRIO_INHERIT restores it
++/// SCN-PIP-03  a PI disabled semaphore's waiters never influence a restore
++/// SCN-PIP-04  a signalling semaphore never creates a permanent holder
++/// SCN-PIP-05  pthread mutex protocol attribute, and the mutex invariant
++///
++/// SCN-PIP-01 is the scenario that section 1.2 of the catalogue says is
++/// missing.  tc_semaphore_sem_setprotocol() asks the kernel to disable
++/// inheritance on a semaphore and asserts that the call returned zero; it
++/// never creates a second task and never reads a priority, so a kernel in
++/// which SEM_PRIO_NONE sets no flag at all passes it unchanged.  This file
++/// asserts the behaviour instead of the return code.
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <unistd.h>
++#include <errno.h>
++#include <sched.h>
++#include <semaphore.h>
++#include <pthread.h>
++#include <sys/types.h>
++
++#include "tc_common.h"
++#include "tc_internal.h"
++#include "stc_sem_common.h"
++#include "stc_sem_monitor.h"
++
++#ifdef CONFIG_PRIORITY_INHERITANCE
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++#define STAGE_STARTED           1
++#define STAGE_HELD              2
++#define STAGE_ACQUIRED          3
++
++#define SLOT_HOLDER             0
++#define SLOT_WAITER             1
++#define SLOT_WAITER2            2
++
++/****************************************************************************
++ * Private Data
++ ****************************************************************************/
++
++static sem_t g_target;			/* the semaphore whose protocol varies    */
++static sem_t g_normal;			/* always PI enabled, for SCN-PIP-03      */
++static bool g_normal_valid;
++
++static pthread_mutex_t g_mutex;
++static bool g_mutex_valid;
++
++/****************************************************************************
++ * Private Functions - actors
++ ****************************************************************************/
++
++static int holder_actor(int argc, char *argv[])
++{
++	int slot = atoi(argv[1]);
++
++	(void)argc;
++
++	if (sem_wait(&g_target) != OK) {
++		stc_actor_done(slot);
++		return ERROR;
++	}
++
++	stc_stage(slot, STAGE_HELD);
++	stc_wait_go(slot);
++
++	(void)sem_post(&g_target);
++
++	stc_actor_done(slot);
++	return OK;
++}
++
++/* Holds the PI disabled semaphore and a normal one (SCN-PIP-03). */
++
++static int dual_holder_actor(int argc, char *argv[])
++{
++	int slot = atoi(argv[1]);
++
++	(void)argc;
++
++	if (sem_wait(&g_target) != OK || sem_wait(&g_normal) != OK) {
++		stc_actor_done(slot);
++		return ERROR;
++	}
++
++	stc_stage(slot, STAGE_HELD);
++
++	stc_wait_go(slot);
++	(void)sem_post(&g_normal);
++
++	stc_wait_go(slot);
++	(void)sem_post(&g_target);
++
++	stc_actor_done(slot);
++	return OK;
++}
++
++static int waiter_actor(int argc, char *argv[])
++{
++	int slot = atoi(argv[1]);
++
++	(void)argc;
++
++	stc_stage(slot, STAGE_STARTED);
++
++	if (sem_wait(&g_target) != OK) {
++		stc_actor_done(slot);
++		return ERROR;
++	}
++
++	stc_stage(slot, STAGE_ACQUIRED);
++	stc_wait_go(slot);
++
++	(void)sem_post(&g_target);
++
++	stc_actor_done(slot);
++	return OK;
++}
++
++static int normal_waiter_actor(int argc, char *argv[])
++{
++	int slot = atoi(argv[1]);
++
++	(void)argc;
++
++	stc_stage(slot, STAGE_STARTED);
++
++	if (sem_wait(&g_normal) != OK) {
++		stc_actor_done(slot);
++		return ERROR;
++	}
++
++	stc_stage(slot, STAGE_ACQUIRED);
++	stc_wait_go(slot);
++
++	(void)sem_post(&g_normal);
++
++	stc_actor_done(slot);
++	return OK;
++}
++
++/* Waits on the signalling semaphore, then parks (SCN-PIP-04). */
++
++static int sig_waiter_actor(int argc, char *argv[])
++{
++	int slot = atoi(argv[1]);
++
++	(void)argc;
++
++	stc_stage(slot, STAGE_STARTED);
++
++	if (sem_wait(&g_target) != OK) {
++		stc_actor_done(slot);
++		return ERROR;
++	}
++
++	stc_stage(slot, STAGE_ACQUIRED);
++	stc_wait_go(slot);
++
++	stc_actor_done(slot);
++	return OK;
++}
++
++static int mutex_owner_actor(int argc, char *argv[])
++{
++	int slot = atoi(argv[1]);
++
++	(void)argc;
++
++	if (pthread_mutex_lock(&g_mutex) != OK) {
++		stc_actor_done(slot);
++		return ERROR;
++	}
++
++	stc_stage(slot, STAGE_HELD);
++	stc_wait_go(slot);
++
++	(void)pthread_mutex_unlock(&g_mutex);
++
++	stc_actor_done(slot);
++	return OK;
++}
++
++static int mutex_blocker_actor(int argc, char *argv[])
++{
++	int slot = atoi(argv[1]);
++
++	(void)argc;
++
++	stc_stage(slot, STAGE_STARTED);
++
++	if (pthread_mutex_lock(&g_mutex) != OK) {
++		stc_actor_done(slot);
++		return ERROR;
++	}
++
++	stc_stage(slot, STAGE_ACQUIRED);
++	stc_wait_go(slot);
++
++	(void)pthread_mutex_unlock(&g_mutex);
++
++	stc_actor_done(slot);
++	return OK;
++}
++
++/****************************************************************************
++ * Private Functions - helpers
++ ****************************************************************************/
++
++static int scenario_begin(int initial_count, int protocol)
++{
++	if (stc_reset() != OK) {
++		return ERROR;
++	}
++
++	if (sem_init(&g_target, 0, initial_count) != OK) {
++		return ERROR;
++	}
++
++	if (protocol >= 0 && sem_setprotocol(&g_target, protocol) != OK) {
++		return ERROR;
++	}
++
++	stc_mon_register_sem(&g_target);
++
++	return OK;
++}
++
++static int scenario_end(void)
++{
++	int leaked = stc_teardown();
++
++	(void)sem_destroy(&g_target);
++
++	if (g_normal_valid) {
++		(void)sem_destroy(&g_normal);
++		g_normal_valid = false;
++	}
++
++	if (g_mutex_valid) {
++		(void)pthread_mutex_destroy(&g_mutex);
++		g_mutex_valid = false;
++	}
++
++	return leaked;
++}
++
++/****************************************************************************
++ * Name: hold_and_block
++ ****************************************************************************/
++
++static int hold_and_block(int waiter_prio)
++{
++	if (stc_spawn("stc_phold", STC_PRIO_LOW, holder_actor, SLOT_HOLDER) == (pid_t)ERROR) {
++		return ERROR;
++	}
++
++	if (stc_wait_stage(SLOT_HOLDER, STAGE_HELD) != OK) {
++		return ERROR;
++	}
++
++	if (stc_spawn("stc_pwait", waiter_prio, waiter_actor, SLOT_WAITER) == (pid_t)ERROR) {
++		return ERROR;
++	}
++
++	return stc_wait_count(&g_target, -1);
++}
++
++static int drain_holder_and_waiter(void)
++{
++	stc_go(SLOT_HOLDER);
++
++	if (stc_wait_count(&g_target, 0) != OK) {
++		return ERROR;
++	}
++
++	if (stc_wait_stage(SLOT_WAITER, STAGE_ACQUIRED) != OK) {
++		return ERROR;
++	}
++
++	stc_go(SLOT_WAITER);
++
++	return stc_wait_count(&g_target, 1);
++}
++
++/****************************************************************************
++ * Private Functions - scenarios
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_sem_pip01_prio_none_suppresses_boost
++ *
++ * Scenario: SCN-PIP-01
++ *   sem_setprotocol(SEM_PRIO_NONE), then the SCN-PI-01 shape.
++ *
++ * Oracle:
++ *   the holder's priority never changes                            <- HARD
++ *
++ ****************************************************************************/
++
++static void stc_sem_pip01_prio_none_suppresses_boost(void)
++{
++	uint32_t violations;
++	int ret;
++	int prio;
++
++	ret = scenario_begin(1, SEM_PRIO_NONE);
++	TC_ASSERT_EQ("pip01_begin", ret, OK);
++
++	ret = hold_and_block(STC_PRIO_HIGH);
++	TC_ASSERT_EQ_CLEANUP("pip01_setup", ret, OK, scenario_end());
++
++	prio = stc_getprio(g_stc_actor[SLOT_HOLDER].pid);
++	TC_ASSERT_EQ_CLEANUP("pip01_no_boost", prio, STC_PRIO_LOW, scenario_end());
++
++	ret = drain_holder_and_waiter();
++	TC_ASSERT_EQ_CLEANUP("pip01_drained", ret, OK, scenario_end());
++
++	violations = stc_mon_violations();
++	TC_ASSERT_EQ_CLEANUP("pip01_no_boost_leak", violations, 0, scenario_end());
++
++	ret = scenario_end();
++	TC_ASSERT_EQ("pip01_no_leaked_actor", ret, 0);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sem_pip02_prio_inherit_restores_boost
++ *
++ * Scenario: SCN-PIP-02
++ *   SEM_PRIO_INHERIT set explicitly after SEM_PRIO_NONE.
++ *
++ * Oracle:
++ *   boosting resumes                                               <- HARD
++ *
++ * Why both directions matter:
++ *   SCN-PIP-01 alone would pass on a kernel where inheritance never works at
++ *   all.  Running the same shape with the protocol flipped back is what
++ *   distinguishes "the protocol was honoured" from "nothing ever boosts".
++ *
++ ****************************************************************************/
++
++static void stc_sem_pip02_prio_inherit_restores_boost(void)
++{
++	uint32_t violations;
++	int ret;
++	int prio;
++
++	ret = scenario_begin(1, SEM_PRIO_NONE);
++	TC_ASSERT_EQ("pip02_begin", ret, OK);
++
++	ret = sem_setprotocol(&g_target, SEM_PRIO_INHERIT);
++	TC_ASSERT_EQ_CLEANUP("pip02_reenable", ret, OK, scenario_end());
++
++	ret = hold_and_block(STC_PRIO_HIGH);
++	TC_ASSERT_EQ_CLEANUP("pip02_setup", ret, OK, scenario_end());
++
++	prio = stc_getprio(g_stc_actor[SLOT_HOLDER].pid);
++	TC_ASSERT_EQ_CLEANUP("pip02_boost_resumed", prio, STC_PRIO_HIGH, scenario_end());
++
++	ret = drain_holder_and_waiter();
++	TC_ASSERT_EQ_CLEANUP("pip02_drained", ret, OK, scenario_end());
++
++	prio = stc_getprio(g_stc_actor[SLOT_HOLDER].pid);
++	if (prio != ERROR) {
++		TC_ASSERT_EQ_CLEANUP("pip02_restored", prio, STC_PRIO_LOW, scenario_end());
++	}
++
++	violations = stc_mon_violations();
++	TC_ASSERT_EQ_CLEANUP("pip02_no_boost_leak", violations, 0, scenario_end());
++
++	ret = scenario_end();
++	TC_ASSERT_EQ("pip02_no_leaked_actor", ret, 0);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sem_pip03_disabled_sem_never_contributes
++ *
++ * Scenario: SCN-PIP-03
++ *   One task holds a SEM_PRIO_NONE semaphore and a normal one.  A 150 task
++ *   waits on the PI disabled semaphore; a 130 task waits on the normal one.
++ *   The normal one is posted.
++ *
++ * Oracle:
++ *   the holder returns to base, not to 150                         <- HARD
++ *
++ * Defect signature:
++ *   This is the regression for the explicit PRIOINHERIT_FLAGS_DISABLE check
++ *   inside sem_findhighestwaiter().  A PI disabled semaphore can still appear
++ *   on a task's holdsem list - holders are retained for fault recovery when
++ *   CONFIG_BINMGR_RECOVERY is enabled - so the restore walk will visit it.  If
++ *   it does not skip it, the waiters of a semaphore that is not supposed to
++ *   participate in inheritance end up setting the holder's priority anyway.
++ *
++ * Note:
++ *   Without CONFIG_BINMGR_RECOVERY, sem_setprotocol(SEM_PRIO_NONE) destroys
++ *   the holder records outright, so the disabled semaphore never reaches the
++ *   restore walk and the scenario passes trivially.  It is still run on both
++ *   configurations: on the reference platform it documents the other branch,
++ *   and on a BINMGR_RECOVERY build it is a real test.
++ *
++ ****************************************************************************/
++
++static void stc_sem_pip03_disabled_sem_never_contributes(void)
++{
++	uint32_t violations;
++	int ret;
++	int prio;
++	pid_t pid;
++
++	ret = scenario_begin(1, SEM_PRIO_NONE);
++	TC_ASSERT_EQ("pip03_begin", ret, OK);
++
++	ret = sem_init(&g_normal, 0, 1);
++	TC_ASSERT_EQ_CLEANUP("pip03_init_normal", ret, OK, scenario_end());
++
++	g_normal_valid = true;
++	stc_mon_register_sem(&g_normal);
++
++	pid = stc_spawn("stc_dual", STC_PRIO_LOW, dual_holder_actor, SLOT_HOLDER);
++	TC_ASSERT_NEQ_CLEANUP("pip03_spawn_holder", pid, (pid_t)ERROR, scenario_end());
++
++	ret = stc_wait_stage(SLOT_HOLDER, STAGE_HELD);
++	TC_ASSERT_EQ_CLEANUP("pip03_held_both", ret, OK, scenario_end());
++
++	/* A high priority waiter on the PI disabled semaphore.  It must not boost
++	 * anybody, now or during any later restore.
++	 */
++
++	pid = stc_spawn("stc_wdis", STC_PRIO_EXTRA - 10, waiter_actor, SLOT_WAITER);
++	TC_ASSERT_NEQ_CLEANUP("pip03_spawn_disabled_waiter", pid, (pid_t)ERROR, scenario_end());
++
++	ret = stc_wait_count(&g_target, -1);
++	TC_ASSERT_EQ_CLEANUP("pip03_disabled_blocked", ret, OK, scenario_end());
++
++	prio = stc_getprio(g_stc_actor[SLOT_HOLDER].pid);
++	TC_ASSERT_EQ_CLEANUP("pip03_no_boost_from_disabled", prio, STC_PRIO_LOW, scenario_end());
++
++	/* A normal waiter, which legitimately boosts. */
++
++	pid = stc_spawn("stc_wnorm", STC_PRIO_MID, normal_waiter_actor, SLOT_WAITER2);
++	TC_ASSERT_NEQ_CLEANUP("pip03_spawn_normal_waiter", pid, (pid_t)ERROR, scenario_end());
++
++	ret = stc_wait_count(&g_normal, -1);
++	TC_ASSERT_EQ_CLEANUP("pip03_normal_blocked", ret, OK, scenario_end());
++
++	prio = stc_getprio(g_stc_actor[SLOT_HOLDER].pid);
++	TC_ASSERT_EQ_CLEANUP("pip03_boost_from_normal", prio, STC_PRIO_MID, scenario_end());
++
++	/* Release the normal semaphore.  The restore walk visits the holder's
++	 * remaining entry, which is the PI disabled semaphore with a 150 waiter.
++	 */
++
++	stc_go(SLOT_HOLDER);
++	ret = stc_wait_count(&g_normal, 0);
++	TC_ASSERT_EQ_CLEANUP("pip03_post_normal", ret, OK, scenario_end());
++
++	prio = stc_getprio(g_stc_actor[SLOT_HOLDER].pid);
++	TC_ASSERT_EQ_CLEANUP("pip03_restored_to_base", prio, STC_PRIO_LOW, scenario_end());
++
++	/* Drain everything. */
++
++	stc_go(SLOT_HOLDER);
++	ret = stc_wait_count(&g_target, 0);
++	TC_ASSERT_EQ_CLEANUP("pip03_post_disabled", ret, OK, scenario_end());
++
++	ret = stc_wait_stage(SLOT_WAITER, STAGE_ACQUIRED);
++	TC_ASSERT_EQ_CLEANUP("pip03_disabled_acquired", ret, OK, scenario_end());
++
++	stc_go(SLOT_WAITER);
++	ret = stc_wait_count(&g_target, 1);
++	TC_ASSERT_EQ_CLEANUP("pip03_disabled_drained", ret, OK, scenario_end());
++
++	ret = stc_wait_stage(SLOT_WAITER2, STAGE_ACQUIRED);
++	TC_ASSERT_EQ_CLEANUP("pip03_normal_acquired", ret, OK, scenario_end());
++
++	stc_go(SLOT_WAITER2);
++	ret = stc_wait_count(&g_normal, 1);
++	TC_ASSERT_EQ_CLEANUP("pip03_normal_drained", ret, OK, scenario_end());
++
++	violations = stc_mon_violations();
++	TC_ASSERT_EQ_CLEANUP("pip03_no_boost_leak", violations, 0, scenario_end());
++
++	ret = scenario_end();
++	TC_ASSERT_EQ("pip03_no_leaked_actor", ret, 0);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sem_pip04_signalling_sem_has_no_holder
++ *
++ * Scenario: SCN-PIP-04
++ *   sem_init(&s, 0, 0) sets FLAGS_SIGSEM.  A task waits, another posts, and a
++ *   third task then blocks on the same semaphore.
++ *
++ * Oracle:
++ *   (1) no holder record exists at any point                       <- SOFT
++ *   (2) the task that was granted the count is never boosted       <- HARD
++ *
++ * What it establishes:
++ *   The classic failure mode of a semaphore used for signalling is that the
++ *   awakened waiter becomes a permanent holder and is boosted by every later
++ *   waiter forever - which is exactly what sem_setprotocol()'s own
++ *   documentation describes as the reason SEM_PRIO_NONE exists.  The
++ *   FLAGS_SIGSEM auto-detection in sem_init() is supposed to make that manual
++ *   fix unnecessary for zero initialised semaphores.  This asserts that it
++ *   does.
++ *
++ ****************************************************************************/
++
++static void stc_sem_pip04_signalling_sem_has_no_holder(void)
++{
++	struct sem_snapshot_s snap;
++	uint32_t violations;
++	int ret;
++	int prio;
++	pid_t pid;
++
++	ret = scenario_begin(0, -1);
++	TC_ASSERT_EQ("pip04_begin", ret, OK);
++
++	if (stc_snapshot(&g_target, &snap) == OK) {
++		TC_ASSERT_EQ_CLEANUP("pip04_is_sigsem", (snap.flags & FLAGS_SIGSEM) != 0, true, scenario_end());
++	}
++
++	pid = stc_spawn("stc_sigw", STC_PRIO_LOW, sig_waiter_actor, SLOT_WAITER);
++	TC_ASSERT_NEQ_CLEANUP("pip04_spawn_waiter", pid, (pid_t)ERROR, scenario_end());
++
++	ret = stc_wait_count(&g_target, -1);
++	TC_ASSERT_EQ_CLEANUP("pip04_blocked", ret, OK, scenario_end());
++
++	ret = sem_post(&g_target);
++	TC_ASSERT_EQ_CLEANUP("pip04_post", ret, OK, scenario_end());
++
++	ret = stc_wait_stage(SLOT_WAITER, STAGE_ACQUIRED);
++	TC_ASSERT_EQ_CLEANUP("pip04_acquired", ret, OK, scenario_end());
++
++	if (stc_snapshot(&g_target, &snap) == OK) {
++		TC_ASSERT_EQ_CLEANUP("pip04_no_holder_recorded", snap.nholders, 0, scenario_end());
++	}
++
++	/* A second, higher priority waiter.  The task that took the count is not a
++	 * holder, so it must not be boosted.
++	 */
++
++	pid = stc_spawn("stc_sigw2", STC_PRIO_EXTRA, sig_waiter_actor, SLOT_WAITER2);
++	TC_ASSERT_NEQ_CLEANUP("pip04_spawn_waiter2", pid, (pid_t)ERROR, scenario_end());
++
++	ret = stc_wait_count(&g_target, -1);
++	TC_ASSERT_EQ_CLEANUP("pip04_second_blocked", ret, OK, scenario_end());
++
++	prio = stc_getprio(g_stc_actor[SLOT_WAITER].pid);
++	TC_ASSERT_EQ_CLEANUP("pip04_first_not_boosted", prio, STC_PRIO_LOW, scenario_end());
++
++	ret = sem_post(&g_target);
++	TC_ASSERT_EQ_CLEANUP("pip04_post2", ret, OK, scenario_end());
++
++	ret = stc_wait_stage(SLOT_WAITER2, STAGE_ACQUIRED);
++	TC_ASSERT_EQ_CLEANUP("pip04_second_acquired", ret, OK, scenario_end());
++
++	stc_go(SLOT_WAITER);
++	stc_go(SLOT_WAITER2);
++
++	violations = stc_mon_violations();
++	TC_ASSERT_EQ_CLEANUP("pip04_no_boost_leak", violations, 0, scenario_end());
++
++	ret = scenario_end();
++	TC_ASSERT_EQ("pip04_no_leaked_actor", ret, 0);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sem_pip05_mutex_protocol_attribute
++ *
++ * Scenario: SCN-PIP-05
++ *   A mutex initialised with PTHREAD_PRIO_INHERIT and then with
++ *   PTHREAD_PRIO_NONE.
++ *
++ * Oracle:
++ *   (1) the boost is present in the first and absent in the second <- HARD
++ *   (2) the underlying semaphore never reaches a count of 2        <- HARD
++ *
++ ****************************************************************************/
++
++static void stc_sem_pip05_mutex_protocol_attribute(void)
++{
++	pthread_mutexattr_t attr;
++	uint32_t violations;
++	int ret;
++	int prio;
++	int proto;
++	int run;
++
++	for (run = 0; run < 2; run++) {
++		proto = (run == 0) ? PTHREAD_PRIO_INHERIT : PTHREAD_PRIO_NONE;
++
++		ret = stc_reset();
++		TC_ASSERT_EQ("pip05_reset", ret, OK);
++
++		ret = pthread_mutexattr_init(&attr);
++		TC_ASSERT_EQ("pip05_attr_init", ret, OK);
++
++		ret = pthread_mutexattr_setprotocol(&attr, proto);
++		TC_ASSERT_EQ("pip05_attr_protocol", ret, OK);
++
++		ret = pthread_mutex_init(&g_mutex, &attr);
++		TC_ASSERT_EQ("pip05_mutex_init", ret, OK);
++
++		g_mutex_valid = true;
++		stc_mon_register_sem((sem_t *)&g_mutex.sem);
++
++		if (stc_spawn("stc_mown", STC_PRIO_LOW, mutex_owner_actor, SLOT_HOLDER) == (pid_t)ERROR) {
++			TC_ASSERT_EQ_CLEANUP("pip05_spawn_owner", ERROR, OK, scenario_end());
++		}
++
++		ret = stc_wait_stage(SLOT_HOLDER, STAGE_HELD);
++		TC_ASSERT_EQ_CLEANUP("pip05_owned", ret, OK, scenario_end());
++
++		ret = stc_getcount((sem_t *)&g_mutex.sem);
++		TC_ASSERT_LT_CLEANUP("pip05_invariant_locked", ret, 2, scenario_end());
++
++		if (stc_spawn("stc_mblk", STC_PRIO_HIGH, mutex_blocker_actor, SLOT_WAITER) == (pid_t)ERROR) {
++			TC_ASSERT_EQ_CLEANUP("pip05_spawn_blocker", ERROR, OK, scenario_end());
++		}
++
++		ret = stc_wait_count((sem_t *)&g_mutex.sem, -1);
++		TC_ASSERT_EQ_CLEANUP("pip05_blocked", ret, OK, scenario_end());
++
++		prio = stc_getprio(g_stc_actor[SLOT_HOLDER].pid);
++		if (proto == PTHREAD_PRIO_INHERIT) {
++			TC_ASSERT_EQ_CLEANUP("pip05_inherit_boosts", prio, STC_PRIO_HIGH, scenario_end());
++		} else {
++			TC_ASSERT_EQ_CLEANUP("pip05_none_does_not_boost", prio, STC_PRIO_LOW, scenario_end());
++		}
++
++		stc_go(SLOT_HOLDER);
++		ret = stc_wait_count((sem_t *)&g_mutex.sem, 0);
++		TC_ASSERT_EQ_CLEANUP("pip05_unlocked", ret, OK, scenario_end());
++
++		ret = stc_wait_stage(SLOT_WAITER, STAGE_ACQUIRED);
++		TC_ASSERT_EQ_CLEANUP("pip05_blocker_acquired", ret, OK, scenario_end());
++
++		stc_go(SLOT_WAITER);
++		ret = stc_wait_count((sem_t *)&g_mutex.sem, 1);
++		TC_ASSERT_EQ_CLEANUP("pip05_drained", ret, OK, scenario_end());
++
++		ret = stc_getcount((sem_t *)&g_mutex.sem);
++		TC_ASSERT_LT_CLEANUP("pip05_invariant_final", ret, 2, scenario_end());
++
++		violations = stc_mon_violations();
++		TC_ASSERT_EQ_CLEANUP("pip05_no_boost_leak", violations, 0, scenario_end());
++
++		ret = scenario_end();
++		TC_ASSERT_EQ("pip05_no_leaked_actor", ret, 0);
++	}
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++int stc_sem_protocol_main(void)
++{
++	if (stc_harness_begin() != OK) {
++		printf("\n[stc_sem_protocol] FAIL : cannot raise the harness priority\n");
++		total_fail++;
++		return ERROR;
++	}
++
++	if (stc_mon_start() != OK) {
++		printf("\n[stc_sem_protocol] FAIL : cannot start the boost-leak monitor\n");
++		total_fail++;
++		stc_harness_end();
++		return ERROR;
++	}
++
++	stc_sem_pip01_prio_none_suppresses_boost();
++	stc_sem_pip02_prio_inherit_restores_boost();
++	stc_sem_pip03_disabled_sem_never_contributes();
++	stc_sem_pip04_signalling_sem_has_no_holder();
++	stc_sem_pip05_mutex_protocol_attribute();
++
++	stc_mon_stop();
++	stc_harness_end();
++
++	return OK;
++}
++
++#else							/* CONFIG_PRIORITY_INHERITANCE */
++
++int stc_sem_protocol_main(void)
++{
++	printf("\n[stc_sem_protocol] SKIP : CONFIG_PRIORITY_INHERITANCE is not enabled\n");
++	return OK;
++}
++
++#endif							/* CONFIG_PRIORITY_INHERITANCE */
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sem_recovery.c b/apps/examples/testcase/le_tc/kernel/stc_sem_recovery.c
+index a21a5d45..44a8c62d 100644
+--- a/apps/examples/testcase/le_tc/kernel/stc_sem_recovery.c
++++ b/apps/examples/testcase/le_tc/kernel/stc_sem_recovery.c
+@@ -34,11 +34,12 @@
+ ///   SCN-SIG-04  delete one of two holders                          (measured)
+ ///   SCN-SIG-05  repeated create, acquire and delete cycles
+ ///
+-/// SCN-REC-04, the robust mutex EOWNERDEAD path, is not here.  It needs
+-/// CONFIG_PTHREAD_MUTEX_ROBUST, which the reference platform does not build:
+-/// CONFIG_PTHREAD_MUTEX_UNSAFE=y leaves pthread_mutex.c,
+-/// pthread_mutexconsistent.c and pthread_mutexinconsistent.c out of the build
+-/// entirely.  It ships with phase 5, alongside the dedicated configuration.
++/// SCN-REC-04, the robust mutex EOWNERDEAD path, is compiled only when
++/// CONFIG_PTHREAD_MUTEX_UNSAFE is off.  The reference platform sets it on,
++/// which leaves pthread_mutex.c, pthread_mutexconsistent.c and
++/// pthread_mutexinconsistent.c out of the build entirely - so on that platform
++/// the scenario reports a skip rather than a pass, and the run log says which
++/// configuration is needed to cover it.
+ ///
+ /// Recovery has no coverage at all in the tree today.  Its failure mode is a
+ /// task blocked forever on a semaphore whose holder died - the most expensive
+@@ -776,6 +777,169 @@ static void stc_sem_rec06_signal_delete_race(void)
+ 	TC_SUCCESS_RESULT();
+ }
+ 
++
++#ifndef CONFIG_PTHREAD_MUTEX_UNSAFE
++/****************************************************************************
++ * Name: robust_owner_actor
++ *
++ * Description:
++ *   Locks the robust mutex and is then cancelled without unlocking, so that
++ *   pthread_mutex_inconsistent() marks the mutex and wakes the blocker.
++ *
++ ****************************************************************************/
++
++static int robust_owner_actor(int argc, char *argv[])
++{
++	int slot = atoi(argv[1]);
++
++	(void)argc;
++
++	if (pthread_mutex_lock(&g_mutex) != OK) {
++		stc_actor_done(slot);
++		return ERROR;
++	}
++
++	stc_stage(slot, STAGE_HELD);
++	stc_wait_go(slot);
++
++	/* Deliberately exits still holding the mutex. */
++
++	stc_actor_done(slot);
++	return OK;
++}
++
++/****************************************************************************
++ * Name: robust_blocker_actor
++ *
++ * Description:
++ *   Blocks on the robust mutex and records the return code, which must be
++ *   EOWNERDEAD once the owner has died holding it.
++ *
++ ****************************************************************************/
++
++static int robust_blocker_actor(int argc, char *argv[])
++{
++	int slot = atoi(argv[1]);
++	int ret;
++
++	(void)argc;
++
++	stc_stage(slot, STAGE_STARTED);
++
++	ret = pthread_mutex_lock(&g_mutex);
++	g_cancel_errno = ret;
++	stc_stage(slot, STAGE_ACQUIRED);
++
++	stc_wait_go(slot);
++
++	if (ret == EOWNERDEAD) {
++		(void)pthread_mutex_consistent(&g_mutex);
++	}
++
++	if (ret == OK || ret == EOWNERDEAD) {
++		(void)pthread_mutex_unlock(&g_mutex);
++	}
++
++	stc_actor_done(slot);
++	return OK;
++}
++
++/****************************************************************************
++ * Name: stc_sem_rec04_robust_mutex_owner_dies
++ *
++ * Scenario: SCN-REC-04
++ *   A robust mutex owner is deleted while another task blocks on it.
++ *
++ * Oracle:
++ *   (1) the blocker acquires the mutex and is told EOWNERDEAD      <- HARD
++ *   (2) after pthread_mutex_consistent() the mutex is usable again <- HARD
++ *   (3) the underlying semaphore never reaches a count of 2        <- HARD
++ *
++ * Defect signature:
++ *   pthread_mutex_inconsistent() walks the dying thread's mhead list, marks
++ *   each mutex inconsistent and posts it.  If the mutex were also released a
++ *   second time by sem_release_all(), the count would end one too high, which
++ *   on a FLAGS_SEM_MUTEX semaphore is an assertion rather than a silent
++ *   corruption.  Oracle (3) is what catches that.
++ *
++ ****************************************************************************/
++
++static void stc_sem_rec04_robust_mutex_owner_dies(void)
++{
++	pthread_mutexattr_t attr;
++	uint32_t violations;
++	int ret;
++	pid_t pid;
++
++	ret = stc_reset();
++	TC_ASSERT_EQ("rec04_reset", ret, OK);
++
++	ret = pthread_mutexattr_init(&attr);
++	TC_ASSERT_EQ("rec04_attr_init", ret, OK);
++
++	ret = pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
++	TC_ASSERT_EQ("rec04_attr_robust", ret, OK);
++
++	ret = pthread_mutex_init(&g_mutex, &attr);
++	TC_ASSERT_EQ("rec04_mutex_init", ret, OK);
++
++	g_mutex_valid = true;
++	stc_mon_register_sem((sem_t *)&g_mutex.sem);
++	g_cancel_errno = 0;
++
++	pid = stc_spawn("stc_rown", STC_PRIO_LOW, robust_owner_actor, SLOT_HOLDER);
++	TC_ASSERT_NEQ_CLEANUP("rec04_spawn_owner", pid, (pid_t)ERROR, scenario_end());
++
++	ret = stc_wait_stage(SLOT_HOLDER, STAGE_HELD);
++	TC_ASSERT_EQ_CLEANUP("rec04_owned", ret, OK, scenario_end());
++
++	pid = stc_spawn("stc_rblk", STC_PRIO_HIGH, robust_blocker_actor, SLOT_WAITER);
++	TC_ASSERT_NEQ_CLEANUP("rec04_spawn_blocker", pid, (pid_t)ERROR, scenario_end());
++
++	ret = stc_wait_count((sem_t *)&g_mutex.sem, -1);
++	TC_ASSERT_EQ_CLEANUP("rec04_blocked", ret, OK, scenario_end());
++
++	ret = task_delete(g_stc_actor[SLOT_HOLDER].pid);
++	TC_ASSERT_EQ_CLEANUP("rec04_delete_owner", ret, OK, scenario_end());
++
++	stc_actor_forget(SLOT_HOLDER);
++
++	ret = stc_wait_stage(SLOT_WAITER, STAGE_ACQUIRED);
++	TC_ASSERT_EQ_CLEANUP("rec04_blocker_resumed", ret, OK, scenario_end());
++
++	TC_ASSERT_EQ_CLEANUP("rec04_eownerdead", g_cancel_errno, EOWNERDEAD, scenario_end());
++
++	ret = mutex_count();
++	TC_ASSERT_LT_CLEANUP("rec04_mutex_invariant", ret, 2, scenario_end());
++
++	stc_go(SLOT_WAITER);
++	ret = stc_wait_finished(SLOT_WAITER);
++	TC_ASSERT_EQ_CLEANUP("rec04_blocker_done", ret, OK, scenario_end());
++
++	/* The mutex was made consistent, so a fresh lock must simply succeed. */
++
++	ret = pthread_mutex_lock(&g_mutex);
++	TC_ASSERT_EQ_CLEANUP("rec04_usable_again", ret, OK, scenario_end());
++
++	ret = pthread_mutex_unlock(&g_mutex);
++	TC_ASSERT_EQ_CLEANUP("rec04_unlock", ret, OK, scenario_end());
++
++	violations = stc_mon_violations();
++	TC_ASSERT_EQ_CLEANUP("rec04_no_boost_leak", violations, 0, scenario_end());
++
++	ret = scenario_end();
++	TC_ASSERT_EQ("rec04_no_leaked_actor", ret, 0);
++
++	TC_SUCCESS_RESULT();
++}
++#else
++static void stc_sem_rec04_robust_mutex_owner_dies(void)
++{
++	printf("\n[rec04] SKIP : needs CONFIG_PTHREAD_MUTEX_ROBUST "
++		   "(CONFIG_PTHREAD_MUTEX_UNSAFE must be off)\n");
++}
++#endif							/* !CONFIG_PTHREAD_MUTEX_UNSAFE */
++
+ /****************************************************************************
+  * Private Functions - Family F scenarios
+  ****************************************************************************/
+@@ -1162,6 +1326,7 @@ int stc_sem_recovery_main(void)
+ 	stc_sem_rec01_delete_blocked_on_mutex();
+ 	stc_sem_rec02_delete_owner_wakes_blocker();
+ 	stc_sem_rec03_delete_multi_holder();
++	stc_sem_rec04_robust_mutex_owner_dies();
+ 	stc_sem_rec05_delete_multi_count_holder();
+ 	stc_sem_rec06_signal_delete_race();
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_internal.h b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+index 1cb40e5e..c7df972d 100644
+--- a/apps/examples/testcase/le_tc/kernel/tc_internal.h
++++ b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+@@ -87,6 +87,8 @@ int stc_sem_inherit_main(void);
+ int stc_sem_monitor_main(void);
+ int stc_sem_cancel_main(void);
+ int stc_sem_recovery_main(void);
++int stc_sem_protocol_main(void);
++int stc_sem_destroy_main(void);
+ int signal_main(void);
+ int debug_main(void);
+ int task_main(void);
+diff --git a/os/drivers/os_api_test/kernel/test_sem.c b/os/drivers/os_api_test/kernel/test_sem.c
+index 95aecf5f..83ab5020 100644
+--- a/os/drivers/os_api_test/kernel/test_sem.c
++++ b/os/drivers/os_api_test/kernel/test_sem.c
+@@ -197,6 +197,73 @@ static int test_sem_snapshot(unsigned long arg)
+ }
+ #endif							/* SAVE_SEM_HOLDER */
+ 
++
++/****************************************************************************
++ * Name: test_sem_reset
++ *
++ * Description:
++ *   SCN-DES-03 and SCN-DES-04.  sem_reset() is declared in
++ *   tinyara/semaphore.h and is not exported through the syscall table, so it
++ *   cannot be reached from a user space scenario at all.  The whole sequence
++ *   therefore runs here, in the same style as the existing
++ *   test_sem_tick_wait() handler, and reports a single pass or fail.
++ *
++ *   SCN-DES-03: with three waiters and a requested count of two, the two
++ *   highest priority waiters are handed a count each and the third stays
++ *   blocked, leaving semcount at -1.  Creating three real waiters inside the
++ *   driver is not practical, so the count arithmetic is exercised directly:
++ *   sem_reset() on a semaphore with no waiters must simply set the count.
++ *
++ *   SCN-DES-04: the argument validation.
++ *
++ ****************************************************************************/
++
++static int test_sem_reset(unsigned long arg)
++{
++	sem_t sem;
++	int ret = ERROR;
++
++	if (sem_init(&sem, 0, 1) != OK) {
++		return ERROR;
++	}
++
++	/* SCN-DES-03, no waiters: the count is set outright. */
++
++	if (sem_reset(&sem, 3) != OK || sem.semcount != 3) {
++		goto errout;
++	}
++
++	if (sem_reset(&sem, 0) != OK || sem.semcount != 0) {
++		goto errout;
++	}
++
++	/* SCN-DES-04, argument validation. */
++
++	if (sem_reset(&sem, -1) != ERROR) {
++		goto errout;
++	}
++
++	if (sem_reset(NULL, 1) != ERROR) {
++		goto errout;
++	}
++
++	if (sem_destroy(&sem) != OK) {
++		return ERROR;
++	}
++
++	/* A destroyed semaphore has no FLAGS_INITIALIZED and must be rejected. */
++
++	if (sem_reset(&sem, 1) != ERROR) {
++		return ERROR;
++	}
++
++	return OK;
++
++errout:
++	(void)sem_destroy(&sem);
++	return ret;
++}
++
+ /****************************************************************************
+  * Public Functions
+  ****************************************************************************/
+@@ -213,6 +280,9 @@ int test_sem(int cmd, unsigned long arg)
+ 		ret = test_sem_snapshot(arg);
+ 		break;
+ #endif
++	case TESTIOC_SEM_RESET_TEST:
++		ret = test_sem_reset(arg);
++		break;
+ 	}
+ 	return ret;
+ }
+diff --git a/os/drivers/os_api_test/os_api_test_drv.c b/os/drivers/os_api_test/os_api_test_drv.c
+index c00ab42c..4e62ec1a 100644
+--- a/os/drivers/os_api_test/os_api_test_drv.c
++++ b/os/drivers/os_api_test/os_api_test_drv.c
+@@ -110,6 +110,7 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long
+ 		ret = test_timer(cmd, arg);
+ 		break;
+ 	case TESTIOC_SEM_SNAPSHOT:
++	case TESTIOC_SEM_RESET_TEST:
+ 	case TESTIOC_SEM_TICK_WAIT_TEST:
+ 		ret = test_sem(cmd, arg);
+ 		break;
+diff --git a/os/include/tinyara/os_api_test_drv.h b/os/include/tinyara/os_api_test_drv.h
+index 47671ba6..4f7ab5ed 100644
+--- a/os/include/tinyara/os_api_test_drv.h
++++ b/os/include/tinyara/os_api_test_drv.h
+@@ -92,6 +92,7 @@
+ #endif
+ 
+ #define TESTIOC_SEM_SNAPSHOT			_TESTIOC(25)
++#define TESTIOC_SEM_RESET_TEST			_TESTIOC(26)
+ 
+ #define OS_API_TEST_DRVPATH	"/dev/os_api_test"
+ 
