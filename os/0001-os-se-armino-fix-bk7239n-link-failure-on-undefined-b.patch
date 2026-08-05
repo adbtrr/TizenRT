@@ -1,0 +1,49 @@
+From c2bcd63a0426df2dfcbf1ba9d1e402d6f77c16ab Mon Sep 17 00:00:00 2001
+From: adbtrr_work_5_issue <adbtrr_work_5_issue@local>
+Date: Wed, 5 Aug 2026 12:00:00 +0530
+Subject: [PATCH] os/se/armino: fix bk7239n link failure on undefined
+ bk_flash_get_protect_type
+
+The secure storage wrapper added for the TP1X plus board calls
+bk_flash_get_protect_type(). That API is only declared in
+os/board/bk7239n/src/include/driver/flash.h and has no definition in the
+in-tree Beken flash driver, where protection handling is limited to the
+file-static helpers flash_set_protect_type()/flash_get_protect_cfg().
+
+Because os/se/armino/Make.defs adds bk_security_api_wrapper_tz.c whenever
+CONFIG_SE_ARMINO=y, every bk7239n configuration fails at link time with:
+
+  undefined reference to `bk_flash_get_protect_type'
+
+Read the flash status register instead and test the block protection bits
+directly. bk_flash_read_status_reg() is implemented in the flash driver and
+FLASH_STATUS_BITS is already used by this file when writing the status
+register, so the check stays self consistent. This mirrors the existing
+Ameba implementation in os/se/ameba/rtl_security_api_wrapper_tz.c.
+
+Verified by a full build of bk7239n/hello which now links tinyara.axf.
+---
+ os/se/armino/bk_security_api_wrapper_tz.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/os/se/armino/bk_security_api_wrapper_tz.c b/os/se/armino/bk_security_api_wrapper_tz.c
+index 9f5ab8bd..3ec6058b 100644
+--- a/os/se/armino/bk_security_api_wrapper_tz.c
++++ b/os/se/armino/bk_security_api_wrapper_tz.c
+@@ -123,12 +123,12 @@ int bk_ss_flash_read(uint32_t address, uint32_t len, uint8_t *data, int en_displ
+   */
+ int bk_verify_flash_protect(void)
+ {
+-	flash_protect_type_t protect_type;
++	uint16_t status_reg;
+ 
+-	protect_type = bk_flash_get_protect_type();
+-	printf("Flash Protect Type: %d\n", protect_type);
++	status_reg = bk_flash_read_status_reg();
++	printf("Flash Status Register: 0x%04x\n", status_reg);
+ 
+-	if (protect_type != FLASH_PROTECT_NONE) {
++	if ((status_reg & FLASH_STATUS_BITS) == FLASH_STATUS_BITS) {
+ 		return 1;
+ 	} else {
+ 		return 0;
