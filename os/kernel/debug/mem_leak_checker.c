@@ -46,13 +46,37 @@
 
 #define MM_PREV_NODE_SIZE(x)            ((x)->preceding & ~MM_ALLOC_BIT)
 
+/* The kernel heap plus the heap of every application */
+
+#ifdef CONFIG_APP_BINARY_SEPARATION
+#define MAX_CHECK_TARGETS  (CONFIG_NUM_APPS + 1)
+#else
+#define MAX_CHECK_TARGETS  1
+#endif
+
 struct alloc_node_info_s {
 	volatile struct mm_allocnode_s *node;
 	struct alloc_node_info_s *next;
 };
 
+/* A heap which is checked for leaks, and the name it is reported under */
+
+struct check_target_s {
+	struct mm_heap_s *heap;
+	char *name;
+};
+
 static struct alloc_node_info_s **g_hash_table;
 static struct alloc_node_info_s *g_node_info;
+
+/* Number of chunks registered in g_node_info[]. The chunks of every checked
+ * heap share one table, so this runs across the heaps instead of restarting
+ * for each of them.
+ */
+static int g_node_total;
+
+static struct check_target_s g_target[MAX_CHECK_TARGETS];
+static int g_target_total;
 
 static int hash_init(void)
 {
@@ -165,7 +189,7 @@ static int get_node_cnt(struct mm_heap_s *heap)
 	return ret;
 }
 
-static void fill_hash_table(struct mm_heap_s *heap, int *leak_cnt, int *broken_cnt)
+static void fill_hash_table(struct mm_heap_s *heap)
 {
 	volatile struct mm_allocnode_s *node;
 	mmsize_t node_size;
@@ -196,41 +220,44 @@ static void fill_hash_table(struct mm_heap_s *heap, int *leak_cnt, int *broken_c
 			/* Check broken link */
 			if (node_size != MM_PREV_NODE_SIZE(node)) {
 				node->memory_state = MM_MEMORY_STATE_BROKEN;
-				(*broken_cnt)++;
 				continue;
 			}
 			node_size = node->size;
-			if ((unsigned long)node + (unsigned long)SIZEOF_MM_ALLOCNODE == (unsigned long)g_node_info || 
+			if ((unsigned long)node + (unsigned long)SIZEOF_MM_ALLOCNODE == (unsigned long)g_node_info ||
 					(unsigned long)node + (unsigned long)SIZEOF_MM_ALLOCNODE == (unsigned long)g_hash_table) {
 				continue;
 			}
 			/* Check if the node corresponds to an allocated memory chunk */
 			if ((node->preceding & MM_ALLOC_BIT) != 0) {
-				g_node_info[*leak_cnt].node = node;
-				g_node_info[*leak_cnt].next = NULL;
+				if (g_node_total >= MAX_ALLOC_COUNT) {
+					/* The heaps grew after they were counted. Stop instead
+					 * of writing past the end of g_node_info[].
+					 */
+					break;
+				}
+				g_node_info[g_node_total].node = node;
+				g_node_info[g_node_total].next = NULL;
 				node->memory_state = MM_MEMORY_STATE_LEAK;
-				add_hash(*leak_cnt);
-				(*leak_cnt)++;
+				add_hash(g_node_total);
+				g_node_total++;
 			}
 		}
 	}
 	mm_givesemaphore(heap);
 }
 
-static void search_addr(void *start_addr, void *end_addr, int *leak_cnt)
+static void search_addr(void *start_addr, void *end_addr)
 {
 	/* This function traverse the memory from start_addr to end_addr for comparing the address based on hash table. */
 	void *leak_chk;
 
 	/* Not to access over its region, subtract 0x04 from the end of the address. */
 	for (leak_chk = start_addr; leak_chk < end_addr - MEM_ACCESS_UNIT; leak_chk++) {
-		if (search_hash(*(unsigned long volatile *)leak_chk - (unsigned long)SIZEOF_MM_ALLOCNODE)) {
-			(*leak_cnt)--;
-		}
+		search_hash(*(unsigned long volatile *)leak_chk - (unsigned long)SIZEOF_MM_ALLOCNODE);
 	}
 }
 
-static void heap_check(struct mm_heap_s *heap, int checker_pid, int *leak_cnt)
+static void heap_check(struct mm_heap_s *heap, int checker_pid)
 {
 	void *leak_chk;
 	struct mm_allocnode_s *visit_node;
@@ -263,9 +290,7 @@ static void heap_check(struct mm_heap_s *heap, int checker_pid, int *leak_cnt)
 					if ((leak_chk >= exclude_bottom && leak_chk <= exclude_top)) {
 						continue;
 					}
-					if (search_hash(*(unsigned long volatile *)leak_chk - (unsigned long)SIZEOF_MM_ALLOCNODE)) {
-						(*leak_cnt)--;
-					}
+					search_hash(*(unsigned long volatile *)leak_chk - (unsigned long)SIZEOF_MM_ALLOCNODE);
 				}
 			}
 		}
@@ -275,11 +300,64 @@ static void heap_check(struct mm_heap_s *heap, int checker_pid, int *leak_cnt)
 static struct mm_heap_s * init_mem_leak_checker(int checker_pid, char *bin_name);
 
 /****************************************************************************
+ * Name: collect_targets
+ *
+ * Description:
+ *   Build the list of heaps which exist right now: the kernel heap and the
+ *   heap of every loaded application.
+ *
+ *   The list is used for two things. It is the set of heaps to visit while
+ *   searching for references, and, when the whole system is checked, it is
+ *   also the set of heaps to report on.
+ *
+ *   Returns the number of heaps found.
+ *
+ ****************************************************************************/
+
+static int collect_targets(void)
+{
+#ifdef CONFIG_APP_BINARY_SEPARATION
+	bin_addr_info_t *info;
+	struct mm_heap_s *app_heap;
+	int bin_idx;
+#endif
+
+	g_target_total = 0;
+
+	g_target[g_target_total].heap = kmm_get_baseheap();
+	g_target[g_target_total].name = "Kernel";
+	g_target_total++;
+
+#ifdef CONFIG_APP_BINARY_SEPARATION
+	/* Index CMN_BIN_IDX is the common binary, which has no heap of its own,
+	 * so the applications start at the next index.
+	 */
+
+	info = (bin_addr_info_t *)get_bin_addr_list();
+	for (bin_idx = CMN_BIN_IDX + 1; bin_idx <= CONFIG_NUM_APPS && g_target_total < MAX_CHECK_TARGETS; bin_idx++) {
+		if (info[bin_idx].text_addr == 0) {
+			/* This binary is not loaded */
+			continue;
+		}
+		app_heap = mm_get_app_heap_with_name(BIN_NAME(bin_idx));
+		if (app_heap == NULL) {
+			continue;
+		}
+		g_target[g_target_total].heap = app_heap;
+		g_target[g_target_total].name = BIN_NAME(bin_idx);
+		g_target_total++;
+	}
+#endif
+
+	return g_target_total;
+}
+
+/****************************************************************************
  * Name: ram_check
  *
  * Description:
- *   Visit every place a reference to a chunk of the checked heap can be
- *   kept, and mark the referenced chunks.
+ *   Visit every place a reference to a checked chunk can be kept, and mark
+ *   the referenced chunks.
  *
  *   The set of places to visit does not depend on which heap is checked.
  *   A chunk of the kernel heap can be referenced by an application just as
@@ -294,79 +372,46 @@ static struct mm_heap_s * init_mem_leak_checker(int checker_pid, char *bin_name)
  *   script instead of being carved out of the kernel heap, so no part of
  *   the application memory was visited by the kernel check at all.
  *
+ *   This is by far the most expensive phase, because every position of
+ *   every visited region is read. Since what it visits does not depend on
+ *   the heap being reported, it runs once for all of them.
+ *
  ****************************************************************************/
 
-static void ram_check(struct mm_heap_s *heap, int checker_pid, int *leak_cnt)
+static void ram_check(int checker_pid)
 {
 	int mem_region_idx;
-	int target_visited = 0;
-	struct mm_heap_s *kheap;
+	int idx;
 #ifdef CONFIG_APP_BINARY_SEPARATION
 	bin_addr_info_t *info;
-	struct mm_heap_s *app_heap;
 	int bin_idx;
 #endif
 
 	/* Visit all the data regions of the kernel */
 
 	for (mem_region_idx = 0; mem_region_idx < MEM_VAR_REGION_COUNT; mem_region_idx++) {
-		search_addr(variable_region_start_addr[mem_region_idx], variable_region_end_addr[mem_region_idx], leak_cnt);
+		search_addr(variable_region_start_addr[mem_region_idx], variable_region_end_addr[mem_region_idx]);
 	}
 
 #ifdef CONFIG_APP_BINARY_SEPARATION
-	info = (bin_addr_info_t *)get_bin_addr_list();
-
 	/* Visit the data and the bss region of every loaded binary. Index
-	 * CMN_BIN_IDX is the common binary and is covered by the same loop, so
-	 * the binary which owns the checked heap does not have to be looked up
-	 * by name any more.
+	 * CMN_BIN_IDX is the common binary and is covered by the same loop.
 	 */
 
+	info = (bin_addr_info_t *)get_bin_addr_list();
 	for (bin_idx = CMN_BIN_IDX; bin_idx <= CONFIG_NUM_APPS; bin_idx++) {
 		if (info[bin_idx].text_addr == 0) {
-			/* This binary is not loaded */
 			continue;
 		}
-		search_addr((void *)info[bin_idx].data_addr, (void *)(info[bin_idx].data_addr + info[bin_idx].data_size), leak_cnt);
-		search_addr((void *)info[bin_idx].bss_addr, (void *)(info[bin_idx].bss_addr + info[bin_idx].bss_size), leak_cnt);
+		search_addr((void *)info[bin_idx].data_addr, (void *)(info[bin_idx].data_addr + info[bin_idx].data_size));
+		search_addr((void *)info[bin_idx].bss_addr, (void *)(info[bin_idx].bss_addr + info[bin_idx].bss_size));
 	}
 #endif
 
-	/* Visit the kernel heap */
+	/* Visit the kernel heap and the heap of every loaded application */
 
-	kheap = kmm_get_baseheap();
-	heap_check(kheap, checker_pid, leak_cnt);
-	if (heap == kheap) {
-		target_visited = 1;
-	}
-
-#ifdef CONFIG_APP_BINARY_SEPARATION
-	/* Visit the heap of every loaded application. Index CMN_BIN_IDX is
-	 * skipped because the common binary has no heap of its own.
-	 */
-
-	for (bin_idx = CMN_BIN_IDX + 1; bin_idx <= CONFIG_NUM_APPS; bin_idx++) {
-		if (info[bin_idx].text_addr == 0) {
-			continue;
-		}
-		app_heap = mm_get_app_heap_with_name(BIN_NAME(bin_idx));
-		if (app_heap == NULL) {
-			continue;
-		}
-		heap_check(app_heap, checker_pid, leak_cnt);
-		if (heap == app_heap) {
-			target_visited = 1;
-		}
-	}
-#endif
-
-	/* The checked heap is normally one of the heaps visited above. Visit it
-	 * here if it was not, so that a reference kept by the checked heap
-	 * itself can never be missed.
-	 */
-
-	if (!target_visited) {
-		heap_check(heap, checker_pid, leak_cnt);
+	for (idx = 0; idx < g_target_total; idx++) {
+		heap_check(g_target[idx].heap, checker_pid);
 	}
 }
 
@@ -386,22 +431,55 @@ static void print_mem_hex_dump(void *addr, size_t alloc_size)
 	printf("\n");
 }
 
-static void print_info(struct mm_heap_s *heap, int leak_cnt, int broken_cnt)
+/****************************************************************************
+ * Name: print_info
+ *
+ * Description:
+ *   Report the chunks of one heap which are still marked as a leak after
+ *   the search for references has run.
+ *
+ *   The counters are taken from the same walk which prints the chunks
+ *   instead of being carried along the search, so that the totals always
+ *   describe exactly what was printed.
+ *
+ ****************************************************************************/
+
+static void print_info(struct mm_heap_s *heap)
 {
 	volatile struct mm_allocnode_s *node;
-	uint32_t owner_addr;	
+	uint32_t owner_addr;
+	int leak_cnt = 0;
+	int broken_cnt = 0;
+
+#if CONFIG_KMM_REGIONS > 1
+	int region;
+#else
+#define region 0
+#endif
+
+	mm_takesemaphore(heap);
+
+	/* Count first, so that the totals and the printed chunks come from the
+	 * same state of the heap.
+	 */
+
+#if CONFIG_KMM_REGIONS > 1
+	for (region = 0; region < heap->mm_nregions; region++)
+#endif
+	{
+		for (node = heap->mm_heapstart[region]; node < heap->mm_heapend[region]; node = (struct mm_allocnode_s *)((char *)node + node->size)) {
+			ASSERT(node->size);
+			if (node->memory_state == MM_MEMORY_STATE_LEAK) {
+				leak_cnt++;
+			} else if (node->memory_state == MM_MEMORY_STATE_BROKEN) {
+				broken_cnt++;
+			}
+		}
+	}
 
 	if (leak_cnt > 0 || broken_cnt > 0) {
 		printf("Type   |    Addr    | Size(byte) |    Owner   | PID \n");
 		printf("---------------------------------------------------\n");
-
-		mm_takesemaphore(heap);
-
-#if CONFIG_KMM_REGIONS > 1
-		int region;
-#else
-#define region 0
-#endif
 
 		/* Visit each region */
 
@@ -432,36 +510,37 @@ static void print_info(struct mm_heap_s *heap, int leak_cnt, int broken_cnt)
 			}
 		}
 
-		mm_givesemaphore(heap);
-
 		printf("*** %d LEAKS, %d BROKENS.\n", leak_cnt, broken_cnt);
 	} else {
 		printf("*** NO MEMORY LEAK.\n");
 	}
+
+	mm_givesemaphore(heap);
 }
 
-int run_mem_leak_checker(int checker_pid, char *bin_name)
+/****************************************************************************
+ * Name: check_reported_targets
+ *
+ * Description:
+ *   Register the chunks of the heaps in report[0..nreport-1], run the
+ *   search for references once, and report each of those heaps.
+ *
+ *   All of the heaps share one registration table and one search, so the
+ *   expensive phase runs once no matter how many heaps are reported. It
+ *   used to run once per reported heap, and each of those runs visited
+ *   every region again.
+ *
+ ****************************************************************************/
+
+static int check_reported_targets(int checker_pid, struct check_target_s *report, int nreport)
 {
-	int leak_cnt = 0;
 	int node_cnt = 0;
-	int broken_cnt = 0;
-	struct mm_heap_s *heap = NULL;
+	int idx;
 
-	if (strncmp(bin_name, "kernel", strlen("kernel") + 1) == 0) {
-		heap = kmm_get_baseheap();
-	} 
-#ifdef CONFIG_APP_BINARY_SEPARATION
-	else {
-		heap = mm_get_app_heap_with_name(bin_name);
-	}
-#endif
-
-	if (!heap) {
-		printf("Can't found heap, bin name: %s", bin_name);
-		return ERROR;
+	for (idx = 0; idx < nreport; idx++) {
+		node_cnt += get_node_cnt(report[idx].heap);
 	}
 
-	node_cnt = get_node_cnt(heap);
 	if (MAX_ALLOC_COUNT < node_cnt) {
 		printf("Available buffer size (%d) is small.\nPlease increase CONFIG_MEM_LEAK_CHECKER_MAX_ALLOC_COUNT value more than %d.\n", MAX_ALLOC_COUNT, node_cnt);
 		return ERROR;
@@ -477,24 +556,82 @@ int run_mem_leak_checker(int checker_pid, char *bin_name)
 		return ERROR;
 	}
 
-	fill_hash_table(heap, &leak_cnt, &broken_cnt);
+	/* Register the chunks of every reported heap in the one table */
 
-	/* Visit RAM region */
-	ram_check(heap, checker_pid, &leak_cnt);
+	g_node_total = 0;
+	for (idx = 0; idx < nreport; idx++) {
+		fill_hash_table(report[idx].heap);
+	}
 
-	print_info(heap, leak_cnt, broken_cnt);
+	/* Visit RAM region. Shared by every reported heap. */
+
+	ram_check(checker_pid);
+
+	/* A reported heap is normally one of the heaps ram_check() visited.
+	 * Visit it here if it was not, so that a reference kept by the reported
+	 * heap itself can never be missed.
+	 */
+
+	for (idx = 0; idx < nreport; idx++) {
+		int visited = 0;
+		int target_idx;
+
+		for (target_idx = 0; target_idx < g_target_total; target_idx++) {
+			if (g_target[target_idx].heap == report[idx].heap) {
+				visited = 1;
+				break;
+			}
+		}
+
+		if (!visited) {
+			heap_check(report[idx].heap, checker_pid);
+		}
+	}
+
+	for (idx = 0; idx < nreport; idx++) {
+		printf("\n%s :\n", report[idx].name);
+		print_info(report[idx].heap);
+	}
 
 	hash_deinit();
 	return OK;
 }
 
+int run_mem_leak_checker(int checker_pid, char *bin_name)
+{
+	struct check_target_s report;
+
+	if (collect_targets() <= 0) {
+		printf("Can't found any heap to check.\n");
+		return ERROR;
+	}
+
+	if (strncmp(bin_name, "kernel", strlen("kernel") + 1) == 0) {
+		report.heap = kmm_get_baseheap();
+	}
+#ifdef CONFIG_APP_BINARY_SEPARATION
+	else {
+		report.heap = mm_get_app_heap_with_name(bin_name);
+	}
+#endif
+
+	if (!report.heap) {
+		printf("Can't found heap, bin name: %s", bin_name);
+		return ERROR;
+	}
+	report.name = bin_name;
+
+	/* Only the requested heap is reported, but the search still visits
+	 * every heap, because any of them can hold the reference.
+	 */
+
+	return check_reported_targets(checker_pid, &report, 1);
+}
+
 int run_all_mem_leak_checker(int checker_pid)
 {
-	int ret;
-	printf("\nKernel :\n");
-	ret = run_mem_leak_checker(checker_pid, "kernel");
-
-	if (ret != OK) {
+	if (collect_targets() <= 0) {
+		printf("Can't found any heap to check.\n");
 		return ERROR;
 	}
 
@@ -508,19 +645,11 @@ int run_all_mem_leak_checker(int checker_pid)
 			printf("[%s] Text Addr : %p, Text Size : %u\n", BIN_NAME(bin_idx), bin_addr_info[bin_idx].text_addr, bin_addr_info[bin_idx].text_size);
 		}
 	}
-	printf("\n");
-	/* bin_idx value zero is always reserved for common binary, so
-	 * skip checking common binary and start checking from index one
-	 */
-	for (bin_idx = 1; bin_idx <= CONFIG_NUM_APPS; bin_idx++) {
-		if (bin_addr_info[bin_idx].text_addr != 0) {
-			printf("%s :\n", BIN_NAME(bin_idx));
-			ret = run_mem_leak_checker(checker_pid, BIN_NAME(bin_idx));
-			if (ret != OK) {
-				return ERROR;
-			}
-		}
-	}
 #endif
-	return OK;
+
+	/* Report the kernel heap and the heap of every loaded application from
+	 * a single search.
+	 */
+
+	return check_reported_targets(checker_pid, g_target, g_target_total);
 }
