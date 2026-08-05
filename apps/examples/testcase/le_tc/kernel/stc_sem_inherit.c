@@ -17,15 +17,28 @@
  ****************************************************************************/
 
 /// @file stc_sem_inherit.c
-/// @brief Family A of the Priority Inheritance and Semaphore Recovery
-///        Scenario Test Catalogue - boost and restore.
+/// @brief Families A and B of the Priority Inheritance and Semaphore Recovery
+///        Scenario Test Catalogue - boost and restore, and the cross
+///        semaphore and multi holder restore paths.
 ///
-/// SCN-PI-01  boost on block, restore on post
-/// SCN-PI-02  no boost when the waiter does not outrank the holder
-/// SCN-PI-03  the holder tracks the maximum waiter priority
-/// SCN-PI-04  a classic inversion is bounded by the critical section
-/// SCN-PI-05  every holder of a counting semaphore is boosted
-/// SCN-PI-06  every holder is restored, not only the one that posted
+/// Family A - boost and restore
+///   SCN-PI-01  boost on block, restore on post
+///   SCN-PI-02  no boost when the waiter does not outrank the holder
+///   SCN-PI-03  the holder tracks the maximum waiter priority
+///   SCN-PI-04  a classic inversion is bounded by the critical section
+///   SCN-PI-05  every holder of a counting semaphore is boosted
+///   SCN-PI-06  every holder is restored, not only the one that posted
+///
+/// Family B - cross semaphore and multi holder restore
+///   SCN-PIX-01 a holder that still owes another semaphore stays boosted
+///   SCN-PIX-02 a spent holder entry stops boosting its holder
+///   SCN-PIX-03 the just awakened waiter does not re-boost its own holder
+///   SCN-PIX-04 an ambiguous release leaves every holder record intact
+///   SCN-PIX-05 an unambiguous release frees the holder record
+///
+/// Family B is the subtle half.  Each scenario isolates one branch of
+/// sem_restoreholderprio(), and each has a defect signature that no API level
+/// test can express, because the only symptom is a priority.
 ///
 /// These are the base cases.  Nothing in the tree asserts today that a boost
 /// happens at all: the only priority inheritance test that exists,
@@ -82,6 +95,8 @@
 #define SLOT_WAITER             3
 #define SLOT_WAITER2            4
 #define SLOT_SPINNER            5
+#define SLOT_POSTER             6
+#define SLOT_TAKER              7
 
 /* Length of the SCN-PI-04 critical section, in loop iterations.  Work, not a
  * sleep: a sleeping holder would release the CPU, and the scenario would then
@@ -97,6 +112,13 @@
 /* The semaphore under test.  Re-initialised by every scenario. */
 
 static sem_t g_target;
+
+/* Second semaphore, used by the Family B scenarios that need a holder to owe
+ * two semaphores at once.
+ */
+
+static sem_t g_target2;
+static bool g_target2_valid;
 
 /* Sink for the critical-section work loop, so it cannot be optimised away. */
 
@@ -241,6 +263,160 @@ static int spinner_actor(int argc, char *argv[])
 	return OK;
 }
 
+
+/****************************************************************************
+ * Name: holder_two_sems_actor
+ *
+ * Description:
+ *   Take one count of each semaphore, then release them one at a time, each
+ *   release gated by its own stc_go().  Used by SCN-PIX-01 and SCN-PIX-02,
+ *   where the whole point is what the holder's priority is between the two
+ *   releases.
+ *
+ ****************************************************************************/
+
+static int holder_two_sems_actor(int argc, char *argv[])
+{
+	int slot = atoi(argv[1]);
+
+	(void)argc;
+
+	if (sem_wait(&g_target) != OK || sem_wait(&g_target2) != OK) {
+		stc_actor_done(slot);
+		return ERROR;
+	}
+
+	stc_stage(slot, STAGE_HELD);
+
+	stc_wait_go(slot);
+	(void)sem_post(&g_target);
+	stc_stage(slot, STAGE_POSTED);
+
+	stc_wait_go(slot);
+	(void)sem_post(&g_target2);
+
+	stc_actor_done(slot);
+	return OK;
+}
+
+/****************************************************************************
+ * Name: holder_two_counts_actor
+ *
+ * Description:
+ *   Take two counts of the same semaphore and release them one at a time.
+ *   Used by SCN-PIX-03: after the first release the holder still owns a count,
+ *   so its holder entry is still examined by the restore pass - which is what
+ *   makes the exclusion of the awakened waiter observable.
+ *
+ ****************************************************************************/
+
+static int holder_two_counts_actor(int argc, char *argv[])
+{
+	int slot = atoi(argv[1]);
+
+	(void)argc;
+
+	if (sem_wait(&g_target) != OK || sem_wait(&g_target) != OK) {
+		stc_actor_done(slot);
+		return ERROR;
+	}
+
+	stc_stage(slot, STAGE_HELD);
+
+	stc_wait_go(slot);
+	(void)sem_post(&g_target);
+	stc_stage(slot, STAGE_POSTED);
+
+	stc_wait_go(slot);
+	(void)sem_post(&g_target);
+
+	stc_actor_done(slot);
+	return OK;
+}
+
+/****************************************************************************
+ * Name: holder_no_post_actor
+ *
+ * Description:
+ *   Take one count and never release it.  Used by SCN-PIX-05, where a
+ *   non-holder returns the count on this actor's behalf; posting again here
+ *   would inject a second count and corrupt the arithmetic.
+ *
+ ****************************************************************************/
+
+static int holder_no_post_actor(int argc, char *argv[])
+{
+	int slot = atoi(argv[1]);
+
+	(void)argc;
+
+	if (sem_wait(&g_target) != OK) {
+		stc_actor_done(slot);
+		return ERROR;
+	}
+
+	stc_stage(slot, STAGE_HELD);
+	stc_wait_go(slot);
+
+	stc_actor_done(slot);
+	return OK;
+}
+
+/****************************************************************************
+ * Name: poster_actor
+ *
+ * Description:
+ *   Posts a semaphore it never waited on.  POSIX allows this for counting
+ *   semaphores, and it is the case sem_releaseholder() has to disambiguate.
+ *
+ ****************************************************************************/
+
+static int poster_actor(int argc, char *argv[])
+{
+	int slot = atoi(argv[1]);
+
+	(void)argc;
+
+	stc_stage(slot, STAGE_STARTED);
+	stc_wait_go(slot);
+
+	(void)sem_post(&g_target);
+	stc_stage(slot, STAGE_POSTED);
+
+	stc_actor_done(slot);
+	return OK;
+}
+
+/****************************************************************************
+ * Name: waiter2_actor
+ *
+ * Description:
+ *   waiter_actor() for the second semaphore.
+ *
+ ****************************************************************************/
+
+static int waiter2_actor(int argc, char *argv[])
+{
+	int slot = atoi(argv[1]);
+
+	(void)argc;
+
+	stc_stage(slot, STAGE_STARTED);
+
+	if (sem_wait(&g_target2) != OK) {
+		stc_actor_done(slot);
+		return ERROR;
+	}
+
+	stc_stage(slot, STAGE_ACQUIRED);
+	stc_wait_go(slot);
+
+	(void)sem_post(&g_target2);
+
+	stc_actor_done(slot);
+	return OK;
+}
+
 /****************************************************************************
  * Private Functions - helpers
  *
@@ -285,7 +461,37 @@ static int scenario_end(void)
 
 	(void)sem_destroy(&g_target);
 
+	if (g_target2_valid) {
+		(void)sem_destroy(&g_target2);
+		g_target2_valid = false;
+	}
+
 	return leaked;
+}
+
+/****************************************************************************
+ * Name: scenario_begin2
+ *
+ * Description:
+ *   As scenario_begin(), plus a second semaphore.  Both are registered with
+ *   the boost-leak monitor, so a waiter on either one justifies a boost.
+ *
+ ****************************************************************************/
+
+static int scenario_begin2(int count1, int count2)
+{
+	if (scenario_begin(count1) != OK) {
+		return ERROR;
+	}
+
+	if (sem_init(&g_target2, 0, count2) != OK) {
+		return ERROR;
+	}
+
+	g_target2_valid = true;
+	stc_mon_register_sem(&g_target2);
+
+	return OK;
 }
 
 /****************************************************************************
@@ -326,7 +532,7 @@ static int hold_and_block(int waiter_prio, int waiter_slot)
  *
  ****************************************************************************/
 
-static int release_waiter(int slot, int final_count)
+static int release_waiter_on(int slot, sem_t *sem, int final_count)
 {
 	if (stc_wait_stage(slot, STAGE_ACQUIRED) != OK) {
 		return ERROR;
@@ -334,7 +540,12 @@ static int release_waiter(int slot, int final_count)
 
 	stc_go(slot);
 
-	return stc_wait_count(&g_target, final_count);
+	return stc_wait_count(sem, final_count);
+}
+
+static int release_waiter(int slot, int final_count)
+{
+	return release_waiter_on(slot, &g_target, final_count);
 }
 
 /****************************************************************************
@@ -780,6 +991,442 @@ static void stc_sem_pi06_all_holders_restored(void)
 	TC_SUCCESS_RESULT();
 }
 
+
+/****************************************************************************
+ * Private Functions - Family B scenarios
+ ****************************************************************************/
+
+/****************************************************************************
+ * Name: stc_sem_pix01_still_owes_other_semaphore
+ *
+ * Scenario: SCN-PIX-01
+ *   One holder owns S1 and S2.  A 140 task waits on S1, a 160 task waits on
+ *   S2.  S1 is posted first.
+ *
+ * Oracle:
+ *   (1) the holder reaches 140, then 160, as the waiters arrive     <- HARD
+ *   (2) after posting S1 the holder is still at 160                 <- HARD
+ *   (3) after posting S2 the holder is back at 100                  <- HARD
+ *
+ * Defect signature:
+ *   Oracle (2) fails if the restore pass looks only at the semaphore being
+ *   posted instead of walking the holder's whole holdsem list.  Dropping the
+ *   holder to base there re-opens the inversion on S2 for its 160 waiter,
+ *   which is the exact situation inheritance exists to prevent.
+ *
+ ****************************************************************************/
+
+static void stc_sem_pix01_still_owes_other_semaphore(void)
+{
+	uint32_t violations;
+	int ret;
+	int prio;
+	pid_t pid;
+
+	ret = scenario_begin2(1, 1);
+	TC_ASSERT_EQ("pix01_begin", ret, OK);
+
+	pid = stc_spawn("stc_h2", STC_PRIO_LOW, holder_two_sems_actor, SLOT_HOLDER);
+	TC_ASSERT_NEQ_CLEANUP("pix01_spawn_holder", pid, (pid_t)ERROR, scenario_end());
+
+	ret = stc_wait_stage(SLOT_HOLDER, STAGE_HELD);
+	TC_ASSERT_EQ_CLEANUP("pix01_held", ret, OK, scenario_end());
+
+	pid = stc_spawn("stc_w1", STC_PRIO_HIGH, waiter_actor, SLOT_WAITER);
+	TC_ASSERT_NEQ_CLEANUP("pix01_spawn_w1", pid, (pid_t)ERROR, scenario_end());
+
+	ret = stc_wait_count(&g_target, -1);
+	TC_ASSERT_EQ_CLEANUP("pix01_w1_blocked", ret, OK, scenario_end());
+
+	prio = stc_getprio(g_stc_actor[SLOT_HOLDER].pid);
+	TC_ASSERT_EQ_CLEANUP("pix01_boost_140", prio, STC_PRIO_HIGH, scenario_end());
+
+	pid = stc_spawn("stc_w2", STC_PRIO_EXTRA, waiter2_actor, SLOT_WAITER2);
+	TC_ASSERT_NEQ_CLEANUP("pix01_spawn_w2", pid, (pid_t)ERROR, scenario_end());
+
+	ret = stc_wait_count(&g_target2, -1);
+	TC_ASSERT_EQ_CLEANUP("pix01_w2_blocked", ret, OK, scenario_end());
+
+	prio = stc_getprio(g_stc_actor[SLOT_HOLDER].pid);
+	TC_ASSERT_EQ_CLEANUP("pix01_boost_160", prio, STC_PRIO_EXTRA, scenario_end());
+
+	/* Release S1 only.  S2 is still held and its waiter still outranks the
+	 * holder, so the holder must stay where it is.
+	 */
+
+	stc_go(SLOT_HOLDER);
+	ret = stc_wait_count(&g_target, 0);
+	TC_ASSERT_EQ_CLEANUP("pix01_post_s1", ret, OK, scenario_end());
+
+	prio = stc_getprio(g_stc_actor[SLOT_HOLDER].pid);
+	TC_ASSERT_EQ_CLEANUP("pix01_still_boosted", prio, STC_PRIO_EXTRA, scenario_end());
+
+	stc_go(SLOT_HOLDER);
+	ret = stc_wait_count(&g_target2, 0);
+	TC_ASSERT_EQ_CLEANUP("pix01_post_s2", ret, OK, scenario_end());
+
+	prio = stc_getprio(g_stc_actor[SLOT_HOLDER].pid);
+	TC_ASSERT_EQ_CLEANUP("pix01_restored", prio, STC_PRIO_LOW, scenario_end());
+
+	ret = release_waiter(SLOT_WAITER, 1);
+	TC_ASSERT_EQ_CLEANUP("pix01_drain_s1", ret, OK, scenario_end());
+
+	ret = release_waiter_on(SLOT_WAITER2, &g_target2, 1);
+	TC_ASSERT_EQ_CLEANUP("pix01_drain_s2", ret, OK, scenario_end());
+
+	violations = stc_mon_violations();
+	TC_ASSERT_EQ_CLEANUP("pix01_no_boost_leak", violations, 0, scenario_end());
+
+	ret = scenario_end();
+	TC_ASSERT_EQ("pix01_no_leaked_actor", ret, 0);
+
+	TC_SUCCESS_RESULT();
+}
+
+/****************************************************************************
+ * Name: stc_sem_pix02_spent_entry_stops_boosting
+ *
+ * Scenario: SCN-PIX-02
+ *   One holder owns S1 and S2.  Two tasks, 130 and 140, wait on S1.  Nobody
+ *   waits on S2.  S1 is posted once, so the 140 task takes the count and the
+ *   130 task keeps waiting.
+ *
+ * Oracle:
+ *   after the post the holder is back at 100, not at 130            <- HARD
+ *
+ * Defect signature:
+ *   The holder's S1 entry is spent - its count reached zero in
+ *   sem_releaseholder() - so the restore pass must skip it.  If it does not,
+ *   it finds the still-waiting 130 task and pins the holder there.  The task
+ *   is then permanently one boost above its base until it happens to post
+ *   something else, and a worker looping on the same two semaphores never
+ *   unwinds at all.  This is the single most valuable scenario in Family B.
+ *
+ ****************************************************************************/
+
+static void stc_sem_pix02_spent_entry_stops_boosting(void)
+{
+	uint32_t violations;
+	int ret;
+	int prio;
+	pid_t pid;
+
+	ret = scenario_begin2(1, 1);
+	TC_ASSERT_EQ("pix02_begin", ret, OK);
+
+	pid = stc_spawn("stc_h2", STC_PRIO_LOW, holder_two_sems_actor, SLOT_HOLDER);
+	TC_ASSERT_NEQ_CLEANUP("pix02_spawn_holder", pid, (pid_t)ERROR, scenario_end());
+
+	ret = stc_wait_stage(SLOT_HOLDER, STAGE_HELD);
+	TC_ASSERT_EQ_CLEANUP("pix02_held", ret, OK, scenario_end());
+
+	pid = stc_spawn("stc_w130", STC_PRIO_MID, waiter_actor, SLOT_WAITER);
+	TC_ASSERT_NEQ_CLEANUP("pix02_spawn_w130", pid, (pid_t)ERROR, scenario_end());
+
+	ret = stc_wait_count(&g_target, -1);
+	TC_ASSERT_EQ_CLEANUP("pix02_w130_blocked", ret, OK, scenario_end());
+
+	prio = stc_getprio(g_stc_actor[SLOT_HOLDER].pid);
+	TC_ASSERT_EQ_CLEANUP("pix02_boost_130", prio, STC_PRIO_MID, scenario_end());
+
+	pid = stc_spawn("stc_w140", STC_PRIO_HIGH, waiter_actor, SLOT_WAITER2);
+	TC_ASSERT_NEQ_CLEANUP("pix02_spawn_w140", pid, (pid_t)ERROR, scenario_end());
+
+	ret = stc_wait_count(&g_target, -2);
+	TC_ASSERT_EQ_CLEANUP("pix02_w140_blocked", ret, OK, scenario_end());
+
+	prio = stc_getprio(g_stc_actor[SLOT_HOLDER].pid);
+	TC_ASSERT_EQ_CLEANUP("pix02_boost_140", prio, STC_PRIO_HIGH, scenario_end());
+
+	/* Post S1 once.  The 140 task takes the count; the 130 task is still
+	 * linked as a waiter on S1, but the holder no longer holds a count there.
+	 */
+
+	stc_go(SLOT_HOLDER);
+	ret = stc_wait_count(&g_target, -1);
+	TC_ASSERT_EQ_CLEANUP("pix02_post_s1", ret, OK, scenario_end());
+
+	prio = stc_getprio(g_stc_actor[SLOT_HOLDER].pid);
+	TC_ASSERT_EQ_CLEANUP("pix02_fully_restored", prio, STC_PRIO_LOW, scenario_end());
+
+	stc_go(SLOT_HOLDER);
+	ret = stc_wait_count(&g_target2, 1);
+	TC_ASSERT_EQ_CLEANUP("pix02_post_s2", ret, OK, scenario_end());
+
+	ret = release_waiter(SLOT_WAITER2, 0);
+	TC_ASSERT_EQ_CLEANUP("pix02_drain_w140", ret, OK, scenario_end());
+
+	ret = release_waiter(SLOT_WAITER, 1);
+	TC_ASSERT_EQ_CLEANUP("pix02_drain_w130", ret, OK, scenario_end());
+
+	violations = stc_mon_violations();
+	TC_ASSERT_EQ_CLEANUP("pix02_no_boost_leak", violations, 0, scenario_end());
+
+	ret = scenario_end();
+	TC_ASSERT_EQ("pix02_no_leaked_actor", ret, 0);
+
+	TC_SUCCESS_RESULT();
+}
+
+/****************************************************************************
+ * Name: stc_sem_pix03_awakened_waiter_excluded
+ *
+ * Scenario: SCN-PIX-03
+ *   One holder owns two counts of the same semaphore.  A 160 task blocks.  One
+ *   count is posted, so the waiter is granted it while the holder still owns
+ *   the other count.
+ *
+ * Oracle:
+ *   after the post the holder is back at 100                        <- HARD
+ *
+ * Defect signature:
+ *   The holder still owns a count, so its entry is examined rather than
+ *   skipped.  The task that has just been granted the count can still be
+ *   linked on the waiting list while priorities are recomputed, so it must be
+ *   excluded from that recomputation.  Without the exclusion it is found as
+ *   the highest waiter of a semaphore it has already been given, and the boost
+ *   never ends.
+ *
+ ****************************************************************************/
+
+static void stc_sem_pix03_awakened_waiter_excluded(void)
+{
+	uint32_t violations;
+	int ret;
+	int prio;
+	pid_t pid;
+
+	ret = scenario_begin(2);
+	TC_ASSERT_EQ("pix03_begin", ret, OK);
+
+	pid = stc_spawn("stc_h2c", STC_PRIO_LOW, holder_two_counts_actor, SLOT_HOLDER);
+	TC_ASSERT_NEQ_CLEANUP("pix03_spawn_holder", pid, (pid_t)ERROR, scenario_end());
+
+	ret = stc_wait_stage(SLOT_HOLDER, STAGE_HELD);
+	TC_ASSERT_EQ_CLEANUP("pix03_held", ret, OK, scenario_end());
+
+	ret = stc_getcount(&g_target);
+	TC_ASSERT_EQ_CLEANUP("pix03_both_counts_taken", ret, 0, scenario_end());
+
+	pid = stc_spawn("stc_wx", STC_PRIO_EXTRA, waiter_actor, SLOT_WAITER);
+	TC_ASSERT_NEQ_CLEANUP("pix03_spawn_waiter", pid, (pid_t)ERROR, scenario_end());
+
+	ret = stc_wait_count(&g_target, -1);
+	TC_ASSERT_EQ_CLEANUP("pix03_blocked", ret, OK, scenario_end());
+
+	prio = stc_getprio(g_stc_actor[SLOT_HOLDER].pid);
+	TC_ASSERT_EQ_CLEANUP("pix03_boosted", prio, STC_PRIO_EXTRA, scenario_end());
+
+	stc_go(SLOT_HOLDER);
+	ret = stc_wait_count(&g_target, 0);
+	TC_ASSERT_EQ_CLEANUP("pix03_post_one", ret, OK, scenario_end());
+
+	prio = stc_getprio(g_stc_actor[SLOT_HOLDER].pid);
+	TC_ASSERT_EQ_CLEANUP("pix03_restored", prio, STC_PRIO_LOW, scenario_end());
+
+	stc_go(SLOT_HOLDER);
+	ret = stc_wait_count(&g_target, 1);
+	TC_ASSERT_EQ_CLEANUP("pix03_post_two", ret, OK, scenario_end());
+
+	ret = release_waiter(SLOT_WAITER, 2);
+	TC_ASSERT_EQ_CLEANUP("pix03_drained", ret, OK, scenario_end());
+
+	violations = stc_mon_violations();
+	TC_ASSERT_EQ_CLEANUP("pix03_no_boost_leak", violations, 0, scenario_end());
+
+	ret = scenario_end();
+	TC_ASSERT_EQ("pix03_no_leaked_actor", ret, 0);
+
+	TC_SUCCESS_RESULT();
+}
+
+/****************************************************************************
+ * Name: stc_sem_pix04_ambiguous_release_keeps_records
+ *
+ * Scenario: SCN-PIX-04
+ *   A counting semaphore with two holders, a 140 waiter, and a third task that
+ *   never waited posting the semaphore.  With two holders there is no way to
+ *   tell whose count was released.
+ *
+ * Oracle:
+ *   (1) both holders are boosted to 140 while the waiter blocks     <- HARD
+ *   (2) after the non-holder post, both holders are back at their own
+ *       base priorities                                             <- HARD
+ *   (3) both can still release their own counts, and the final count
+ *       reflects the extra count the non-holder injected             <- HARD
+ *
+ * Defect signature:
+ *   Attributing an ambiguous release to the posting task would drop a holder
+ *   record that is still live.  The holder then keeps being boosted by later
+ *   waiters, and its count is released a second time if the task is deleted -
+ *   which on a mutex flagged semaphore trips the semcount < 2 assertion.
+ *
+ ****************************************************************************/
+
+static void stc_sem_pix04_ambiguous_release_keeps_records(void)
+{
+	uint32_t violations;
+	int ret;
+	int prio;
+	pid_t pid;
+
+	ret = scenario_begin(2);
+	TC_ASSERT_EQ("pix04_begin", ret, OK);
+
+	pid = stc_spawn("stc_ha", STC_PRIO_LOW, holder_actor, SLOT_HOLDER);
+	TC_ASSERT_NEQ_CLEANUP("pix04_spawn_h1", pid, (pid_t)ERROR, scenario_end());
+
+	ret = stc_wait_stage(SLOT_HOLDER, STAGE_HELD);
+	TC_ASSERT_EQ_CLEANUP("pix04_h1_held", ret, OK, scenario_end());
+
+	pid = stc_spawn("stc_hb", STC_PRIO_LOW2, holder_actor, SLOT_HOLDER2);
+	TC_ASSERT_NEQ_CLEANUP("pix04_spawn_h2", pid, (pid_t)ERROR, scenario_end());
+
+	ret = stc_wait_stage(SLOT_HOLDER2, STAGE_HELD);
+	TC_ASSERT_EQ_CLEANUP("pix04_h2_held", ret, OK, scenario_end());
+
+	pid = stc_spawn("stc_w", STC_PRIO_HIGH, waiter_actor, SLOT_WAITER);
+	TC_ASSERT_NEQ_CLEANUP("pix04_spawn_waiter", pid, (pid_t)ERROR, scenario_end());
+
+	ret = stc_wait_count(&g_target, -1);
+	TC_ASSERT_EQ_CLEANUP("pix04_blocked", ret, OK, scenario_end());
+
+	prio = stc_getprio(g_stc_actor[SLOT_HOLDER].pid);
+	TC_ASSERT_EQ_CLEANUP("pix04_h1_boosted", prio, STC_PRIO_HIGH, scenario_end());
+
+	prio = stc_getprio(g_stc_actor[SLOT_HOLDER2].pid);
+	TC_ASSERT_EQ_CLEANUP("pix04_h2_boosted", prio, STC_PRIO_HIGH, scenario_end());
+
+	/* A task that never waited posts the semaphore. */
+
+	pid = stc_spawn("stc_post", STC_PRIO_INVERTER, poster_actor, SLOT_POSTER);
+	TC_ASSERT_NEQ_CLEANUP("pix04_spawn_poster", pid, (pid_t)ERROR, scenario_end());
+
+	ret = stc_wait_stage(SLOT_POSTER, STAGE_STARTED);
+	TC_ASSERT_EQ_CLEANUP("pix04_poster_ready", ret, OK, scenario_end());
+
+	stc_go(SLOT_POSTER);
+	ret = stc_wait_count(&g_target, 0);
+	TC_ASSERT_EQ_CLEANUP("pix04_nonholder_post", ret, OK, scenario_end());
+
+	prio = stc_getprio(g_stc_actor[SLOT_HOLDER].pid);
+	TC_ASSERT_EQ_CLEANUP("pix04_h1_restored", prio, STC_PRIO_LOW, scenario_end());
+
+	prio = stc_getprio(g_stc_actor[SLOT_HOLDER2].pid);
+	TC_ASSERT_EQ_CLEANUP("pix04_h2_restored", prio, STC_PRIO_LOW2, scenario_end());
+
+	/* Both holders must still be able to release their own counts. */
+
+	stc_go(SLOT_HOLDER);
+	ret = stc_wait_count(&g_target, 1);
+	TC_ASSERT_EQ_CLEANUP("pix04_h1_post", ret, OK, scenario_end());
+
+	stc_go(SLOT_HOLDER2);
+	ret = stc_wait_count(&g_target, 2);
+	TC_ASSERT_EQ_CLEANUP("pix04_h2_post", ret, OK, scenario_end());
+
+	ret = release_waiter(SLOT_WAITER, 3);
+	TC_ASSERT_EQ_CLEANUP("pix04_drained", ret, OK, scenario_end());
+
+	violations = stc_mon_violations();
+	TC_ASSERT_EQ_CLEANUP("pix04_no_boost_leak", violations, 0, scenario_end());
+
+	ret = scenario_end();
+	TC_ASSERT_EQ("pix04_no_leaked_actor", ret, 0);
+
+	TC_SUCCESS_RESULT();
+}
+
+/****************************************************************************
+ * Name: stc_sem_pix05_unambiguous_release_frees_record
+ *
+ * Scenario: SCN-PIX-05
+ *   A counting semaphore with exactly one holder, posted by a task that never
+ *   waited.  With a single holder the release is unambiguous, so that holder's
+ *   record must be released.  A different task then takes the count and a 140
+ *   task blocks behind it.
+ *
+ * Oracle:
+ *   (1) the new holder is boosted to 140                            <- HARD
+ *   (2) the original holder stays at 100                            <- HARD
+ *
+ * Defect signature:
+ *   If the original holder's record survives the non-holder post, it is a
+ *   record of a count the task no longer owns.  Oracle (2) then fails: the
+ *   stale entry boosts a task that holds nothing at all.
+ *
+ ****************************************************************************/
+
+static void stc_sem_pix05_unambiguous_release_frees_record(void)
+{
+	uint32_t violations;
+	int ret;
+	int prio;
+	pid_t pid;
+
+	ret = scenario_begin(1);
+	TC_ASSERT_EQ("pix05_begin", ret, OK);
+
+	pid = stc_spawn("stc_hnp", STC_PRIO_LOW, holder_no_post_actor, SLOT_HOLDER);
+	TC_ASSERT_NEQ_CLEANUP("pix05_spawn_holder", pid, (pid_t)ERROR, scenario_end());
+
+	ret = stc_wait_stage(SLOT_HOLDER, STAGE_HELD);
+	TC_ASSERT_EQ_CLEANUP("pix05_held", ret, OK, scenario_end());
+
+	pid = stc_spawn("stc_post", STC_PRIO_INVERTER, poster_actor, SLOT_POSTER);
+	TC_ASSERT_NEQ_CLEANUP("pix05_spawn_poster", pid, (pid_t)ERROR, scenario_end());
+
+	ret = stc_wait_stage(SLOT_POSTER, STAGE_STARTED);
+	TC_ASSERT_EQ_CLEANUP("pix05_poster_ready", ret, OK, scenario_end());
+
+	/* The count is returned on the holder's behalf.  The holder owns nothing
+	 * from this point on.
+	 */
+
+	stc_go(SLOT_POSTER);
+	ret = stc_wait_count(&g_target, 1);
+	TC_ASSERT_EQ_CLEANUP("pix05_nonholder_post", ret, OK, scenario_end());
+
+	pid = stc_spawn("stc_take", STC_PRIO_LOW2, holder_actor, SLOT_TAKER);
+	TC_ASSERT_NEQ_CLEANUP("pix05_spawn_taker", pid, (pid_t)ERROR, scenario_end());
+
+	ret = stc_wait_stage(SLOT_TAKER, STAGE_HELD);
+	TC_ASSERT_EQ_CLEANUP("pix05_taker_held", ret, OK, scenario_end());
+
+	pid = stc_spawn("stc_w", STC_PRIO_HIGH, waiter_actor, SLOT_WAITER);
+	TC_ASSERT_NEQ_CLEANUP("pix05_spawn_waiter", pid, (pid_t)ERROR, scenario_end());
+
+	ret = stc_wait_count(&g_target, -1);
+	TC_ASSERT_EQ_CLEANUP("pix05_blocked", ret, OK, scenario_end());
+
+	prio = stc_getprio(g_stc_actor[SLOT_TAKER].pid);
+	TC_ASSERT_EQ_CLEANUP("pix05_taker_boosted", prio, STC_PRIO_HIGH, scenario_end());
+
+	prio = stc_getprio(g_stc_actor[SLOT_HOLDER].pid);
+	TC_ASSERT_EQ_CLEANUP("pix05_exholder_not_boosted", prio, STC_PRIO_LOW, scenario_end());
+
+	stc_go(SLOT_TAKER);
+	ret = stc_wait_count(&g_target, 0);
+	TC_ASSERT_EQ_CLEANUP("pix05_taker_post", ret, OK, scenario_end());
+
+	ret = release_waiter(SLOT_WAITER, 1);
+	TC_ASSERT_EQ_CLEANUP("pix05_drained", ret, OK, scenario_end());
+
+	/* The original holder never posts: its count was already returned. */
+
+	stc_go(SLOT_HOLDER);
+	ret = stc_wait_finished(SLOT_HOLDER);
+	TC_ASSERT_EQ_CLEANUP("pix05_exholder_done", ret, OK, scenario_end());
+
+	violations = stc_mon_violations();
+	TC_ASSERT_EQ_CLEANUP("pix05_no_boost_leak", violations, 0, scenario_end());
+
+	ret = scenario_end();
+	TC_ASSERT_EQ("pix05_no_leaked_actor", ret, 0);
+
+	TC_SUCCESS_RESULT();
+}
+
 /****************************************************************************
  * Public Functions
  ****************************************************************************/
@@ -814,6 +1461,12 @@ int stc_sem_inherit_main(void)
 	stc_sem_pi04_inversion_is_bounded();
 	stc_sem_pi05_all_holders_boosted();
 	stc_sem_pi06_all_holders_restored();
+
+	stc_sem_pix01_still_owes_other_semaphore();
+	stc_sem_pix02_spent_entry_stops_boosting();
+	stc_sem_pix03_awakened_waiter_excluded();
+	stc_sem_pix04_ambiguous_release_keeps_records();
+	stc_sem_pix05_unambiguous_release_frees_record();
 
 	stc_mon_stop();
 	stc_harness_end();

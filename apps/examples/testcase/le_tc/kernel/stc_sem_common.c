@@ -358,6 +358,19 @@ void stc_actor_done(int slot)
 }
 
 /****************************************************************************
+ * Name: stc_actor_forget
+ ****************************************************************************/
+
+void stc_actor_forget(int slot)
+{
+	if (slot >= 0 && slot < STC_MAX_ACTORS) {
+		g_stc_actor[slot].spawned = false;
+		g_stc_actor[slot].finished = true;
+		g_stc_actor[slot].pid = 0;
+	}
+}
+
+/****************************************************************************
  * Name: stc_wait_stage
  ****************************************************************************/
 

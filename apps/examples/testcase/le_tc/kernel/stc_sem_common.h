@@ -198,6 +198,14 @@ void stc_stage(int slot, uint8_t stage);
 
 void stc_actor_done(int slot);
 
+/* Drop a slot from the actor table without deleting anything.  Used by the
+ * scenarios that delete a blocked actor on purpose: that actor never reaches
+ * its exit point, and without this it would be reported as a leaked actor by
+ * the very teardown check that exists to catch accidental leaks.
+ */
+
+void stc_actor_forget(int slot);
+
 /* Harness observation ------------------------------------------------------ */
 
 /* Bounded wait until the actor in slot reaches at least the given stage.

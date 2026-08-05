@@ -166,6 +166,7 @@ int tc_kernel_main(int argc, char *argv[])
 #ifdef CONFIG_TC_KERNEL_SEM_SCENARIO
 	stc_sem_inherit_main();
 	stc_sem_monitor_main();
+	stc_sem_cancel_main();
 #endif
 
 #ifdef CONFIG_TC_KERNEL_SIGNAL
