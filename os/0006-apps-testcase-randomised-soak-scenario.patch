@@ -1,0 +1,463 @@
+From 1f29c15cc0f40208b194f927077beb7065e1e0d1 Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_sched_tc_fixed <>
+Date: Wed, 5 Aug 2026 19:27:44 +0000
+Subject: [PATCH] apps/examples/testcase: add randomised soak scenario
+
+Phase 6, and the last of the scenario test rollout.
+
+Every other scenario sets up one arrangement and checks one outcome.  That
+is what makes them diagnostic, and it is also their limit: they only ever
+visit the states somebody thought to write down.  The soak does the
+opposite, running a long sequence of randomised workloads that vary task
+count, priority spread and affinity, and checking the same small set of
+invariants after each round.  It is not trying to localise a defect; it is
+trying to reach a state no fixed scenario would.
+
+The starvation monitor runs throughout, so a violation is attributed to the
+round that produced it.  On failure the round's full parameters are printed,
+worker by worker, which is usually enough to turn a soak failure into a
+reproducible fixed scenario.  The generator is deliberately deterministic
+and its seed is printed at the start, because a soak failure is only useful
+if the sequence can be replayed.
+
+Fairness is only asserted for rounds where every worker happened to share a
+priority, since that is the only arrangement in which equal shares are the
+correct outcome, and the threshold is looser than the dedicated round-robin
+scenarios use because a soak round is shorter and its masks are arbitrary.
+
+The soak has its own Kconfig symbol separate from the rest of the scenario
+tier, so that enabling the scenarios does not silently enable a run lasting
+minutes.  Duration is configurable and defaults to sixty seconds; the
+catalogue figure for a nightly job is 1800.
+
+Both the SMP and non-SMP compilation paths are warning free under -Wall
+-Wextra.
+---
+ apps/examples/testcase/le_tc/kernel/Kconfig   |  22 ++
+ apps/examples/testcase/le_tc/kernel/Make.defs |   3 +
+ .../testcase/le_tc/kernel/kernel_tc_main.c    |   4 +
+ .../testcase/le_tc/kernel/stc_sched_soak.c    | 338 ++++++++++++++++++
+ .../testcase/le_tc/kernel/tc_internal.h       |   1 +
+ 5 files changed, 368 insertions(+)
+ create mode 100644 apps/examples/testcase/le_tc/kernel/stc_sched_soak.c
+
+diff --git a/apps/examples/testcase/le_tc/kernel/Kconfig b/apps/examples/testcase/le_tc/kernel/Kconfig
+index 6dcea0c2..c57aef95 100644
+--- a/apps/examples/testcase/le_tc/kernel/Kconfig
++++ b/apps/examples/testcase/le_tc/kernel/Kconfig
+@@ -272,5 +272,27 @@ config STC_KERNEL_SCHED
+ 		selected by TC_KN_ALL; enable them for a nightly or on demand run
+ 		rather than for a per commit gate.
+ 
++config STC_KERNEL_SCHED_SOAK
++	bool "STC Sched soak (long running)"
++	default n
++	depends on STC_KERNEL_SCHED
++	---help---
++		Randomised mixed workload soak for the scheduler.
++
++		This runs for minutes rather than seconds and is intended for a
++		nightly job, not for an interactive run.  It varies task count,
++		priority spread and affinity on every round and checks the same
++		invariants after each, so it reaches combinations that the fixed
++		scenarios do not enumerate.
++
++config STC_SCHED_SOAK_SECONDS
++	int "Soak duration in seconds"
++	default 60
++	depends on STC_KERNEL_SCHED_SOAK
++	---help---
++		Total wall clock duration of the soak.  The catalogue figure for
++		a nightly run is 1800.  The default is deliberately short so
++		that enabling the soak by accident does not stall a run.
++
+ endif #EXAMPLES_TESTCASE_KERNEL
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/Make.defs b/apps/examples/testcase/le_tc/kernel/Make.defs
+index 5edc6d63..be6d1daa 100644
+--- a/apps/examples/testcase/le_tc/kernel/Make.defs
++++ b/apps/examples/testcase/le_tc/kernel/Make.defs
+@@ -191,6 +191,9 @@ ifeq ($(CONFIG_STC_KERNEL_SCHED),y)
+   CSRCS += stc_sched_blocking.c
+   CSRCS += stc_sched_lifecycle.c
+ endif
++ifeq ($(CONFIG_STC_KERNEL_SCHED_SOAK),y)
++  CSRCS += stc_sched_soak.c
++endif
+ 
+ # Include kernel build support
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+index ae6a167d..7181874a 100644
+--- a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
++++ b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+@@ -237,6 +237,10 @@ int tc_kernel_main(int argc, char *argv[])
+ 	stc_sched_lifecycle_main();
+ #endif
+ 
++#ifdef CONFIG_STC_KERNEL_SCHED_SOAK
++	stc_sched_soak_main();
++#endif
++
+ 	close(g_tc_fd);
+ 	g_tc_fd = -1;
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_soak.c b/apps/examples/testcase/le_tc/kernel/stc_sched_soak.c
+new file mode 100644
+index 00000000..950b5971
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_soak.c
+@@ -0,0 +1,338 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file stc_sched_soak.c
++
++/// @brief Soak scenario (family I)
++///
++/// Every other scenario in the suite sets up one arrangement and checks one
++/// outcome.  That is what makes them diagnostic, and it is also their limit:
++/// they only ever visit the states somebody thought to write down.
++///
++/// The soak does the opposite.  It runs a long sequence of randomised
++/// workloads, varying the number of tasks, their priorities and their
++/// affinity masks, and after each one checks the same small set of
++/// invariants.  It is not trying to localise a defect; it is trying to reach
++/// a state that no fixed scenario would.
++///
++/// The starvation monitor runs throughout, so a violation is caught in
++/// whichever round produced it and the parameters of that round are printed,
++/// which is usually enough to turn a soak failure into a reproducible fixed
++/// scenario.
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdbool.h>
++#include <unistd.h>
++#include <time.h>
++#include <sched.h>
++
++#include "tc_internal.h"
++#include "stc_sched_common.h"
++#include "stc_sched_monitor.h"
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++/* Total duration.  The catalogue calls for thirty minutes, which belongs in
++ * a nightly job rather than in an interactive run, so the figure is a
++ * Kconfig value with a short default.  Set CONFIG_STC_SCHED_SOAK_SECONDS to
++ * 1800 for the nightly.
++ */
++
++#ifdef CONFIG_STC_SCHED_SOAK_SECONDS
++#define STC_SOAK_SECONDS        CONFIG_STC_SCHED_SOAK_SECONDS
++#else
++#define STC_SOAK_SECONDS        60
++#endif
++
++/* Length of one round.  Short enough that a soak visits many arrangements,
++ * long enough that each one spans a useful number of round-robin slices.
++ */
++
++#define STC_SOAK_ROUND_MS       1000
++
++/* Fairness floor applied only to rounds where every worker shares one
++ * priority, since that is the only case where equal shares are the correct
++ * outcome.  Looser than the dedicated round-robin scenarios use, because a
++ * soak round is shorter and its affinity masks are arbitrary.
++ */
++
++#define STC_SOAK_FAIR_PCT       25
++
++/****************************************************************************
++ * Private Data
++ ****************************************************************************/
++
++static unsigned int g_soak_seed;
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_soak_rand
++ *
++ * Description:
++ *   Small deterministic generator.  Deterministic on purpose: a soak failure
++ *   is only useful if the sequence that produced it can be replayed, and the
++ *   seed is printed at the start of the run for exactly that reason.
++ *
++ ****************************************************************************/
++
++static unsigned int stc_soak_rand(unsigned int limit)
++{
++	g_soak_seed = g_soak_seed * 1103515245u + 12345u;
++
++	if (limit == 0) {
++		return 0;
++	}
++
++	return (g_soak_seed >> 16) % limit;
++}
++
++/****************************************************************************
++ * Name: stc_soak_build_round
++ *
++ * Description:
++ *   Chooses the parameters for one round: how many workers, whether they all
++ *   share a priority or form a ladder, and whether each is pinned.
++ *
++ *   Returns true when every worker ended up at the same priority, which is
++ *   the only case in which a fairness comparison is meaningful.
++ *
++ ****************************************************************************/
++
++static bool stc_soak_build_round(struct stc_workload_s *wl, int *prios,
++				 cpu_set_t *masks, int ncpus)
++{
++	bool equal_priority;
++	int nworkers;
++	int i;
++
++	/* Between one and two more workers than there are CPUs, so both the
++	 * undersubscribed and the oversubscribed cases occur.
++	 */
++
++	nworkers = 1 + (int)stc_soak_rand((unsigned int)(ncpus + 2));
++	if (nworkers > STC_MAX_WORKERS) {
++		nworkers = STC_MAX_WORKERS;
++	}
++
++	equal_priority = (stc_soak_rand(2) == 0);
++
++	for (i = 0; i < nworkers; i++) {
++		if (equal_priority) {
++			prios[i] = SCHED_PRIORITY_DEFAULT;
++		} else {
++			prios[i] = SCHED_PRIORITY_DEFAULT +
++				   (int)stc_soak_rand(30);
++		}
++
++		/* Roughly a third of workers get pinned, the rest are left for
++		 * the scheduler to place.  A mask of zero means unpinned, so
++		 * that is also the correct value without SMP, where there is
++		 * nothing to pin to.
++		 */
++
++		masks[i] = 0;
++
++#ifdef CONFIG_SMP
++		if (stc_soak_rand(3) == 0) {
++			CPU_SET((int)stc_soak_rand((unsigned int)ncpus),
++				&masks[i]);
++		}
++#else
++		(void)stc_soak_rand(3);
++#endif
++	}
++
++	stc_workload_init(wl, nworkers, SCHED_PRIORITY_DEFAULT, SCHED_RR);
++	wl->window_ms = STC_SOAK_ROUND_MS;
++	wl->priorities = prios;
++	wl->affinities = masks;
++
++	return equal_priority;
++}
++
++/****************************************************************************
++ * Name: stc_sched_soak01_randomised_mixed_load
++ *
++ * @testcase             :stc_sched_soak01_randomised_mixed_load
++ * @brief                :SCN-SOAK-01, randomised mixed workload over time
++ * @scenario             :Run repeated one second rounds, each with a
++ *                        randomly chosen number of workers, a randomly
++ *                        chosen priority arrangement and randomly chosen
++ *                        affinity masks, with the starvation monitor running
++ *                        throughout.  After every round check the same
++ *                        invariants: the workload ran, every worker at the
++ *                        top priority made progress, no task was passed over
++ *                        for longer than the monitor's grace period, and in
++ *                        rounds where all workers shared a priority the
++ *                        shares were not wildly uneven.
++ *                        The value of this scenario is coverage rather than
++ *                        diagnosis.  It reaches combinations of task count,
++ *                        priority spread and pinning that no fixed scenario
++ *                        enumerates, and defects in the scheduler tend to
++ *                        live in exactly those combinations.  The generator
++ *                        is deterministic and its seed is printed, so a
++ *                        failing run can be replayed rather than merely
++ *                        reported.
++ * @apicovered           :task_create, sched_setscheduler, sched_setaffinity,
++ *                        sched_foreach via the test driver
++ * @precondition         :CONFIG_RR_INTERVAL greater than zero
++ * @postcondition        :monitor stopped, all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_soak01_randomised_mixed_load(void)
++{
++	struct stc_workload_s wl;
++	struct timespec start;
++	struct timespec now;
++	int prios[STC_MAX_WORKERS];
++	cpu_set_t masks[STC_MAX_WORKERS];
++	int ncpus = stc_ncpus();
++	uint32_t elapsed_ms = 0;
++	uint32_t budget_ms = (uint32_t)STC_SOAK_SECONDS * 1000;
++	int rounds = 0;
++	int failed_round = -1;
++	int fail_reason = 0;
++	int mon_started;
++	int top_prio;
++	bool equal_priority;
++	int i;
++
++	g_soak_seed = 20260804u;
++
++	printf("[SCN-SOAK-01] duration=%ds round=%dms seed=%u ncpus=%d\n",
++	       STC_SOAK_SECONDS, STC_SOAK_ROUND_MS, g_soak_seed, ncpus);
++
++	mon_started = stc_monitor_start(SCHED_PRIORITY_DEFAULT);
++
++	(void)clock_gettime(CLOCK_REALTIME, &start);
++
++	while (elapsed_ms < budget_ms && failed_round < 0) {
++		equal_priority = stc_soak_build_round(&wl, prios, masks,
++						      ncpus);
++
++		if (stc_run_workload(&wl) != OK) {
++			failed_round = rounds;
++			fail_reason = 1;
++			break;
++		}
++
++		/* Whatever the arrangement, the highest priority workers must
++		 * have made progress.
++		 */
++
++		top_prio = prios[0];
++		for (i = 1; i < wl.nworkers; i++) {
++			if (prios[i] > top_prio) {
++				top_prio = prios[i];
++			}
++		}
++
++		for (i = 0; i < wl.nworkers; i++) {
++			if (prios[i] == top_prio && stc_count(i) == 0) {
++				failed_round = rounds;
++				fail_reason = 2;
++			}
++		}
++
++		/* Equal priority rounds should also be roughly fair. */
++
++		if (failed_round < 0 && equal_priority &&
++		    stc_fair_pct(wl.nworkers) < STC_SOAK_FAIR_PCT) {
++			failed_round = rounds;
++			fail_reason = 3;
++		}
++
++		if (failed_round < 0 && stc_monitor_violations() != 0) {
++			failed_round = rounds;
++			fail_reason = 4;
++		}
++
++		if (failed_round >= 0) {
++			printf("[SCN-SOAK-01] round %d failed, reason=%d "
++			       "nworkers=%d equal_prio=%d fair=%d%%\n",
++			       rounds, fail_reason, wl.nworkers,
++			       (int)equal_priority,
++			       stc_fair_pct(wl.nworkers));
++
++			for (i = 0; i < wl.nworkers; i++) {
++				printf("[SCN-SOAK-01]   w%d prio=%d mask=0x%x "
++				       "count=%u\n", i, prios[i],
++				       (unsigned int)masks[i],
++				       (unsigned int)stc_count(i));
++			}
++		}
++
++		rounds++;
++
++		(void)clock_gettime(CLOCK_REALTIME, &now);
++		elapsed_ms = stc_elapsed_ms(&start, &now);
++	}
++
++	if (mon_started == OK) {
++		(void)stc_monitor_stop();
++	}
++
++	printf("[SCN-SOAK-01] rounds=%d elapsed=%ums\n", rounds,
++	       (unsigned int)elapsed_ms);
++	stc_monitor_report("SCN-SOAK-01");
++
++	TC_ASSERT_EQ("soak01_monitor_start", mon_started, OK);
++
++	/* The soak actually did something. */
++
++	TC_ASSERT_GT("soak01_rounds_run", rounds, 0);
++
++	/* No round tripped an invariant. */
++
++	TC_ASSERT_EQ("soak01_no_failed_round", failed_round, -1);
++
++	TC_ASSERT_EQ("soak01_no_starvation", stc_monitor_violations(), 0);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_sched_soak_main
++ ****************************************************************************/
++
++int stc_sched_soak_main(void)
++{
++	printf("[SCN-SOAK] soak scenario, ncpus=%d\n", stc_ncpus());
++
++	stc_sched_soak01_randomised_mixed_load();
++
++	return 0;
++}
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_internal.h b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+index 55469400..b5fc6256 100644
+--- a/apps/examples/testcase/le_tc/kernel/tc_internal.h
++++ b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+@@ -108,6 +108,7 @@ int stc_sched_lock_main(void);
+ int stc_sched_inversion_main(void);
+ int stc_sched_blocking_main(void);
+ int stc_sched_lifecycle_main(void);
++int stc_sched_soak_main(void);
+ int tc_get_drvfd(void);
+ 
+ #endif /* __EXAMPLES_TESTCASE_KERNEL_TC_INTERNAL_H */
+-- 
+2.43.0
+
