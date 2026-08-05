@@ -3,14 +3,13 @@
 # see kconfig-language at https://www.kernel.org/doc/Documentation/kbuild/kconfig-language.txt
 #
 
-config EXAMPLES_FOTA_SAMPLE
-	bool "FOTA Sample Application"
+config EXAMPLES_SSTORAGE
+	bool "Secure Storage example"
 	default n
-	select SYSTEM_FOTA_HAL
-	select FOTA_DRIVER
+	depends on SE_AMEBA || SE_ARMINO
 	---help---
-		Enable FOTA Sample Application with FOTA HAL.
+		Enable the Secure Storage example
 
 config USER_ENTRYPOINT
 	string
-	default "fota_sample" if ENTRY_FOTA_SAMPLE
+	default "sstorage" if ENTRY_SSTORAGE

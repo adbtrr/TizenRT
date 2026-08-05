@@ -1,6 +1,6 @@
 ###########################################################################
 #
-# Copyright 2016 Samsung Electronics All Rights Reserved.
+# Copyright 2022 Samsung Electronics All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,9 +16,9 @@
 #
 ###########################################################################
 ############################################################################
-# apps/system/fota_hal/Makefile
+# apps/examples/board_specific_demo/secure_storage_demo/Makefile
 #
-#   Copyright (C) 2013 Gregory Nutt. All rights reserved.
+#   Copyright (C) 2008, 2010-2013 Gregory Nutt. All rights reserved.
 #   Author: Gregory Nutt <gnutt@nuttx.org>
 #
 # Redistribution and use in source and binary forms, with or without
@@ -54,9 +54,31 @@
 -include $(TOPDIR)/Make.defs
 include $(APPDIR)/Make.defs
 
+# Secure Storage built-in application info
+
+APPNAME = sstorage
+FUNCNAME = $(APPNAME)_main
+THREADEXEC = TASH_EXECMD_ASYNC
+
+# Secure Storage Example
+
 ASRCS =
-CSRCS = fota_hal.c
-MAINSRC =
+CSRCS =
+MAINSRC = secure_storage.c
+
+# Include board-specific headers based on configuration
+# Note: The -include flag includes the file at the beginning of compilation
+# If board-specific headers need to be included at the end, 
+# the source file should be modified instead
+ifeq ($(CONFIG_ARCH_CHIP_BK7239N),y)
+CFLAGS += -include armino.h
+else ifeq ($(CONFIG_AMEBAD_TRUSTZONE),y)
+CFLAGS += -include ameba.h
+else ifeq ($(CONFIG_AMEBALITE_TRUSTZONE),y)
+CFLAGS += -include ameba.h
+else ifeq ($(CONFIG_AMEBASMART_TRUSTZONE),y)
+CFLAGS += -include ameba.h
+endif
 
 AOBJS = $(ASRCS:.S=$(OBJEXT))
 COBJS = $(CSRCS:.c=$(OBJEXT))
@@ -70,12 +92,12 @@ ifneq ($(CONFIG_BUILD_KERNEL),y)
 endif
 
 ifeq ($(CONFIG_WINDOWS_NATIVE),y)
-  BIN = ..\..\libapps$(LIBEXT)
+  BIN = $(APPDIR)\libapps$(LIBEXT)
 else
 ifeq ($(WINTOOL),y)
-  BIN = ..\\..\\libapps$(LIBEXT)
+  BIN = $(APPDIR)\\libapps$(LIBEXT)
 else
-  BIN = ../../libapps$(LIBEXT)
+  BIN = $(APPDIR)/libapps$(LIBEXT)
 endif
 endif
 
@@ -85,7 +107,8 @@ else
   INSTALL_DIR = $(BIN_DIR)
 endif
 
-PROGNAME =
+CONFIG_EXAMPLES_SSTORAGE_PROGNAME ?= sstorage$(EXEEXT)
+PROGNAME = $(CONFIG_EXAMPLES_SSTORAGE_PROGNAME)
 
 ROOTDEPPATH = --dep-path .
 
@@ -94,7 +117,7 @@ ROOTDEPPATH = --dep-path .
 VPATH =
 
 all: .built
-.PHONY: depend clean distclean
+.PHONY: clean depend distclean
 
 $(AOBJS): %$(OBJEXT): %.S
 	$(call ASSEMBLE, $<, $@)
@@ -104,7 +127,7 @@ $(COBJS) $(MAINOBJ): %$(OBJEXT): %.c
 
 .built: $(OBJS)
 	$(call ARCHIVE, $(BIN), $(OBJS))
-	$(Q) touch .built
+	@touch .built
 
 ifeq ($(CONFIG_BUILD_KERNEL),y)
 $(BIN_DIR)$(DELIM)$(PROGNAME): $(OBJS) $(MAINOBJ)
@@ -119,15 +142,20 @@ install:
 
 endif
 
-# Register application
+ifeq ($(CONFIG_BUILTIN_APPS)$(CONFIG_EXAMPLES_SSTORAGE),yy)
+$(BUILTIN_REGISTRY)$(DELIM)$(FUNCNAME).bdat: $(DEPCONFIG) Makefile
+	$(Q) $(call REGISTER,$(APPNAME),$(FUNCNAME),$(THREADEXEC),$(PRIORITY),$(STACKSIZE))
 
+context: $(BUILTIN_REGISTRY)$(DELIM)$(FUNCNAME).bdat
+
+else
 context:
 
-# Create dependencies
+endif
 
 .depend: Makefile $(SRCS)
-	$(Q) $(MKDEP) $(ROOTDEPPATH) "$(CC)" -- $(CFLAGS) -- $(SRCS) >Make.dep
-	$(Q) touch $@
+	@$(MKDEP) $(ROOTDEPPATH) "$(CC)" -- $(CFLAGS) -- $(SRCS) >Make.dep
+	@touch $@
 
 depend: .depend
 
