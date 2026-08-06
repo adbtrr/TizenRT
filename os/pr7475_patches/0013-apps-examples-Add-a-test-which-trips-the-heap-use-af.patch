@@ -1,0 +1,590 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_pr_fixes_use <>
+Date: Thu, 6 Aug 2026 13:10:10 +0000
+Subject: [PATCH] apps/examples: Add a test which trips the heap use-after-free
+ detector
+
+Nothing in the tree exercised the detector, so there was no way to tell
+whether it reports on a given board, and no way to notice if it stopped
+reporting.
+
+Add an example which writes into freed heap memory in each of the
+shapes the detector is meant to catch, and prints what should have
+happened for each one:
+
+  1. Write into a chunk still on the free list. Caught by DEBUG_MM_UAF
+     on its own.
+  2. Write to the first word of a freed block. Inside the free node
+     bookkeeping, so it needs DEBUG_MM_QUARANTINE, which covers the
+     whole payload of a held chunk.
+  3. Write after another allocation has taken the block. Needs
+     DEBUG_MM_QUARANTINE; without it the address already belongs to the
+     new owner.
+  4. Free the same block twice.
+  5. Ordinary allocation traffic, which must stay silent.
+
+Case 5 is the one that matters most: a detector which reports on
+correct code is worse than no detector, so any output during that case
+is a failure. Cases 2 and 3 print a different expectation depending on
+whether the quarantine is configured, so the same binary documents
+what each option buys.
+
+The test corrupts the heap deliberately and says so.
+---
+ apps/examples/mm_uaf_test/Kconfig       |  20 ++
+ apps/examples/mm_uaf_test/Kconfig_ENTRY |   3 +
+ apps/examples/mm_uaf_test/Make.defs     |  21 ++
+ apps/examples/mm_uaf_test/Makefile      | 122 ++++++++++
+ apps/examples/mm_uaf_test/README.txt    |  34 +++
+ apps/examples/mm_uaf_test/mm_uaf_test.c | 307 ++++++++++++++++++++++++
+ 6 files changed, 507 insertions(+)
+ create mode 100644 apps/examples/mm_uaf_test/Kconfig
+ create mode 100644 apps/examples/mm_uaf_test/Kconfig_ENTRY
+ create mode 100644 apps/examples/mm_uaf_test/Make.defs
+ create mode 100644 apps/examples/mm_uaf_test/Makefile
+ create mode 100644 apps/examples/mm_uaf_test/README.txt
+ create mode 100644 apps/examples/mm_uaf_test/mm_uaf_test.c
+
+diff --git a/apps/examples/mm_uaf_test/Kconfig b/apps/examples/mm_uaf_test/Kconfig
+new file mode 100644
+index 00000000..52fad866
+--- /dev/null
++++ b/apps/examples/mm_uaf_test/Kconfig
+@@ -0,0 +1,20 @@
++#
++# For a description of the syntax of this configuration file,
++# see kconfig-language at https://www.kernel.org/doc/Documentation/kbuild/kconfig-language.txt
++#
++
++config EXAMPLES_MM_UAF_TEST
++	bool "Example which trips the heap use-after-free detector"
++	default n
++	depends on DEBUG_MM_UAF
++	---help---
++		Writes into heap memory which has already been freed, in each of the
++		shapes the detector is meant to catch, and prints what was expected of
++		each one. Use it to confirm that DEBUG_MM_UAF, and DEBUG_MM_QUARANTINE
++		if it is enabled, actually report on this board.
++
++		The test corrupts the heap on purpose. Do not enable it in a product.
++
++config USER_ENTRYPOINT
++	string
++	default "uaftest_main" if ENTRY_MM_UAF_TEST
+diff --git a/apps/examples/mm_uaf_test/Kconfig_ENTRY b/apps/examples/mm_uaf_test/Kconfig_ENTRY
+new file mode 100644
+index 00000000..e97bfb33
+--- /dev/null
++++ b/apps/examples/mm_uaf_test/Kconfig_ENTRY
+@@ -0,0 +1,3 @@
++config ENTRY_MM_UAF_TEST
++	bool "Heap use-after-free detector test"
++	depends on EXAMPLES_MM_UAF_TEST
+diff --git a/apps/examples/mm_uaf_test/Make.defs b/apps/examples/mm_uaf_test/Make.defs
+new file mode 100644
+index 00000000..d693f234
+--- /dev/null
++++ b/apps/examples/mm_uaf_test/Make.defs
+@@ -0,0 +1,21 @@
++###########################################################################
++#
++# Copyright 2026 Samsung Electronics All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++# either express or implied. See the License for the specific
++# language governing permissions and limitations under the License.
++#
++###########################################################################
++
++ifeq ($(CONFIG_EXAMPLES_MM_UAF_TEST),y)
++CONFIGURED_APPS += examples/mm_uaf_test
++endif
+diff --git a/apps/examples/mm_uaf_test/Makefile b/apps/examples/mm_uaf_test/Makefile
+new file mode 100644
+index 00000000..29cf298b
+--- /dev/null
++++ b/apps/examples/mm_uaf_test/Makefile
+@@ -0,0 +1,122 @@
++###########################################################################
++#
++# Copyright 2026 Samsung Electronics All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++# either express or implied. See the License for the specific
++# language governing permissions and limitations under the License.
++#
++###########################################################################
++
++-include $(TOPDIR)/.config
++-include $(TOPDIR)/Make.defs
++include $(APPDIR)/Make.defs
++
++# built-in application info
++
++APPNAME = uaftest
++FUNCNAME = $(APPNAME)_main
++THREADEXEC = TASH_EXECMD_ASYNC
++
++# Example which trips the heap use-after-free detector on purpose
++
++ASRCS =
++CSRCS =
++MAINSRC = mm_uaf_test.c
++
++AOBJS = $(ASRCS:.S=$(OBJEXT))
++COBJS = $(CSRCS:.c=$(OBJEXT))
++MAINOBJ = $(MAINSRC:.c=$(OBJEXT))
++
++SRCS = $(ASRCS) $(CSRCS) $(MAINSRC)
++OBJS = $(AOBJS) $(COBJS)
++
++ifneq ($(CONFIG_BUILD_KERNEL),y)
++  OBJS += $(MAINOBJ)
++endif
++
++ifeq ($(CONFIG_WINDOWS_NATIVE),y)
++  BIN = $(APPDIR)\libapps$(LIBEXT)
++else
++ifeq ($(WINTOOL),y)
++  BIN = $(APPDIR)\\libapps$(LIBEXT)
++else
++  BIN = $(APPDIR)/libapps$(LIBEXT)
++endif
++endif
++
++ifeq ($(WINTOOL),y)
++  INSTALL_DIR = "${shell cygpath -w $(BIN_DIR)}"
++else
++  INSTALL_DIR = $(BIN_DIR)
++endif
++
++CONFIG_EXAMPLES_MM_UAF_TEST_PROGNAME ?= uaftest$(EXEEXT)
++PROGNAME = $(CONFIG_EXAMPLES_MM_UAF_TEST_PROGNAME)
++
++ROOTDEPPATH = --dep-path .
++
++# Common build
++
++all: .built
++.PHONY: clean depend distclean
++
++$(AOBJS): %$(OBJEXT): %.S
++	$(call ASSEMBLE, $<, $@)
++
++$(COBJS) $(MAINOBJ): %$(OBJEXT): %.c
++	$(call COMPILE, $<, $@)
++
++.built: $(OBJS)
++	$(call ARCHIVE, $(BIN), $(OBJS))
++	@touch .built
++
++ifeq ($(CONFIG_BUILD_KERNEL),y)
++$(BIN_DIR)$(DELIM)$(PROGNAME): $(OBJS) $(MAINOBJ)
++	@echo "LD: $(PROGNAME)"
++	$(Q) $(LD) $(LDELFFLAGS) $(LDLIBPATH) -o $(INSTALL_DIR)$(DELIM)$(PROGNAME) $(ARCHCRT0OBJ) $(MAINOBJ) $(LDLIBS)
++	$(Q) $(NM) -u  $(INSTALL_DIR)$(DELIM)$(PROGNAME)
++
++install: $(BIN_DIR)$(DELIM)$(PROGNAME)
++
++else
++install:
++
++endif
++
++ifeq ($(CONFIG_BUILTIN_APPS)$(CONFIG_EXAMPLES_MM_UAF_TEST),yy)
++$(BUILTIN_REGISTRY)$(DELIM)$(FUNCNAME).bdat: $(DEPCONFIG) Makefile
++	$(call REGISTER,$(APPNAME),$(FUNCNAME),$(THREADEXEC))
++
++context: $(BUILTIN_REGISTRY)$(DELIM)$(APPNAME)_main.bdat
++
++else
++context:
++
++endif
++
++.depend: Makefile $(SRCS)
++	@$(MKDEP) $(ROOTDEPPATH) "$(CC)" -- $(CFLAGS) -- $(SRCS) >Make.dep
++	@touch $@
++
++depend: .depend
++
++clean:
++	$(call DELFILE, .built)
++	$(call CLEAN)
++
++distclean: clean
++	$(call DELFILE, Make.dep)
++	$(call DELFILE, .depend)
++
++-include Make.dep
++.PHONY: preconfig
++preconfig:
+diff --git a/apps/examples/mm_uaf_test/README.txt b/apps/examples/mm_uaf_test/README.txt
+new file mode 100644
+index 00000000..38f993d1
+--- /dev/null
++++ b/apps/examples/mm_uaf_test/README.txt
+@@ -0,0 +1,34 @@
++apps/examples/mm_uaf_test
++=========================
++
++Trips the heap use-after-free detector on purpose, in each of the shapes it
++is meant to catch, and prints what should have been reported for each one.
++
++Build with CONFIG_EXAMPLES_MM_UAF_TEST=y, which requires CONFIG_DEBUG_MM_UAF.
++Run it from TASH as "uaftest".
++
++Cases
++-----
++
++  1. Write into a chunk which is still on the free list.
++     Reported by DEBUG_MM_UAF on its own.
++
++  2. Write to the first word of a freed block.
++     Inside the free node bookkeeping, so DEBUG_MM_UAF on its own cannot see
++     it. Reported once DEBUG_MM_QUARANTINE is enabled, because a held chunk
++     is in no list and its whole payload carries the pattern.
++
++  3. Write after another allocation has taken the block.
++     Needs DEBUG_MM_QUARANTINE. Without it the address already belongs to the
++     new owner and no check of the contents can tell the two writers apart.
++
++  4. Free the same block twice.
++     Reported either way, but with DEBUG_MM_QUARANTINE the block is still
++     held, so the report names both callers.
++
++  5. Ordinary allocation traffic, which must stay silent. A detector which
++     reports on correct code is worse than no detector, so treat any output
++     during this case as a failure.
++
++The test leaves the heap corrupted on purpose. Reboot the board afterwards,
++and do not enable it in a product build.
+diff --git a/apps/examples/mm_uaf_test/mm_uaf_test.c b/apps/examples/mm_uaf_test/mm_uaf_test.c
+new file mode 100644
+index 00000000..52842637
+--- /dev/null
++++ b/apps/examples/mm_uaf_test/mm_uaf_test.c
+@@ -0,0 +1,307 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++/* Big enough to reach past the free node bookkeeping in every configuration,
++ * small enough to be taken by the quarantine with its default settings.
++ */
++
++#define TEST_SIZE	128
++
++#define STALE_VALUE	0xdeadbeef
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++static void banner(int n, FAR const char *what)
++{
++	printf("\n------------------------------------------------------------\n");
++	printf("Case %d: %s\n", n, what);
++	printf("------------------------------------------------------------\n");
++}
++
++/****************************************************************************
++ * Name: case_write_while_free
++ *
++ * Description:
++ *   The case the free list detector is built for. Free a block, write
++ *   through the stale pointer while nothing has taken the block yet, then
++ *   force the block to be consumed.
++ *
++ ****************************************************************************/
++
++static void case_write_while_free(void)
++{
++	FAR uint32_t *p;
++	FAR void *consume;
++
++	banner(1, "write into a chunk which is still on the free list");
++
++	p = (FAR uint32_t *)malloc(TEST_SIZE);
++	if (p == NULL) {
++		printf("  malloc failed, skipping\n");
++		return;
++	}
++
++	printf("  allocated %d bytes at %p\n", TEST_SIZE, p);
++	free(p);
++
++	/* Nobody has taken the chunk yet, so this lands in poisoned memory */
++
++	printf("  writing 0x%08x through the stale pointer\n", STALE_VALUE);
++	p[TEST_SIZE / sizeof(uint32_t) - 1] = STALE_VALUE;
++
++	printf("  forcing the chunk to be consumed\n");
++	consume = malloc(TEST_SIZE);
++
++	printf("  EXPECTED: one \"Use after free detected\" report above\n");
++
++	if (consume != NULL) {
++		free(consume);
++	}
++}
++
++/****************************************************************************
++ * Name: case_write_at_start_of_payload
++ *
++ * Description:
++ *   The same thing, but writing to the very first word of the freed block.
++ *   That is where a write to the first member of a freed object lands, and
++ *   it is inside the free node bookkeeping which the free list window cannot
++ *   cover. Only the quarantine reaches it.
++ *
++ ****************************************************************************/
++
++static void case_write_at_start_of_payload(void)
++{
++	FAR uint32_t *p;
++	FAR void *consume;
++
++	banner(2, "write to the first word of a freed block");
++
++	p = (FAR uint32_t *)malloc(TEST_SIZE);
++	if (p == NULL) {
++		printf("  malloc failed, skipping\n");
++		return;
++	}
++
++	printf("  allocated %d bytes at %p\n", TEST_SIZE, p);
++	free(p);
++
++	printf("  writing 0x%08x to offset 0\n", STALE_VALUE);
++	p[0] = STALE_VALUE;
++
++	consume = malloc(TEST_SIZE);
++
++#ifdef CONFIG_DEBUG_MM_QUARANTINE
++	printf("  EXPECTED: a report, because the quarantine covers the whole payload\n");
++#else
++	printf("  EXPECTED: no report. Offset 0 is inside the free list bookkeeping,\n");
++	printf("            which the free list window cannot cover. Enable\n");
++	printf("            DEBUG_MM_QUARANTINE to catch this one.\n");
++#endif
++
++	if (consume != NULL) {
++		free(consume);
++	}
++}
++
++/****************************************************************************
++ * Name: case_write_after_reallocation
++ *
++ * Description:
++ *   The case which needs the reuse of the chunk to be delayed. Free a block,
++ *   let something else allocate, and only then write through the stale
++ *   pointer. Without the quarantine the address already belongs to the new
++ *   owner and nothing can tell the two writers apart.
++ *
++ ****************************************************************************/
++
++static void case_write_after_reallocation(void)
++{
++	FAR uint32_t *stale;
++	FAR uint32_t *reused;
++#ifdef CONFIG_DEBUG_MM_QUARANTINE
++	int i;
++#endif
++
++	banner(3, "write after somebody else has allocated the block");
++
++	stale = (FAR uint32_t *)malloc(TEST_SIZE);
++	if (stale == NULL) {
++		printf("  malloc failed, skipping\n");
++		return;
++	}
++
++	printf("  allocated %d bytes at %p\n", TEST_SIZE, stale);
++	free(stale);
++
++	reused = (FAR uint32_t *)malloc(TEST_SIZE);
++	printf("  next allocation of the same size landed at %p\n", reused);
++
++	if (reused == stale) {
++		printf("  the same address came straight back, so the block was not held\n");
++	} else {
++		printf("  a different address came back, so the freed block is being held\n");
++	}
++
++	printf("  writing 0x%08x through the stale pointer\n", STALE_VALUE);
++	stale[0] = STALE_VALUE;
++	stale[TEST_SIZE / sizeof(uint32_t) - 1] = STALE_VALUE;
++
++#ifdef CONFIG_DEBUG_MM_QUARANTINE
++	printf("  churning the heap so the held block ages out\n");
++	for (i = 0; i < CONFIG_DEBUG_MM_QUARANTINE_CHUNKS + 4; i++) {
++		FAR void *tmp = malloc(TEST_SIZE);
++		if (tmp != NULL) {
++			free(tmp);
++		}
++	}
++
++	printf("  EXPECTED: a report naming the task which allocated the block\n");
++#else
++	printf("  EXPECTED: no report. The block already belongs to its new owner,\n");
++	printf("            so the write cannot be told apart from a valid one.\n");
++	printf("            Enable DEBUG_MM_QUARANTINE to catch this one.\n");
++#endif
++
++	if (reused != NULL) {
++		free(reused);
++	}
++}
++
++/****************************************************************************
++ * Name: case_double_free
++ *
++ * Description:
++ *   Free the same block twice. Without the quarantine this is caught only
++ *   while the block is still free. With it, the block is held and looks
++ *   allocated, so the quarantine scan is what reports it.
++ *
++ ****************************************************************************/
++
++static void case_double_free(void)
++{
++	FAR void *p;
++
++	banner(4, "free the same block twice");
++
++	p = malloc(TEST_SIZE);
++	if (p == NULL) {
++		printf("  malloc failed, skipping\n");
++		return;
++	}
++
++	printf("  allocated %d bytes at %p\n", TEST_SIZE, p);
++	free(p);
++	printf("  freeing it a second time\n");
++	free(p);
++
++	printf("  EXPECTED: a double free warning naming both callers\n");
++}
++
++/****************************************************************************
++ * Name: case_clean_traffic
++ *
++ * Description:
++ *   Ordinary allocation traffic which must not produce any report at all.
++ *   A detector which cries wolf is worse than none, so this is the case
++ *   which matters most.
++ *
++ ****************************************************************************/
++
++static void case_clean_traffic(void)
++{
++	FAR void *p[16];
++	int i;
++
++	banner(5, "well behaved traffic, which must stay silent");
++
++	for (i = 0; i < 16; i++) {
++		p[i] = malloc(16 << (i % 5));
++		if (p[i] != NULL) {
++			memset(p[i], i, 16 << (i % 5));
++		}
++	}
++
++	for (i = 0; i < 16; i += 2) {
++		free(p[i]);
++		p[i] = NULL;
++	}
++
++	for (i = 0; i < 16; i++) {
++		FAR void *q = realloc(p[i], 64 + i);
++		if (q != NULL) {
++			p[i] = q;
++		}
++	}
++
++	for (i = 0; i < 16; i++) {
++		free(p[i]);
++	}
++
++	printf("  EXPECTED: nothing reported between case 4 and here\n");
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++#ifdef CONFIG_BUILD_KERNEL
++int main(int argc, FAR char *argv[])
++#else
++int uaftest_main(int argc, char *argv[])
++#endif
++{
++	printf("\n############################################################\n");
++	printf("Heap use-after-free detector test\n");
++	printf("  DEBUG_MM_UAF        : enabled\n");
++#ifdef CONFIG_DEBUG_MM_QUARANTINE
++	printf("  DEBUG_MM_QUARANTINE : enabled (%d chunks, %d bytes)\n",
++		   CONFIG_DEBUG_MM_QUARANTINE_CHUNKS, CONFIG_DEBUG_MM_QUARANTINE_BYTES);
++#else
++	printf("  DEBUG_MM_QUARANTINE : disabled\n");
++#endif
++	printf("  poison window       : %d bytes\n", CONFIG_DEBUG_MM_UAF_POISON_SIZE);
++	printf("This test corrupts the heap on purpose. Reboot afterwards.\n");
++	printf("############################################################\n");
++
++	case_write_while_free();
++	case_write_at_start_of_payload();
++	case_write_after_reallocation();
++	case_double_free();
++	case_clean_traffic();
++
++	printf("\nDone. Compare each EXPECTED line with the reports above.\n");
++	return 0;
++}

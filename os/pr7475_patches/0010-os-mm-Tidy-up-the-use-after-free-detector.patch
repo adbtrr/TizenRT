@@ -1,0 +1,316 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_pr_fixes_use <>
+Date: Thu, 6 Aug 2026 13:03:29 +0000
+Subject: [PATCH] os/mm: Tidy up the use-after-free detector
+
+A collection of small cleanups with no change to what is detected:
+
+ - Give the disabled case empty macros in mm.h and drop the eight
+   #ifdef CONFIG_DEBUG_MM_UAF blocks from six hot allocator files.
+ - Pass the heap to the verify entry points and print the free node
+   list with the report. A corrupted chunk is very often a corrupted
+   free list, and that list is the first thing worth seeing.
+ - Drop the separator line printed before mm_dump_heap_region(), which
+   prints its own banner, so the report no longer starts with a doubled
+   rule.
+ - Include tinyara/arch.h. mfdbg() expands to a use of
+   up_interrupt_context() under CONFIG_BUILD_FLAT, which is declared
+   only there, and nothing else in this file's include chain reaches
+   it.
+ - Drop the include of mm_node.h. Nothing from it is used, and the
+   headers it pulls in are already included directly.
+ - Use FAR consistently between the declarations and the definitions.
+ - Write MM_UAF_PATTERN as 0xA5A5A5A5u so the constant is unsigned.
+ - Test the scan result as "i == nwords" rather than "i >= nwords" and
+   say in the comment that an empty range lands there too.
+ - Note in the Kconfig help that DEBUG_MM_HEAPINFO is worth enabling
+   alongside, and that the option changes behaviour rather than only
+   adding reporting, because allocations now come back holding the
+   pattern instead of recycled data.
+---
+ os/Kconfig.debug                | 10 ++++++++++
+ os/include/tinyara/mm/mm.h      | 13 ++++++++++---
+ os/mm/mm_heap/mm_addfreechunk.c |  2 --
+ os/mm/mm_heap/mm_free.c         |  8 ++------
+ os/mm/mm_heap/mm_malloc.c       |  4 +---
+ os/mm/mm_heap/mm_memalign.c     |  4 +---
+ os/mm/mm_heap/mm_realloc.c      |  8 ++------
+ os/mm/mm_heap/mm_shrinkchunk.c  |  4 +---
+ os/mm/mm_heap/mm_uaf.c          | 25 +++++++++++++------------
+ 9 files changed, 40 insertions(+), 38 deletions(-)
+
+diff --git a/os/Kconfig.debug b/os/Kconfig.debug
+index defcc7b1..1c846300 100644
+--- a/os/Kconfig.debug
++++ b/os/Kconfig.debug
+@@ -815,6 +815,16 @@ config DEBUG_MM_UAF
+ 		is left NULL, but a write of any other value, or a write to flink, is
+ 		not detected.
+ 
++		Enable DEBUG_MM_HEAPINFO as well. Without it mm_dump_node() has no
++		owning task and no allocating address to print, which is most of the
++		value of the report.
++
++		Note that this changes behaviour, not only reporting: memory returned
++		by malloc now starts out holding the pattern instead of whatever the
++		previous owner left there. That also exposes reads of uninitialised
++		heap memory, but code which happened to work by reading recycled data
++		will stop working.
++
+ if DEBUG_MM_UAF
+ 
+ config DEBUG_MM_UAF_POISON_SIZE
+diff --git a/os/include/tinyara/mm/mm.h b/os/include/tinyara/mm/mm.h
+index 99281bb7..fb3152ee 100644
+--- a/os/include/tinyara/mm/mm.h
++++ b/os/include/tinyara/mm/mm.h
+@@ -173,7 +173,7 @@
+ #define MM_REMAINDER_FREE_CALL_PID 	((pid_t)-1)
+ 
+ #ifdef CONFIG_DEBUG_MM_UAF
+-#define MM_UAF_PATTERN	0xA5A5A5A5
++#define MM_UAF_PATTERN	0xA5A5A5A5u
+ 
+ /* Round up to a whole poison word. The poisoned window only has to be 32-bit
+  * aligned, so rounding to the allocator granule with MM_ALIGN_UP() would give
+@@ -670,9 +670,16 @@ int mm_size2ndx(size_t size);
+ 
+ #ifdef CONFIG_DEBUG_MM_UAF
+ void mm_uaf_poison_range(FAR void *start, size_t nbytes);
+-void mm_uaf_verify_range(FAR struct mm_allocnode_s *node, FAR void *start, size_t nbytes);
++void mm_uaf_verify_range(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *node, FAR void *start, size_t nbytes);
+ void mm_uaf_poison(FAR struct mm_freenode_s *node);
+-void mm_uaf_verify(FAR struct mm_freenode_s *node);
++void mm_uaf_verify(FAR struct mm_heap_s *heap, FAR struct mm_freenode_s *node);
++#else
++/* Keep the call sites free of preprocessor noise when the detector is off */
++
++#define mm_uaf_poison_range(start, nbytes)
++#define mm_uaf_verify_range(heap, node, start, nbytes)
++#define mm_uaf_poison(node)
++#define mm_uaf_verify(heap, node)
+ #endif
+ 
+ void mm_dump_node(struct mm_allocnode_s *node, char *node_type);
+diff --git a/os/mm/mm_heap/mm_addfreechunk.c b/os/mm/mm_heap/mm_addfreechunk.c
+index 455731b3..a0455948 100644
+--- a/os/mm/mm_heap/mm_addfreechunk.c
++++ b/os/mm/mm_heap/mm_addfreechunk.c
+@@ -84,9 +84,7 @@ void mm_addfreechunk(FAR struct mm_heap_s *heap, FAR struct mm_freenode_s *node)
+ 	FAR struct mm_freenode_s *next;
+ 	FAR struct mm_freenode_s *prev;
+ 
+-#ifdef CONFIG_DEBUG_MM_UAF
+ 	mm_uaf_poison(node);
+-#endif
+ 
+ 	/* Convert the size to a nodelist index */
+ 
+diff --git a/os/mm/mm_heap/mm_free.c b/os/mm/mm_heap/mm_free.c
+index a5c7981f..19cb9f7b 100644
+--- a/os/mm/mm_heap/mm_free.c
++++ b/os/mm/mm_heap/mm_free.c
+@@ -215,13 +215,11 @@ static void mm_free_internal(FAR struct mm_heap_s *heap, FAR void *mem, mmaddres
+ 		DEBUGASSERT_MM_FREE_NODE(heap, next);
+ 		REMOVE_NODE_FROM_LIST(next);
+ 
+-#ifdef CONFIG_DEBUG_MM_UAF
+ 		/* Verify once 'next' is off the free list, before the merge rewrites
+ 		 * the sizes that bound the poisoned window.
+ 		 */
+ 
+-		mm_uaf_verify(next);
+-#endif
++		mm_uaf_verify(heap, next);
+ 
+ 		/* Then merge the two chunks */
+ 
+@@ -242,13 +240,11 @@ static void mm_free_internal(FAR struct mm_heap_s *heap, FAR void *mem, mmaddres
+ 		DEBUGASSERT_MM_FREE_NODE(heap, prev);
+ 		REMOVE_NODE_FROM_LIST(prev);
+ 
+-#ifdef CONFIG_DEBUG_MM_UAF
+ 		/* Verify once 'prev' is off the free list, before the merge rewrites
+ 		 * the sizes that bound the poisoned window.
+ 		 */
+ 
+-		mm_uaf_verify(prev);
+-#endif
++		mm_uaf_verify(heap, prev);
+ 
+ 		/* Then merge the two chunks */
+ 
+diff --git a/os/mm/mm_heap/mm_malloc.c b/os/mm/mm_heap/mm_malloc.c
+index 53b009f0..7b48e894 100644
+--- a/os/mm/mm_heap/mm_malloc.c
++++ b/os/mm/mm_heap/mm_malloc.c
+@@ -216,14 +216,12 @@ retry_after_gc:
+ 		DEBUGASSERT_MM_FREE_NODE(heap, node);
+ 		REMOVE_NODE_FROM_LIST(node);
+ 
+-#ifdef CONFIG_DEBUG_MM_UAF
+ 		/* Verify once the node is off the free list but before it is split.
+ 		 * Removal only rewrites the neighbours' flink/blink, never the poisoned
+ 		 * window, so the check sees exactly the same bytes as before.
+ 		 */
+ 
+-		mm_uaf_verify(node);
+-#endif
++		mm_uaf_verify(heap, node);
+ 
+ 		/* Check if we have to split the free node into one of the allocated
+ 		 * size and another smaller freenode.  In some cases, the remaining
+diff --git a/os/mm/mm_heap/mm_memalign.c b/os/mm/mm_heap/mm_memalign.c
+index 0bdc33e0..bcc54a26 100644
+--- a/os/mm/mm_heap/mm_memalign.c
++++ b/os/mm/mm_heap/mm_memalign.c
+@@ -220,11 +220,9 @@ retry_after_gc:
+ 		DEBUGASSERT_MM_FREE_NODE(heap, node);
+ 		REMOVE_NODE_FROM_LIST(node);
+ 
+-#ifdef CONFIG_DEBUG_MM_UAF
+ 		/* Verify once the node is off the free list but before it is split. */
+ 
+-		mm_uaf_verify(node);
+-#endif
++		mm_uaf_verify(heap, node);
+ 
+ 		/* Check if there is free space at the beginning of the aligned chunk */
+ 		if ((size_t)newnode - (size_t)node >= SIZEOF_MM_FREENODE) {
+diff --git a/os/mm/mm_heap/mm_realloc.c b/os/mm/mm_heap/mm_realloc.c
+index ea5d3b2e..b277bb94 100644
+--- a/os/mm/mm_heap/mm_realloc.c
++++ b/os/mm/mm_heap/mm_realloc.c
+@@ -261,13 +261,11 @@ FAR void *mm_realloc(FAR struct mm_heap_s *heap, FAR void *oldmem, size_t size,
+ 			DEBUGASSERT_MM_FREE_NODE(heap, prev);
+ 			REMOVE_NODE_FROM_LIST(prev);
+ 
+-#ifdef CONFIG_DEBUG_MM_UAF
+ 			/* Verify once 'prev' is off the free list, before its size is
+ 			 * adjusted and the user data is moved down into it.
+ 			 */
+ 
+-			mm_uaf_verify(prev);
+-#endif
++			mm_uaf_verify(heap, prev);
+ 
+ 			/* Extend the node into the previous free chunk */
+ 			/* Did we consume the entire preceding chunk? */
+@@ -323,11 +321,9 @@ FAR void *mm_realloc(FAR struct mm_heap_s *heap, FAR void *oldmem, size_t size,
+ 			DEBUGASSERT_MM_FREE_NODE(heap, next);
+ 			REMOVE_NODE_FROM_LIST(next);
+ 
+-#ifdef CONFIG_DEBUG_MM_UAF
+ 			/* Verify once 'next' is off the free list, before it is absorbed. */
+ 
+-			mm_uaf_verify(next);
+-#endif
++			mm_uaf_verify(heap, next);
+ 
+ 			/* Extend the node into the next chunk */
+ 			/* Did we consume the entire preceding chunk? */
+diff --git a/os/mm/mm_heap/mm_shrinkchunk.c b/os/mm/mm_heap/mm_shrinkchunk.c
+index 332c2f28..2269204e 100644
+--- a/os/mm/mm_heap/mm_shrinkchunk.c
++++ b/os/mm/mm_heap/mm_shrinkchunk.c
+@@ -107,11 +107,9 @@ void mm_shrinkchunk(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *node,
+ 		DEBUGASSERT_MM_FREE_NODE(heap, next);
+ 		REMOVE_NODE_FROM_LIST(next);
+ 
+-#ifdef CONFIG_DEBUG_MM_UAF
+ 		/* Verify once 'next' is off the free list, before it is absorbed. */
+ 
+-		mm_uaf_verify(next);
+-#endif
++		mm_uaf_verify(heap, next);
+ 
+ 		/* Create a new chunk that will hold both the next chunk and the
+ 		 * tailing memory from the aligned chunk.
+diff --git a/os/mm/mm_heap/mm_uaf.c b/os/mm/mm_heap/mm_uaf.c
+index 5cd028bc..028a1ae0 100644
+--- a/os/mm/mm_heap/mm_uaf.c
++++ b/os/mm/mm_heap/mm_uaf.c
+@@ -27,10 +27,9 @@
+ #include <assert.h>
+ #include <debug.h>
+ 
++#include <tinyara/arch.h>
+ #include <tinyara/mm/mm.h>
+ 
+-#include "mm_node.h"
+-
+ /****************************************************************************
+  * Private Data
+  ****************************************************************************/
+@@ -85,12 +84,12 @@ static bool g_uaf_reporting;
+  *
+  ****************************************************************************/
+ 
+-static size_t mm_uaf_area(struct mm_freenode_s *node, uint32_t **poison)
++static size_t mm_uaf_area(FAR struct mm_freenode_s *node, FAR uint32_t **poison)
+ {
+ 	size_t offset = MM_UAF_ALIGN_UP(SIZEOF_MM_FREENODE);
+ 	size_t nbytes;
+ 
+-	*poison = (uint32_t *)((char *)node + offset);
++	*poison = (FAR uint32_t *)((FAR char *)node + offset);
+ 
+ 	if (node->size <= offset) {
+ 		/* The chunk is all bookkeeping, there is no room for the pattern */
+@@ -150,15 +149,15 @@ void mm_uaf_poison_range(FAR void *start, size_t nbytes)
+  *   while it was not in use, which is a use-after-free by whoever owned it
+  *   before.
+  *
+- *   'node' is only used to describe the chunk in the report; the range does
+- *   not have to start at the node.
++ *   'node' and 'heap' are only used to describe the damage in the report; the
++ *   range does not have to start at the node.
+  *
+  *   NOTES:
+  *     (1) the caller must hold the MM semaphore.
+  *
+  ****************************************************************************/
+ 
+-void mm_uaf_verify_range(FAR struct mm_allocnode_s *node, FAR void *start, size_t nbytes)
++void mm_uaf_verify_range(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *node, FAR void *start, size_t nbytes)
+ {
+ 	FAR uint32_t *poison = (FAR uint32_t *)start;
+ 	size_t nwords = nbytes / sizeof(uint32_t);
+@@ -172,8 +171,10 @@ void mm_uaf_verify_range(FAR struct mm_allocnode_s *node, FAR void *start, size_
+ 		}
+ 	}
+ 
+-	if (i >= nwords) {
+-		/* The pattern is intact, nothing wrote into the chunk while free */
++	if (i == nwords) {
++		/* Every word still holds the pattern, so nothing wrote into the chunk
++		 * while it was free. An empty range lands here too.
++		 */
+ 
+ 		return;
+ 	}
+@@ -222,9 +223,9 @@ void mm_uaf_verify_range(FAR struct mm_allocnode_s *node, FAR void *start, size_
+ 
+ 	g_uaf_reporting = true;
+ 
+-	heap_dbg("#########################################################################################\n");
+ 	mfdbg("ERROR: Use after free detected.\n");
+ 	mm_dump_node(node, "FREE NODE");
++	mm_dump_heap_free_node_list(heap);
+ 	mm_dump_heap_region((uintptr_t)node, (uintptr_t)node + dumpsize);
+ 
+ 	g_uaf_reporting = false;
+@@ -288,11 +289,11 @@ void mm_uaf_poison(FAR struct mm_freenode_s *node)
+  *
+  ****************************************************************************/
+ 
+-void mm_uaf_verify(FAR struct mm_freenode_s *node)
++void mm_uaf_verify(FAR struct mm_heap_s *heap, FAR struct mm_freenode_s *node)
+ {
+ 	uint32_t *poison;
+ 	size_t nwords;
+ 
+ 	nwords = mm_uaf_area(node, &poison);
+-	mm_uaf_verify_range((FAR struct mm_allocnode_s *)node, poison, nwords * sizeof(uint32_t));
++	mm_uaf_verify_range(heap, (FAR struct mm_allocnode_s *)node, poison, nwords * sizeof(uint32_t));
+ }

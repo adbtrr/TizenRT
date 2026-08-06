@@ -1,0 +1,260 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_pr_fixes_use <>
+Date: Thu, 6 Aug 2026 13:01:55 +0000
+Subject: [PATCH] os/mm: Give the detector a range based poison and verify
+ primitive
+
+mm_uaf_poison() and mm_uaf_verify() derived the checked window inside
+themselves, from the free node layout, so they can only ever cover a
+chunk which is sitting on the free list. How much of a chunk may carry
+the pattern actually depends on why the chunk is not in use: one on the
+free list has to leave flink, blink and the free debug info alone,
+while a chunk held out of the free list entirely can carry the pattern
+across its whole user data area.
+
+Split the range out. mm_uaf_poison_range() and mm_uaf_verify_range()
+take an explicit start and length, and the existing node based
+functions become thin wrappers which pass the free list window. All
+seven call sites are untouched and the values they end up using are
+identical, so there is no behavioural or output change.
+
+This is what a later delayed reuse change needs in order to poison a
+whole payload while the free list path keeps its narrower window,
+without having to reopen every call site at that point.
+
+Also set *poison in mm_uaf_area() before the early return, so the
+wrappers always hand a valid pointer to the range helpers even for a
+chunk too small to carry any pattern.
+---
+ os/include/tinyara/mm/mm.h |   2 +
+ os/mm/mm_heap/mm_uaf.c     | 126 +++++++++++++++++++++++++++----------
+ 2 files changed, 94 insertions(+), 34 deletions(-)
+
+diff --git a/os/include/tinyara/mm/mm.h b/os/include/tinyara/mm/mm.h
+index ba255b74..99281bb7 100644
+--- a/os/include/tinyara/mm/mm.h
++++ b/os/include/tinyara/mm/mm.h
+@@ -669,6 +669,8 @@ void mm_addfreechunk(FAR struct mm_heap_s *heap, FAR struct mm_freenode_s *node)
+ int mm_size2ndx(size_t size);
+ 
+ #ifdef CONFIG_DEBUG_MM_UAF
++void mm_uaf_poison_range(FAR void *start, size_t nbytes);
++void mm_uaf_verify_range(FAR struct mm_allocnode_s *node, FAR void *start, size_t nbytes);
+ void mm_uaf_poison(FAR struct mm_freenode_s *node);
+ void mm_uaf_verify(FAR struct mm_freenode_s *node);
+ #endif
+diff --git a/os/mm/mm_heap/mm_uaf.c b/os/mm/mm_heap/mm_uaf.c
+index 1699b9ea..5cd028bc 100644
+--- a/os/mm/mm_heap/mm_uaf.c
++++ b/os/mm/mm_heap/mm_uaf.c
+@@ -90,6 +90,8 @@ static size_t mm_uaf_area(struct mm_freenode_s *node, uint32_t **poison)
+ 	size_t offset = MM_UAF_ALIGN_UP(SIZEOF_MM_FREENODE);
+ 	size_t nbytes;
+ 
++	*poison = (uint32_t *)((char *)node + offset);
++
+ 	if (node->size <= offset) {
+ 		/* The chunk is all bookkeeping, there is no room for the pattern */
+ 
+@@ -101,8 +103,6 @@ static size_t mm_uaf_area(struct mm_freenode_s *node, uint32_t **poison)
+ 		nbytes = CONFIG_DEBUG_MM_UAF_POISON_SIZE;
+ 	}
+ 
+-	*poison = (uint32_t *)((char *)node + offset);
+-
+ 	return nbytes / sizeof(uint32_t);
+ }
+ 
+@@ -111,56 +111,61 @@ static size_t mm_uaf_area(struct mm_freenode_s *node, uint32_t **poison)
+  ****************************************************************************/
+ 
+ /****************************************************************************
+- * Name: mm_uaf_poison
++ * Name: mm_uaf_poison_range
+  *
+  * Description:
+- *   Fill the data area of a chunk which is about to enter the free list with
+- *   the poison pattern. Called for every chunk which becomes free, so that
+- *   mm_uaf_verify() has a known content to compare against.
++ *   Fill an explicit range with the poison pattern.
++ *
++ *   The range is given rather than derived from the node, because how much of
++ *   a chunk may carry the pattern depends on why the chunk is not in use. A
++ *   chunk on the free list has to leave its flink, blink and free debug info
++ *   alone, while a chunk which is held out of the free list altogether can
++ *   carry the pattern across its whole user data area.
++ *
++ *   'nbytes' is truncated to whole words, so nothing outside the range is
++ *   written.
+  *
+  *   NOTES:
+- *     (1) node->size must already be set to its final value.
+- *     (2) the caller must hold the MM semaphore.
++ *     (1) the caller must hold the MM semaphore.
+  *
+  ****************************************************************************/
+ 
+-void mm_uaf_poison(struct mm_freenode_s *node)
++void mm_uaf_poison_range(FAR void *start, size_t nbytes)
+ {
+-	uint32_t *poison;
+-	size_t nwords;
++	FAR uint32_t *poison = (FAR uint32_t *)start;
++	size_t nwords = nbytes / sizeof(uint32_t);
+ 	size_t i;
+ 
+-	nwords = mm_uaf_area(node, &poison);
+ 	for (i = 0; i < nwords; i++) {
+ 		poison[i] = MM_UAF_PATTERN;
+ 	}
+ }
+ 
+ /****************************************************************************
+- * Name: mm_uaf_verify
++ * Name: mm_uaf_verify_range
+  *
+  * Description:
+- *   Check that the poison pattern written by mm_uaf_poison() is still intact
+- *   in the chunk which is about to be handed out. Any difference means that
+- *   the chunk was written while it was free, which is a use-after-free by
+- *   whoever owned it before.
++ *   Check that the pattern written by mm_uaf_poison_range() is still intact
++ *   over an explicit range. Any difference means that the memory was written
++ *   while it was not in use, which is a use-after-free by whoever owned it
++ *   before.
++ *
++ *   'node' is only used to describe the chunk in the report; the range does
++ *   not have to start at the node.
+  *
+  *   NOTES:
+- *     (1) must be called before the chunk is removed from the free list and
+- *         split, so that the poisoned area is still the one which was
+- *         poisoned when the chunk was freed.
+- *     (2) the caller must hold the MM semaphore.
++ *     (1) the caller must hold the MM semaphore.
+  *
+  ****************************************************************************/
+ 
+-void mm_uaf_verify(struct mm_freenode_s *node)
++void mm_uaf_verify_range(FAR struct mm_allocnode_s *node, FAR void *start, size_t nbytes)
+ {
+-	uint32_t *poison;
+-	size_t nwords;
++	FAR uint32_t *poison = (FAR uint32_t *)start;
++	size_t nwords = nbytes / sizeof(uint32_t);
++	size_t covered;
+ 	size_t dumpsize;
+ 	size_t i;
+ 
+-	nwords = mm_uaf_area(node, &poison);
+ 	for (i = 0; i < nwords; i++) {
+ 		if (poison[i] != MM_UAF_PATTERN) {
+ 			break;
+@@ -178,18 +183,18 @@ void mm_uaf_verify(struct mm_freenode_s *node)
+ 		 * the pattern and stay quiet rather than recursing.
+ 		 */
+ 
+-		mm_uaf_poison(node);
++		mm_uaf_poison_range(start, nbytes);
+ 		return;
+ 	}
+ 
+ #if CONFIG_DEBUG_MM_UAF_MAX_REPORTS > 0
+ 	if (g_uaf_nreports >= CONFIG_DEBUG_MM_UAF_MAX_REPORTS) {
+-		/* The console budget is spent. Still repair the pattern below so that
+-		 * the allocator does not keep tripping over the same bytes, but do not
++		/* The console budget is spent. Still repair the pattern so that the
++		 * allocator does not keep tripping over the same bytes, but do not
+ 		 * print anything more.
+ 		 */
+ 
+-		mm_uaf_poison(node);
++		mm_uaf_poison_range(start, nbytes);
+ 		return;
+ 	}
+ 
+@@ -200,11 +205,13 @@ void mm_uaf_verify(struct mm_freenode_s *node)
+ 	 * that the bytes around the corruption stay visible, but the dump is never
+ 	 * longer than CONFIG_DEBUG_MM_UAF_DUMP_SIZE. Without that cap a corrupted
+ 	 * top of heap chunk emits one line per 32 bytes of the whole remaining
+-	 * heap, which takes long enough to trip the watchdog. The verified window
+-	 * is always included, even when the cap is smaller than the window.
++	 * heap, which takes long enough to trip the watchdog. The checked range is
++	 * always included, even when the cap is smaller than the range.
+ 	 */
+ 
+-	dumpsize = MM_UAF_ALIGN_UP(SIZEOF_MM_FREENODE) + nwords * sizeof(uint32_t);
++	covered = (size_t)((FAR char *)start - (FAR char *)node) + nwords * sizeof(uint32_t);
++
++	dumpsize = covered;
+ 	if (dumpsize < CONFIG_DEBUG_MM_UAF_DUMP_SIZE) {
+ 		dumpsize = CONFIG_DEBUG_MM_UAF_DUMP_SIZE;
+ 	}
+@@ -217,7 +224,7 @@ void mm_uaf_verify(struct mm_freenode_s *node)
+ 
+ 	heap_dbg("#########################################################################################\n");
+ 	mfdbg("ERROR: Use after free detected.\n");
+-	mm_dump_node((struct mm_allocnode_s *)node, "FREE NODE");
++	mm_dump_node(node, "FREE NODE");
+ 	mm_dump_heap_region((uintptr_t)node, (uintptr_t)node + dumpsize);
+ 
+ 	g_uaf_reporting = false;
+@@ -235,6 +242,57 @@ void mm_uaf_verify(struct mm_freenode_s *node)
+ 	 * of the first one, so the report count becomes meaningful.
+ 	 */
+ 
+-	mm_uaf_poison(node);
++	mm_uaf_poison_range(start, nbytes);
+ #endif
+ }
++
++/****************************************************************************
++ * Name: mm_uaf_poison
++ *
++ * Description:
++ *   Fill the data area of a chunk which is about to enter the free list with
++ *   the poison pattern. Called for every chunk which becomes free, so that
++ *   mm_uaf_verify() has a known content to compare against.
++ *
++ *   NOTES:
++ *     (1) node->size must already be set to its final value.
++ *     (2) the caller must hold the MM semaphore.
++ *
++ ****************************************************************************/
++
++void mm_uaf_poison(FAR struct mm_freenode_s *node)
++{
++	uint32_t *poison;
++	size_t nwords;
++
++	nwords = mm_uaf_area(node, &poison);
++	mm_uaf_poison_range(poison, nwords * sizeof(uint32_t));
++}
++
++/****************************************************************************
++ * Name: mm_uaf_verify
++ *
++ * Description:
++ *   Check that the poison pattern written by mm_uaf_poison() is still intact
++ *   in a chunk which is about to be consumed. Any difference means that the
++ *   chunk was written while it was free, which is a use-after-free by whoever
++ *   owned it before.
++ *
++ *   NOTES:
++ *     (1) must be called before the chunk is split, merged or resized, so
++ *         that the checked area is still the one which was poisoned when the
++ *         chunk was freed. Removing the chunk from the free list first is
++ *         fine, and is what every caller does, because removal only rewrites
++ *         the neighbours' links.
++ *     (2) the caller must hold the MM semaphore.
++ *
++ ****************************************************************************/
++
++void mm_uaf_verify(FAR struct mm_freenode_s *node)
++{
++	uint32_t *poison;
++	size_t nwords;
++
++	nwords = mm_uaf_area(node, &poison);
++	mm_uaf_verify_range((FAR struct mm_allocnode_s *)node, poison, nwords * sizeof(uint32_t));
++}

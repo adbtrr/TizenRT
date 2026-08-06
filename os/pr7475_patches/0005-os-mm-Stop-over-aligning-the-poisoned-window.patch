@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_pr_fixes_use <>
+Date: Thu, 6 Aug 2026 12:59:13 +0000
+Subject: [PATCH] os/mm: Stop over-aligning the poisoned window
+
+mm_uaf_area() started the window at MM_ALIGN_UP(SIZEOF_MM_FREENODE),
+which rounds up to the 16 byte allocator granule. The window only needs
+to be 32-bit aligned, and SIZEOF_MM_FREENODE is a multiple of four in
+every supported configuration, so the granule rounding gave away
+coverage for nothing.
+
+On the common configuration with CONFIG_DEBUG_MM_HEAPINFO enabled the
+free node is 24 bytes and the window started at 32, so eight bytes of
+user data went unchecked, and a 32 byte chunk got no coverage at all,
+which is every freed allocation of 16 bytes or less. Rounding to a
+whole word instead recovers those bytes and gives small chunks a
+window.
+
+Also correct the Kconfig help. It implied that a write into the
+uncovered bookkeeping region is caught by DEBUGASSERT_MM_FREE_NODE.
+That macro only checks blink for NULL, so a write of any other value,
+or a write to flink, is not detected. State the limit plainly instead
+of implying cover which does not exist.
+---
+ os/Kconfig.debug           |  8 ++++++++
+ os/include/tinyara/mm/mm.h |  7 +++++++
+ os/mm/mm_heap/mm_uaf.c     | 18 ++++++++++++------
+ 3 files changed, 27 insertions(+), 6 deletions(-)
+
+diff --git a/os/Kconfig.debug b/os/Kconfig.debug
+index b69e2549..df49b6e8 100644
+--- a/os/Kconfig.debug
++++ b/os/Kconfig.debug
+@@ -799,6 +799,14 @@ config DEBUG_MM_UAF
+ 		chunk is handed out by malloc. A mismatch means somebody wrote into
+ 		the chunk after it was freed (use-after-free).
+ 
++		Not covered: the free node bookkeeping at the start of the user data,
++		from offset 0 up to SIZEOF_MM_FREENODE. The allocator reuses that
++		region for flink, blink and the free debug info while the chunk is on
++		the free list, so it cannot hold the pattern. A write there corrupts
++		the free list; DEBUGASSERT_MM_FREE_NODE catches the case where blink
++		is left NULL, but a write of any other value, or a write to flink, is
++		not detected.
++
+ if DEBUG_MM_UAF
+ 
+ config DEBUG_MM_UAF_POISON_SIZE
+diff --git a/os/include/tinyara/mm/mm.h b/os/include/tinyara/mm/mm.h
+index 48fd8eb4..0ccbd119 100644
+--- a/os/include/tinyara/mm/mm.h
++++ b/os/include/tinyara/mm/mm.h
+@@ -174,6 +174,13 @@
+ 
+ #ifdef CONFIG_DEBUG_MM_UAF
+ #define MM_UAF_PATTERN	0xA5A5A5A5
++
++/* Round up to a whole poison word. The poisoned window only has to be 32-bit
++ * aligned, so rounding to the allocator granule with MM_ALIGN_UP() would give
++ * away coverage for nothing.
++ */
++
++#define MM_UAF_ALIGN_UP(a)	(((a) + (sizeof(uint32_t) - 1)) & ~(sizeof(uint32_t) - 1))
+ #endif
+ 
+ /****************************************************************************
+diff --git a/os/mm/mm_heap/mm_uaf.c b/os/mm/mm_heap/mm_uaf.c
+index f29d27fe..0fe27b27 100644
+--- a/os/mm/mm_heap/mm_uaf.c
++++ b/os/mm/mm_heap/mm_uaf.c
+@@ -65,10 +65,16 @@ static bool g_uaf_reporting;
+  *   bookkeeping fields (flink/blink and the free debug info) which the
+  *   allocator itself keeps using while the chunk sits in the free list.
+  *
+- *   Those fields are skipped by MM_ALIGN_UP(SIZEOF_MM_FREENODE), the same
+- *   granule alignment the allocator applies to every other offset. Since a
+- *   node address is always a multiple of sizeof(uint32_t), that keeps the
+- *   pattern accessible with aligned 32-bit reads and writes.
++ *   Those fields end at SIZEOF_MM_FREENODE, which is a multiple of four in
++ *   every supported configuration, so rounding it up to a whole word is all
++ *   that is needed to keep the pattern reachable with aligned 32-bit accesses.
++ *   Rounding up to the allocator granule instead, as MM_ALIGN_UP() does, would
++ *   push the window a further eight bytes into the chunk on the common
++ *   HEAPINFO configuration and give a 32 byte chunk no coverage at all.
++ *
++ *   What stays uncovered is the free node bookkeeping itself, from the start
++ *   of the user data up to SIZEOF_MM_FREENODE. The allocator keeps using that
++ *   region while the chunk is free, so it cannot carry the pattern.
+  *
+  *   The size is clamped to CONFIG_DEBUG_MM_UAF_POISON_SIZE and truncated to
+  *   whole words, so nothing is ever written past the end of the chunk.
+@@ -81,7 +87,7 @@ static bool g_uaf_reporting;
+ 
+ static size_t mm_uaf_area(struct mm_freenode_s *node, uint32_t **poison)
+ {
+-	size_t offset = MM_ALIGN_UP(SIZEOF_MM_FREENODE);
++	size_t offset = MM_UAF_ALIGN_UP(SIZEOF_MM_FREENODE);
+ 	size_t nbytes;
+ 
+ 	if (node->size <= offset) {
+@@ -198,7 +204,7 @@ void mm_uaf_verify(struct mm_freenode_s *node)
+ 	 * is always included, even when the cap is smaller than the window.
+ 	 */
+ 
+-	dumpsize = MM_ALIGN_UP(SIZEOF_MM_FREENODE) + nwords * sizeof(uint32_t);
++	dumpsize = MM_UAF_ALIGN_UP(SIZEOF_MM_FREENODE) + nwords * sizeof(uint32_t);
+ 	if (dumpsize < CONFIG_DEBUG_MM_UAF_DUMP_SIZE) {
+ 		dumpsize = CONFIG_DEBUG_MM_UAF_DUMP_SIZE;
+ 	}

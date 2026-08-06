@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_pr_fixes_use <>
+Date: Thu, 6 Aug 2026 12:59:13 +0000
+Subject: [PATCH] build/configs: Build the use-after-free detector in
+ qemu/build_test
+
+No configuration in the tree enabled CONFIG_DEBUG_MM_UAF, and mm_uaf.c
+is only added to CSRCS when it is set. Every call site is behind an
+ifdef as well, so nothing in continuous integration compiled a single
+line of the feature and a build break in it would have gone unnoticed
+indefinitely.
+
+qemu/build_test exists for compile coverage and already runs in the
+integration matrix, so enable the option there together with its
+defaults. CONFIG_DEBUG_MM_HEAPINFO is already set in that
+configuration, which is also the combination where the report carries
+the owning task and the allocating address.
+---
+ build/configs/qemu/build_test/defconfig | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/build/configs/qemu/build_test/defconfig b/build/configs/qemu/build_test/defconfig
+index 5ee478dd..22233d1e 100644
+--- a/build/configs/qemu/build_test/defconfig
++++ b/build/configs/qemu/build_test/defconfig
+@@ -771,6 +771,12 @@ CONFIG_DEBUG_VERBOSE=y
+ # CONFIG_ARCH_HAVE_HEAPCHECK is not set
+ CONFIG_DEBUG_MM_HEAPINFO=y
+ # CONFIG_DEBUG_CHECK_FRAGMENTATION is not set
++# CONFIG_DEBUG_MM_FREEINFO is not set
++CONFIG_DEBUG_MM_UAF=y
++CONFIG_DEBUG_MM_UAF_POISON_SIZE=64
++CONFIG_DEBUG_MM_UAF_DUMP_SIZE=256
++CONFIG_DEBUG_MM_UAF_MAX_REPORTS=0
++# CONFIG_DEBUG_MM_UAF_PANIC is not set
+ # CONFIG_DEBUG_IRQ is not set
+ 
+ #

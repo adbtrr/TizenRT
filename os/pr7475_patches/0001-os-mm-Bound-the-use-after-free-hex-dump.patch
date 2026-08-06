@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_pr_fixes_use <>
+Date: Thu, 6 Aug 2026 12:51:21 +0000
+Subject: [PATCH] os/mm: Bound the use-after-free hex dump
+
+mm_uaf_verify() dumped the whole chunk on detection. The most likely
+victim of a stray write is the large top of heap free chunk, so the
+report could emit one line per 32 bytes of the entire remaining heap.
+On a serial console that is thousands of lines with the memory manager
+semaphore held, which trips the watchdog. In report only mode this
+happened on a path that was meant to be recoverable.
+
+Cap the dump with the new CONFIG_DEBUG_MM_UAF_DUMP_SIZE, default 256
+bytes. A chunk smaller than the cap is still dumped in full, so the
+bytes on either side of the corruption stay visible; only oversized
+chunks are truncated. The poisoned window is always included even when
+the cap is smaller than the window, so the evidence is never cut out of
+the report.
+---
+ os/Kconfig.debug       | 12 ++++++++++++
+ os/mm/mm_heap/mm_uaf.c | 20 +++++++++++++++++++-
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/os/Kconfig.debug b/os/Kconfig.debug
+index 17b9fe4a..e5e37933 100644
+--- a/os/Kconfig.debug
++++ b/os/Kconfig.debug
+@@ -811,6 +811,18 @@ config DEBUG_MM_UAF_POISON_SIZE
+ 		covered. Larger values detect more corruption but slow down every
+ 		free and every malloc.
+ 
++config DEBUG_MM_UAF_DUMP_SIZE
++	int "Maximum bytes of a corrupted chunk to hex dump"
++	default 256
++	---help---
++		Upper bound on the hex dump printed when a corrupted chunk is found.
++		A chunk smaller than this is dumped in full, so that the bytes around
++		the corruption stay visible. A larger chunk is truncated to this many
++		bytes. Without the bound a corrupted top of heap chunk dumps the whole
++		remaining heap, one line per 32 bytes, which is slow enough on a serial
++		console to trip the watchdog. The poisoned window is always dumped even
++		if this value is smaller than the window itself.
++
+ config DEBUG_MM_UAF_PANIC
+ 	bool "Panic when use-after-free is detected"
+ 	default n
+diff --git a/os/mm/mm_heap/mm_uaf.c b/os/mm/mm_heap/mm_uaf.c
+index a5706630..8eb7f94b 100644
+--- a/os/mm/mm_heap/mm_uaf.c
++++ b/os/mm/mm_heap/mm_uaf.c
+@@ -129,6 +129,7 @@ void mm_uaf_verify(struct mm_freenode_s *node)
+ {
+ 	uint32_t *poison;
+ 	size_t nwords;
++	size_t dumpsize;
+ 	size_t i;
+ 
+ 	nwords = mm_uaf_area(node, &poison);
+@@ -144,10 +145,27 @@ void mm_uaf_verify(struct mm_freenode_s *node)
+ 		return;
+ 	}
+ 
++	/* Decide how much of the chunk to dump. A small chunk is shown in full so
++	 * that the bytes around the corruption stay visible, but the dump is never
++	 * longer than CONFIG_DEBUG_MM_UAF_DUMP_SIZE. Without that cap a corrupted
++	 * top of heap chunk emits one line per 32 bytes of the whole remaining
++	 * heap, which takes long enough to trip the watchdog. The verified window
++	 * is always included, even when the cap is smaller than the window.
++	 */
++
++	dumpsize = MM_ALIGN_UP(SIZEOF_MM_FREENODE) + nwords * sizeof(uint32_t);
++	if (dumpsize < CONFIG_DEBUG_MM_UAF_DUMP_SIZE) {
++		dumpsize = CONFIG_DEBUG_MM_UAF_DUMP_SIZE;
++	}
++
++	if (dumpsize > node->size) {
++		dumpsize = node->size;
++	}
++
+ 	heap_dbg("#########################################################################################\n");
+ 	mfdbg("ERROR: Use after free detected.\n");
+ 	mm_dump_node((struct mm_allocnode_s *)node, "FREE NODE");
+-	mm_dump_heap_region((uint32_t)node, (uint32_t)node + node->size);
++	mm_dump_heap_region((uint32_t)node, (uint32_t)node + dumpsize);
+ 
+ #ifdef CONFIG_DEBUG_MM_UAF_PANIC
+ 	PANIC();

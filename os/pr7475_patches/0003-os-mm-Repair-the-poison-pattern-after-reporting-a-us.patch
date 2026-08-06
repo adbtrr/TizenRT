@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_pr_fixes_use <>
+Date: Thu, 6 Aug 2026 12:52:47 +0000
+Subject: [PATCH] os/mm: Repair the poison pattern after reporting a
+ use-after-free
+
+mm_uaf_verify() reported the corruption and returned without touching
+the chunk. The chunk is not always consumed by the caller: mm_free()
+and mm_realloc() verify a neighbour which usually stays on the free
+list. The corrupted bytes therefore stayed corrupted, and every later
+free or realloc touching that neighbour re-detected and re-printed the
+same report, forever, from a single defect.
+
+Re-fill the window with the pattern once the report has been printed.
+A second report now means a genuinely new write instead of an echo of
+the first one, which makes the report count meaningful. The repair is
+skipped when CONFIG_DEBUG_MM_UAF_PANIC is set, since the crash dump
+should show the corrupting value.
+
+Also add CONFIG_DEBUG_MM_UAF_MAX_REPORTS as a console budget for a
+defect which fires continuously. Detection and repair keep running when
+the budget is spent, only the printing stops. The default of 0 keeps
+every report, so behaviour is unchanged unless it is configured.
+---
+ os/Kconfig.debug       | 10 ++++++++++
+ os/mm/mm_heap/mm_uaf.c | 38 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 48 insertions(+)
+
+diff --git a/os/Kconfig.debug b/os/Kconfig.debug
+index 6e934462..b69e2549 100644
+--- a/os/Kconfig.debug
++++ b/os/Kconfig.debug
+@@ -830,6 +830,16 @@ config DEBUG_MM_UAF_DUMP_SIZE
+ 		console to trip the watchdog. The poisoned window is always dumped even
+ 		if this value is smaller than the window itself.
+ 
++config DEBUG_MM_UAF_MAX_REPORTS
++	int "Maximum number of reports to print (0 for no limit)"
++	default 0
++	range 0 65535
++	---help---
++		Stop printing after this many use-after-free reports. The detection
++		and the repair of the poison pattern always keep running, only the
++		printing stops, so a defect which fires continuously cannot take over
++		the console. Zero, the default, prints every report.
++
+ config DEBUG_MM_UAF_PANIC
+ 	bool "Panic when use-after-free is detected"
+ 	default n
+diff --git a/os/mm/mm_heap/mm_uaf.c b/os/mm/mm_heap/mm_uaf.c
+index 8eb7f94b..31e7bed0 100644
+--- a/os/mm/mm_heap/mm_uaf.c
++++ b/os/mm/mm_heap/mm_uaf.c
+@@ -30,6 +30,18 @@
+ 
+ #include "mm_node.h"
+ 
++/****************************************************************************
++ * Private Data
++ ****************************************************************************/
++
++#if CONFIG_DEBUG_MM_UAF_MAX_REPORTS > 0
++/* Number of reports printed so far. Only used to stop a repeating writer from
++ * owning the console; the detection itself is never suppressed.
++ */
++
++static uint32_t g_uaf_nreports;
++#endif
++
+ /****************************************************************************
+  * Private Functions
+  ****************************************************************************/
+@@ -145,6 +157,20 @@ void mm_uaf_verify(struct mm_freenode_s *node)
+ 		return;
+ 	}
+ 
++#if CONFIG_DEBUG_MM_UAF_MAX_REPORTS > 0
++	if (g_uaf_nreports >= CONFIG_DEBUG_MM_UAF_MAX_REPORTS) {
++		/* The console budget is spent. Still repair the pattern below so that
++		 * the allocator does not keep tripping over the same bytes, but do not
++		 * print anything more.
++		 */
++
++		mm_uaf_poison(node);
++		return;
++	}
++
++	g_uaf_nreports++;
++#endif
++
+ 	/* Decide how much of the chunk to dump. A small chunk is shown in full so
+ 	 * that the bytes around the corruption stay visible, but the dump is never
+ 	 * longer than CONFIG_DEBUG_MM_UAF_DUMP_SIZE. Without that cap a corrupted
+@@ -169,5 +195,17 @@ void mm_uaf_verify(struct mm_freenode_s *node)
+ 
+ #ifdef CONFIG_DEBUG_MM_UAF_PANIC
+ 	PANIC();
++#else
++	/* Repair the pattern now that the corruption has been reported.
++	 *
++	 * The chunk is not necessarily consumed by the caller: mm_free() and
++	 * mm_realloc() verify a neighbour which often stays on the free list.
++	 * Without the repair, every later free or realloc touching that neighbour
++	 * re-detects the same bytes and prints the same report forever. With the
++	 * repair, a second report means a genuinely new write rather than an echo
++	 * of the first one, so the report count becomes meaningful.
++	 */
++
++	mm_uaf_poison(node);
+ #endif
+ }

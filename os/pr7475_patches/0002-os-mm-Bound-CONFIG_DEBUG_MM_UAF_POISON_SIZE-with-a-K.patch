@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_pr_fixes_use <>
+Date: Thu, 6 Aug 2026 12:51:41 +0000
+Subject: [PATCH] os/mm: Bound CONFIG_DEBUG_MM_UAF_POISON_SIZE with a Kconfig
+ range
+
+The option had no range. mm_uaf_area() compares it against a size_t:
+
+	nbytes = node->size - offset;
+	if (nbytes > CONFIG_DEBUG_MM_UAF_POISON_SIZE) {
+
+A negative value converts to a very large unsigned number, so the clamp
+never fires and the whole chunk is poisoned and verified. That makes
+every free and every malloc linear in the chunk size and, together with
+the hex dump, turns a single detection into a very long report.
+
+Add "range 4 4096" and document in the help text that the value is
+rounded down to whole 32-bit words. The default of 64 is unchanged, so
+existing configurations behave exactly as before.
+---
+ os/Kconfig.debug | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/os/Kconfig.debug b/os/Kconfig.debug
+index e5e37933..6e934462 100644
+--- a/os/Kconfig.debug
++++ b/os/Kconfig.debug
+@@ -804,6 +804,7 @@ if DEBUG_MM_UAF
+ config DEBUG_MM_UAF_POISON_SIZE
+ 	int "Poison pattern size (bytes)"
+ 	default 64
++	range 4 4096
+ 	---help---
+ 		Maximum number of bytes of the free chunk data area to fill with the
+ 		poison pattern. Only the data area which follows the free node
+@@ -811,6 +812,12 @@ config DEBUG_MM_UAF_POISON_SIZE
+ 		covered. Larger values detect more corruption but slow down every
+ 		free and every malloc.
+ 
++		The value is rounded down to a whole number of 32-bit words. The
++		range is enforced because the value is compared against a size_t: a
++		negative value would convert to a huge unsigned number, defeat the
++		clamp and poison the whole chunk, which makes every free and every
++		malloc linear in the chunk size.
++
+ config DEBUG_MM_UAF_DUMP_SIZE
+ 	int "Maximum bytes of a corrupted chunk to hex dump"
+ 	default 256

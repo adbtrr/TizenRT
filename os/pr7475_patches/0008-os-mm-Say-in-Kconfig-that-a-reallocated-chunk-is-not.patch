@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_pr_fixes_use <>
+Date: Thu, 6 Aug 2026 12:59:45 +0000
+Subject: [PATCH] os/mm: Say in Kconfig that a reallocated chunk is not covered
+
+The option is called use-after-free detection, which sets an
+expectation it does not meet in the case most engineers picture: one
+thread frees a block, a second thread allocates the same block, and the
+first thread then writes through its stale pointer.
+
+The detector only watches a chunk while it is on the free list. Once
+the chunk has been handed out again the address legitimately belongs to
+the new owner, so no content check can tell the stale write apart from
+a valid one. Catching that needs the reuse of the chunk to be delayed,
+which this option does not do.
+
+State the limit in the help text so that a reader knows what is and is
+not covered before enabling it.
+---
+ os/Kconfig.debug | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/os/Kconfig.debug b/os/Kconfig.debug
+index df49b6e8..defcc7b1 100644
+--- a/os/Kconfig.debug
++++ b/os/Kconfig.debug
+@@ -799,6 +799,14 @@ config DEBUG_MM_UAF
+ 		chunk is handed out by malloc. A mismatch means somebody wrote into
+ 		the chunk after it was freed (use-after-free).
+ 
++		Not covered: a chunk which has already been handed out again. The
++		detector only watches a chunk while it sits on the free list. If one
++		thread frees a block, a second thread allocates the same block, and
++		the first thread then writes through its stale pointer, the write
++		lands in memory which legitimately belongs to the second thread and
++		nothing reports it. That case needs the reuse of the chunk to be
++		delayed, which this option does not do.
++
+ 		Not covered: the free node bookkeeping at the start of the user data,
+ 		from offset 0 up to SIZEOF_MM_FREENODE. The allocator reuses that
+ 		region for flink, blink and the free debug info while the chunk is on

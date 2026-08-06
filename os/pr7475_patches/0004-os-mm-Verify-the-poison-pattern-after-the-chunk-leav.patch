@@ -1,0 +1,287 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_pr_fixes_use <>
+Date: Thu, 6 Aug 2026 12:55:06 +0000
+Subject: [PATCH] os/mm: Verify the poison pattern after the chunk leaves the
+ free list
+
+Every verification ran while the chunk was still linked into the free
+list. The memory manager semaphore is recursive per PID, so nothing
+prevents a nested allocation, reached from the logging path, from
+re-entering the allocator and handing out the very chunk the caller is
+about to use. In mm_free() the caller then merges a chunk which is now
+allocated, which is silent heap corruption.
+
+Move all seven verifications to just after REMOVE_NODE_FROM_LIST and
+before the chunk is split, merged or resized. Removal only rewrites the
+neighbours' flink and blink fields, never the poisoned window, so the
+comparison sees exactly the same bytes and detection is unchanged.
+
+In mm_realloc() the two verifications move into the takeprev and
+takenext branches, because a neighbour is only removed there. A
+neighbour which realloc inspects but does not consume is no longer
+verified at that moment; it is still verified later, when it is
+actually consumed, so no coverage is lost and only the timing of the
+report changes.
+
+Also add a re-entrancy guard around the report itself. The logging
+helpers are not supposed to allocate, but if one ever does, the nested
+verification repairs the pattern and stays quiet instead of recursing.
+---
+ os/mm/mm_heap/mm_free.c        | 24 ++++++++++++++++--------
+ os/mm/mm_heap/mm_malloc.c      | 13 +++++++++----
+ os/mm/mm_heap/mm_memalign.c    | 10 ++++++----
+ os/mm/mm_heap/mm_realloc.c     | 20 ++++++++++++++------
+ os/mm/mm_heap/mm_shrinkchunk.c | 10 ++++++----
+ os/mm/mm_heap/mm_uaf.c         | 23 +++++++++++++++++++++++
+ 6 files changed, 74 insertions(+), 26 deletions(-)
+
+diff --git a/os/mm/mm_heap/mm_free.c b/os/mm/mm_heap/mm_free.c
+index 6b7043e1..a5c7981f 100644
+--- a/os/mm/mm_heap/mm_free.c
++++ b/os/mm/mm_heap/mm_free.c
+@@ -202,10 +202,6 @@ static void mm_free_internal(FAR struct mm_heap_s *heap, FAR void *mem, mmaddres
+ 	if ((next->preceding & MM_ALLOC_BIT) == 0) {
+ 		FAR struct mm_allocnode_s *andbeyond;
+ 
+-#ifdef CONFIG_DEBUG_MM_UAF
+-		mm_uaf_verify(next);
+-#endif
+-
+ 		/* Get the node following the next node (which will
+ 		 * become the new next node). We know that we can never
+ 		 * index past the tail chunk because it is always allocated.
+@@ -219,6 +215,14 @@ static void mm_free_internal(FAR struct mm_heap_s *heap, FAR void *mem, mmaddres
+ 		DEBUGASSERT_MM_FREE_NODE(heap, next);
+ 		REMOVE_NODE_FROM_LIST(next);
+ 
++#ifdef CONFIG_DEBUG_MM_UAF
++		/* Verify once 'next' is off the free list, before the merge rewrites
++		 * the sizes that bound the poisoned window.
++		 */
++
++		mm_uaf_verify(next);
++#endif
++
+ 		/* Then merge the two chunks */
+ 
+ 		node->size += next->size;
+@@ -232,16 +236,20 @@ static void mm_free_internal(FAR struct mm_heap_s *heap, FAR void *mem, mmaddres
+ 
+ 	prev = (FAR struct mm_freenode_s *)((char *)node - node->preceding);
+ 	if ((prev->preceding & MM_ALLOC_BIT) == 0) {
+-#ifdef CONFIG_DEBUG_MM_UAF
+-		mm_uaf_verify(prev);
+-#endif
+-
+ 		/* Remove the node.  There must be a predecessor, but there may
+ 		 * not be a successor node.
+ 		 */
+ 		DEBUGASSERT_MM_FREE_NODE(heap, prev);
+ 		REMOVE_NODE_FROM_LIST(prev);
+ 
++#ifdef CONFIG_DEBUG_MM_UAF
++		/* Verify once 'prev' is off the free list, before the merge rewrites
++		 * the sizes that bound the poisoned window.
++		 */
++
++		mm_uaf_verify(prev);
++#endif
++
+ 		/* Then merge the two chunks */
+ 
+ 		prev->size += node->size;
+diff --git a/os/mm/mm_heap/mm_malloc.c b/os/mm/mm_heap/mm_malloc.c
+index 0420cc87..53b009f0 100644
+--- a/os/mm/mm_heap/mm_malloc.c
++++ b/os/mm/mm_heap/mm_malloc.c
+@@ -210,16 +210,21 @@ retry_after_gc:
+ 		FAR struct mm_freenode_s *next;
+ 		size_t remaining;
+ 
+-#ifdef CONFIG_DEBUG_MM_UAF
+-		mm_uaf_verify(node);
+-#endif
+-
+ 		/* Remove the node.  There must be a predecessor, but there may not be
+ 		 * a successor node.
+ 		 */
+ 		DEBUGASSERT_MM_FREE_NODE(heap, node);
+ 		REMOVE_NODE_FROM_LIST(node);
+ 
++#ifdef CONFIG_DEBUG_MM_UAF
++		/* Verify once the node is off the free list but before it is split.
++		 * Removal only rewrites the neighbours' flink/blink, never the poisoned
++		 * window, so the check sees exactly the same bytes as before.
++		 */
++
++		mm_uaf_verify(node);
++#endif
++
+ 		/* Check if we have to split the free node into one of the allocated
+ 		 * size and another smaller freenode.  In some cases, the remaining
+ 		 * bytes can be smaller (they may be SIZEOF_MM_ALLOCNODE).  In that
+diff --git a/os/mm/mm_heap/mm_memalign.c b/os/mm/mm_heap/mm_memalign.c
+index 7410e60e..0bdc33e0 100644
+--- a/os/mm/mm_heap/mm_memalign.c
++++ b/os/mm/mm_heap/mm_memalign.c
+@@ -214,16 +214,18 @@ retry_after_gc:
+ 		/* Get the next node after the allocation. */
+ 		FAR struct mm_allocnode_s *next = (FAR struct mm_allocnode_s *)((char *)node + node->size);
+ 
+-#ifdef CONFIG_DEBUG_MM_UAF
+-		mm_uaf_verify(node);
+-#endif
+-
+ 		/* Remove the node.  There must be a predecessor, but there may not be
+ 		 * a successor node.
+ 		 */
+ 		DEBUGASSERT_MM_FREE_NODE(heap, node);
+ 		REMOVE_NODE_FROM_LIST(node);
+ 
++#ifdef CONFIG_DEBUG_MM_UAF
++		/* Verify once the node is off the free list but before it is split. */
++
++		mm_uaf_verify(node);
++#endif
++
+ 		/* Check if there is free space at the beginning of the aligned chunk */
+ 		if ((size_t)newnode - (size_t)node >= SIZEOF_MM_FREENODE) {
+ 			size_t precedingsize;
+diff --git a/os/mm/mm_heap/mm_realloc.c b/os/mm/mm_heap/mm_realloc.c
+index 19f2cb17..ea5d3b2e 100644
+--- a/os/mm/mm_heap/mm_realloc.c
++++ b/os/mm/mm_heap/mm_realloc.c
+@@ -183,17 +183,11 @@ FAR void *mm_realloc(FAR struct mm_heap_s *heap, FAR void *oldmem, size_t size,
+ 	next = (FAR struct mm_freenode_s *)((FAR char *)oldnode + oldnode->size);
+ 	if ((next->preceding & MM_ALLOC_BIT) == 0) {
+ 		nextsize = next->size;
+-#ifdef CONFIG_DEBUG_MM_UAF
+-		mm_uaf_verify(next);
+-#endif
+ 	}
+ 
+ 	prev = (FAR struct mm_freenode_s *)((FAR char *)oldnode - (oldnode->preceding & ~MM_ALLOC_BIT));
+ 	if ((prev->preceding & MM_ALLOC_BIT) == 0) {
+ 		prevsize = prev->size;
+-#ifdef CONFIG_DEBUG_MM_UAF
+-		mm_uaf_verify(prev);
+-#endif
+ 	}
+ 
+ 	/* Now, check if we can extend the current allocation or not */
+@@ -267,6 +261,14 @@ FAR void *mm_realloc(FAR struct mm_heap_s *heap, FAR void *oldmem, size_t size,
+ 			DEBUGASSERT_MM_FREE_NODE(heap, prev);
+ 			REMOVE_NODE_FROM_LIST(prev);
+ 
++#ifdef CONFIG_DEBUG_MM_UAF
++			/* Verify once 'prev' is off the free list, before its size is
++			 * adjusted and the user data is moved down into it.
++			 */
++
++			mm_uaf_verify(prev);
++#endif
++
+ 			/* Extend the node into the previous free chunk */
+ 			/* Did we consume the entire preceding chunk? */
+ 
+@@ -321,6 +323,12 @@ FAR void *mm_realloc(FAR struct mm_heap_s *heap, FAR void *oldmem, size_t size,
+ 			DEBUGASSERT_MM_FREE_NODE(heap, next);
+ 			REMOVE_NODE_FROM_LIST(next);
+ 
++#ifdef CONFIG_DEBUG_MM_UAF
++			/* Verify once 'next' is off the free list, before it is absorbed. */
++
++			mm_uaf_verify(next);
++#endif
++
+ 			/* Extend the node into the next chunk */
+ 			/* Did we consume the entire preceding chunk? */
+ 
+diff --git a/os/mm/mm_heap/mm_shrinkchunk.c b/os/mm/mm_heap/mm_shrinkchunk.c
+index c19cee3b..332c2f28 100644
+--- a/os/mm/mm_heap/mm_shrinkchunk.c
++++ b/os/mm/mm_heap/mm_shrinkchunk.c
+@@ -97,10 +97,6 @@ void mm_shrinkchunk(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *node,
+ 		FAR struct mm_allocnode_s *andbeyond;
+ 		FAR struct mm_freenode_s *newnode;
+ 
+-#ifdef CONFIG_DEBUG_MM_UAF
+-		mm_uaf_verify(next);
+-#endif
+-
+ 		/* Get the chunk next the next node (which could be the tail chunk) */
+ 
+ 		andbeyond = (FAR struct mm_allocnode_s *)((char *)next + next->size);
+@@ -111,6 +107,12 @@ void mm_shrinkchunk(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *node,
+ 		DEBUGASSERT_MM_FREE_NODE(heap, next);
+ 		REMOVE_NODE_FROM_LIST(next);
+ 
++#ifdef CONFIG_DEBUG_MM_UAF
++		/* Verify once 'next' is off the free list, before it is absorbed. */
++
++		mm_uaf_verify(next);
++#endif
++
+ 		/* Create a new chunk that will hold both the next chunk and the
+ 		 * tailing memory from the aligned chunk.
+ 		 */
+diff --git a/os/mm/mm_heap/mm_uaf.c b/os/mm/mm_heap/mm_uaf.c
+index 31e7bed0..f29d27fe 100644
+--- a/os/mm/mm_heap/mm_uaf.c
++++ b/os/mm/mm_heap/mm_uaf.c
+@@ -23,6 +23,7 @@
+ #include <tinyara/config.h>
+ 
+ #include <stdint.h>
++#include <stdbool.h>
+ #include <assert.h>
+ #include <debug.h>
+ 
+@@ -42,6 +43,15 @@
+ static uint32_t g_uaf_nreports;
+ #endif
+ 
++/* Set while a report is being printed. The logging helpers are not supposed to
++ * allocate, but the memory manager semaphore is recursive per PID, so nothing
++ * would stop a nested allocation from re-entering the allocator and reaching
++ * mm_uaf_verify() again. This keeps such a nesting from recursing through the
++ * logging path.
++ */
++
++static bool g_uaf_reporting;
++
+ /****************************************************************************
+  * Private Functions
+  ****************************************************************************/
+@@ -157,6 +167,15 @@ void mm_uaf_verify(struct mm_freenode_s *node)
+ 		return;
+ 	}
+ 
++	if (g_uaf_reporting) {
++		/* A report is already being printed further up the call stack. Repair
++		 * the pattern and stay quiet rather than recursing.
++		 */
++
++		mm_uaf_poison(node);
++		return;
++	}
++
+ #if CONFIG_DEBUG_MM_UAF_MAX_REPORTS > 0
+ 	if (g_uaf_nreports >= CONFIG_DEBUG_MM_UAF_MAX_REPORTS) {
+ 		/* The console budget is spent. Still repair the pattern below so that
+@@ -188,11 +207,15 @@ void mm_uaf_verify(struct mm_freenode_s *node)
+ 		dumpsize = node->size;
+ 	}
+ 
++	g_uaf_reporting = true;
++
+ 	heap_dbg("#########################################################################################\n");
+ 	mfdbg("ERROR: Use after free detected.\n");
+ 	mm_dump_node((struct mm_allocnode_s *)node, "FREE NODE");
+ 	mm_dump_heap_region((uint32_t)node, (uint32_t)node + dumpsize);
+ 
++	g_uaf_reporting = false;
++
+ #ifdef CONFIG_DEBUG_MM_UAF_PANIC
+ 	PANIC();
+ #else

@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_pr_fixes_use <>
+Date: Thu, 6 Aug 2026 12:59:28 +0000
+Subject: [PATCH] os/mm: Make the heap region dump 64-bit safe and stop it
+ over-reading
+
+mm_dump_heap_region() took uint32_t bounds, so every caller had to cast
+a pointer down to 32 bits. On a 64-bit target that truncates the
+address and the dump either prints unrelated memory or faults, and the
+cast itself warns. mm.h documents 64-bit configurations of the
+allocator, so the narrow prototype is wrong rather than merely
+untidy.
+
+Widen the prototype to uintptr_t and update the four call sites. The
+existing callers pass uint32_t values, which widen implicitly, so
+nothing changes on a 32-bit target. Two call sites also passed a
+pointer with no cast at all; give them one.
+
+The printing loop read eight words per line while start < end, so a
+region which is not a multiple of 32 bytes was read up to 28 bytes past
+its end. Heap chunk sizes are multiples of 16, so half of them hit
+this, and for the last region of a heap the over-read runs past the
+heap itself. Read only the words inside the region and print the
+remainder of the line as zero.
+---
+ os/include/tinyara/mm/mm.h               |  2 +-
+ os/mm/mm_heap/mm_check_heap_corruption.c |  2 +-
+ os/mm/mm_heap/mm_heap_dbg.c              | 24 +++++++++++++++++++-----
+ os/mm/mm_heap/mm_heapinfo_utils.c        |  2 +-
+ os/mm/mm_heap/mm_uaf.c                   |  2 +-
+ 5 files changed, 23 insertions(+), 9 deletions(-)
+
+diff --git a/os/include/tinyara/mm/mm.h b/os/include/tinyara/mm/mm.h
+index 0ccbd119..ba255b74 100644
+--- a/os/include/tinyara/mm/mm.h
++++ b/os/include/tinyara/mm/mm.h
+@@ -674,7 +674,7 @@ void mm_uaf_verify(FAR struct mm_freenode_s *node);
+ #endif
+ 
+ void mm_dump_node(struct mm_allocnode_s *node, char *node_type);
+-void mm_dump_heap_region(uint32_t start, uint32_t end);
++void mm_dump_heap_region(uintptr_t start, uintptr_t end);
+ void mm_dump_heap_free_node_list(struct mm_heap_s *heap);
+ int heap_dbg(const char *fmt, ...);
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+diff --git a/os/mm/mm_heap/mm_check_heap_corruption.c b/os/mm/mm_heap/mm_check_heap_corruption.c
+index d9d419ec..9154605b 100644
+--- a/os/mm/mm_heap/mm_check_heap_corruption.c
++++ b/os/mm/mm_heap/mm_check_heap_corruption.c
+@@ -285,7 +285,7 @@ int mm_check_heap_corruption(struct mm_heap_s *heap)
+ 		if (iscorrupt_f || iscorrupt_r) {
+ #if defined(CONFIG_MM_DUMP_CORRPUTED_HEAP)
+ 			mfdbg("CONFIG_MM_DUMP_CORRPUTED_HEAP enabled. Dumping full heap!!\n");
+-			mm_dump_heap_region(heap->mm_heapstart[region], (uint32_t)(heap->mm_heapend[region]) + SIZEOF_MM_ALLOCNODE);
++			mm_dump_heap_region((uintptr_t)(heap->mm_heapstart[region]), (uintptr_t)(heap->mm_heapend[region]) + SIZEOF_MM_ALLOCNODE);
+ #else
+ 			heap_start = (uint32_t)heap->mm_heapstart[region];
+ 			heap_end = (uint32_t)heap->mm_heapend[region] + SIZEOF_MM_ALLOCNODE;
+diff --git a/os/mm/mm_heap/mm_heap_dbg.c b/os/mm/mm_heap/mm_heap_dbg.c
+index 7165412e..30d72025 100644
+--- a/os/mm/mm_heap/mm_heap_dbg.c
++++ b/os/mm/mm_heap/mm_heap_dbg.c
+@@ -63,15 +63,29 @@ int heap_dbg(const char *fmt, ...)
+  *
+  * Description: Print the hex value contents of heap from start to end address.
+  ************************************************************************/
+-void mm_dump_heap_region(uint32_t start, uint32_t end)
++void mm_dump_heap_region(uintptr_t start, uintptr_t end)
+ {
+ 	heap_dbg("#########################################################################################\n");
+-	heap_dbg("Dump heap: 0x%08x - 0x%08x\n", start, end);
++	heap_dbg("Dump heap: %p - %p\n", (void *)start, (void *)end);
+ 	heap_dbg("#########################################################################################\n");
+ 	for (; start < end; start += 32) {
+-		uint32_t *ptr = (uint32_t *)start;
+-		heap_dbg("%08x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+-			   start, ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5], ptr[6], ptr[7]);
++		FAR const uint32_t *ptr = (FAR const uint32_t *)start;
++		uint32_t word[8] = { 0 };
++		int i;
++
++		/* A region is not necessarily a multiple of the 32 bytes printed per
++		 * line, so read only the words which are inside it. Reading the whole
++		 * line unconditionally walks up to 28 bytes past the end, which for
++		 * the last region of a heap is past the heap itself. Words outside
++		 * the region are printed as zero.
++		 */
++
++		for (i = 0; i < 8 && start + i * sizeof(uint32_t) < end; i++) {
++			word[i] = ptr[i];
++		}
++
++		heap_dbg("%p: %08x %08x %08x %08x %08x %08x %08x %08x\n",
++			   (void *)start, word[0], word[1], word[2], word[3], word[4], word[5], word[6], word[7]);
+ 	}
+ 	heap_dbg("#########################################################################################\n");
+ }
+diff --git a/os/mm/mm_heap/mm_heapinfo_utils.c b/os/mm/mm_heap/mm_heapinfo_utils.c
+index 8f2b43b8..b1702069 100644
+--- a/os/mm/mm_heap/mm_heapinfo_utils.c
++++ b/os/mm/mm_heap/mm_heapinfo_utils.c
+@@ -303,7 +303,7 @@ void heapinfo_dump_heap(struct mm_heap_s *heap)
+ 			DEBUGASSERT(mm_takesemaphore(heap));
+ 		}
+ 
+-		mm_dump_heap_region((uint32_t)(heap->mm_heapstart[region]), (uint32_t)(heap->mm_heapend[region]) + SIZEOF_MM_ALLOCNODE);
++		mm_dump_heap_region((uintptr_t)(heap->mm_heapstart[region]), (uintptr_t)(heap->mm_heapend[region]) + SIZEOF_MM_ALLOCNODE);
+ #if defined(CONFIG_BUILD_FLAT) || defined(__KERNEL__)
+ 		if (!abort_mode && !up_interrupt_context())
+ #endif
+diff --git a/os/mm/mm_heap/mm_uaf.c b/os/mm/mm_heap/mm_uaf.c
+index 0fe27b27..1699b9ea 100644
+--- a/os/mm/mm_heap/mm_uaf.c
++++ b/os/mm/mm_heap/mm_uaf.c
+@@ -218,7 +218,7 @@ void mm_uaf_verify(struct mm_freenode_s *node)
+ 	heap_dbg("#########################################################################################\n");
+ 	mfdbg("ERROR: Use after free detected.\n");
+ 	mm_dump_node((struct mm_allocnode_s *)node, "FREE NODE");
+-	mm_dump_heap_region((uint32_t)node, (uint32_t)node + dumpsize);
++	mm_dump_heap_region((uintptr_t)node, (uintptr_t)node + dumpsize);
+ 
+ 	g_uaf_reporting = false;
+ 
