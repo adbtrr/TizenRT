@@ -8,6 +8,8 @@ These patches are review fixes for that change, followed by the work needed to
 cover the case the change cannot see. They apply on top of the pull request's
 own commit, in numbered order.
 
+There are 14 of them.
+
   base:  20fb5f3c  os/mm: Add use-after-free detection to the heap allocator
 
 Applying
@@ -68,7 +70,7 @@ the configuration surface and the coverage the design gives away for nothing.
         list, include tinyara/arch.h, drop an unused include, FAR
         consistency, an unsigned pattern constant.
 
-Part 2 - the reallocation case (0011 to 0013)
+Part 2 - the reallocation case (0011 to 0014)
 ---------------------------------------------
 
 The detector only watches a chunk while it is on the free list. Once the
@@ -94,6 +96,15 @@ support for pointer identity.
   0013  Add apps/examples/mm_uaf_test, which trips the detector in each shape
         it should catch and prints what was expected of each one, including a
         case of well behaved traffic which must stay silent.
+
+  0014  Add apps/examples/mm_quarantine_test, which measures the quarantine
+        rather than reading its log: a freed address is not handed straight
+        back, the delay is bounded so memory is still recycled, and held
+        memory is released rather than failing an allocation. Each check
+        prints pass or fail and the exit status reflects the result. The last
+        check is a regression test for the flush in mm_malloc(): modelling the
+        allocator without that hook makes it fall short by exactly the ring
+        depth.
 
 Configuration
 -------------
