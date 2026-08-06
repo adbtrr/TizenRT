@@ -1,0 +1,778 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_pr_fixes_use_quaran <>
+Date: Thu, 6 Aug 2026 20:46:39 +0000
+Subject: [PATCH 8/8] apps/examples: Add a test which exercises the heap
+ quarantine
+
+The use-after-free example shows the detector's reports, which have to
+be read out of the log. The quarantine also has behaviour which can
+simply be measured, so test it that way instead: each check prints pass
+or fail and the exit status is non-zero if any failed.
+
+  1. A freed address is not handed back by the next allocation of the
+     same size. This is the whole point of holding chunks: it is what
+     leaves a write through a stale pointer somewhere harmless to land,
+     long enough for the pattern check to find it.
+
+  2. The delay is bounded. Churning one size many times must bring
+     addresses back round, or the quarantine would just be a leak, and
+     the number of addresses in circulation must stay near the ring
+     depth. A model of the allocator settles at exactly one more than
+     the configured depth, so the bound is set at twice the depth to
+     leave room for coalescing on a real heap while still failing
+     loudly on a leak.
+
+  3. A chunk larger than the configured maximum is not held. Reported
+     rather than asserted, because whether the identical address
+     returns also depends on coalescing and on
+     CONFIG_MM_ALLOC_LARGE_FROM_BACK.
+
+  4. Held memory is released rather than failing an allocation. Fill
+     the heap, empty it so the quarantine is holding as much as it may,
+     then fill it again; the second pass must fit as much as the first.
+
+Case 4 is the one worth having. Modelling the allocator with the flush
+in mm_malloc() removed makes the second pass fall short by exactly the
+ring depth, so this check goes red if that hook is ever dropped, and
+that hook is what stops the quarantine causing allocation failures.
+
+The same model showed the check needs help to be meaningful: on a roomy
+heap the fixed block cap is reached while memory is still available, so
+the allocator never has to refuse and nothing is tested. The case
+reserves a ballast block first, and asserts that the allocator really
+did run out.
+
+Cases 5 and 6 run last and corrupt the heap deliberately, to show the
+stale write after reuse and the double free of a held block.
+---
+ apps/examples/mm_quarantine_test/Kconfig      |  22 +
+ .../examples/mm_quarantine_test/Kconfig_ENTRY |   3 +
+ apps/examples/mm_quarantine_test/Make.defs    |  21 +
+ apps/examples/mm_quarantine_test/Makefile     | 122 +++++
+ apps/examples/mm_quarantine_test/README.txt   |  49 ++
+ .../mm_quarantine_test/mm_quarantine_test.c   | 464 ++++++++++++++++++
+ 6 files changed, 681 insertions(+)
+ create mode 100644 apps/examples/mm_quarantine_test/Kconfig
+ create mode 100644 apps/examples/mm_quarantine_test/Kconfig_ENTRY
+ create mode 100644 apps/examples/mm_quarantine_test/Make.defs
+ create mode 100644 apps/examples/mm_quarantine_test/Makefile
+ create mode 100644 apps/examples/mm_quarantine_test/README.txt
+ create mode 100644 apps/examples/mm_quarantine_test/mm_quarantine_test.c
+
+diff --git a/apps/examples/mm_quarantine_test/Kconfig b/apps/examples/mm_quarantine_test/Kconfig
+new file mode 100644
+index 00000000..64097d51
+--- /dev/null
++++ b/apps/examples/mm_quarantine_test/Kconfig
+@@ -0,0 +1,22 @@
++#
++# For a description of the syntax of this configuration file,
++# see kconfig-language at https://www.kernel.org/doc/Documentation/kbuild/kconfig-language.txt
++#
++
++config EXAMPLES_MM_QUARANTINE_TEST
++	bool "Example which exercises the heap quarantine"
++	default n
++	depends on DEBUG_MM_QUARANTINE
++	---help---
++		Checks the behaviour DEBUG_MM_QUARANTINE is supposed to provide, and
++		reports pass or fail per check rather than asking the reader to
++		interpret a log. The checks cover delayed reuse of a freed address,
++		that the delay is bounded so memory is still recycled, and that
++		holding memory back never turns into an allocation failure.
++
++		The last two cases corrupt the heap on purpose to show the reports
++		that the quarantine makes possible. Do not enable this in a product.
++
++config USER_ENTRYPOINT
++	string
++	default "quartest_main" if ENTRY_MM_QUARANTINE_TEST
+diff --git a/apps/examples/mm_quarantine_test/Kconfig_ENTRY b/apps/examples/mm_quarantine_test/Kconfig_ENTRY
+new file mode 100644
+index 00000000..234e0e72
+--- /dev/null
++++ b/apps/examples/mm_quarantine_test/Kconfig_ENTRY
+@@ -0,0 +1,3 @@
++config ENTRY_MM_QUARANTINE_TEST
++	bool "Heap quarantine test"
++	depends on EXAMPLES_MM_QUARANTINE_TEST
+diff --git a/apps/examples/mm_quarantine_test/Make.defs b/apps/examples/mm_quarantine_test/Make.defs
+new file mode 100644
+index 00000000..7f5fb26e
+--- /dev/null
++++ b/apps/examples/mm_quarantine_test/Make.defs
+@@ -0,0 +1,21 @@
++###########################################################################
++#
++# Copyright 2026 Samsung Electronics All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++# either express or implied. See the License for the specific
++# language governing permissions and limitations under the License.
++#
++###########################################################################
++
++ifeq ($(CONFIG_EXAMPLES_MM_QUARANTINE_TEST),y)
++CONFIGURED_APPS += examples/mm_quarantine_test
++endif
+diff --git a/apps/examples/mm_quarantine_test/Makefile b/apps/examples/mm_quarantine_test/Makefile
+new file mode 100644
+index 00000000..7b868fc9
+--- /dev/null
++++ b/apps/examples/mm_quarantine_test/Makefile
+@@ -0,0 +1,122 @@
++###########################################################################
++#
++# Copyright 2026 Samsung Electronics All Rights Reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++# http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++# either express or implied. See the License for the specific
++# language governing permissions and limitations under the License.
++#
++###########################################################################
++
++-include $(TOPDIR)/.config
++-include $(TOPDIR)/Make.defs
++include $(APPDIR)/Make.defs
++
++# built-in application info
++
++APPNAME = quartest
++FUNCNAME = $(APPNAME)_main
++THREADEXEC = TASH_EXECMD_ASYNC
++
++# Example which exercises the heap quarantine
++
++ASRCS =
++CSRCS =
++MAINSRC = mm_quarantine_test.c
++
++AOBJS = $(ASRCS:.S=$(OBJEXT))
++COBJS = $(CSRCS:.c=$(OBJEXT))
++MAINOBJ = $(MAINSRC:.c=$(OBJEXT))
++
++SRCS = $(ASRCS) $(CSRCS) $(MAINSRC)
++OBJS = $(AOBJS) $(COBJS)
++
++ifneq ($(CONFIG_BUILD_KERNEL),y)
++  OBJS += $(MAINOBJ)
++endif
++
++ifeq ($(CONFIG_WINDOWS_NATIVE),y)
++  BIN = $(APPDIR)\libapps$(LIBEXT)
++else
++ifeq ($(WINTOOL),y)
++  BIN = $(APPDIR)\\libapps$(LIBEXT)
++else
++  BIN = $(APPDIR)/libapps$(LIBEXT)
++endif
++endif
++
++ifeq ($(WINTOOL),y)
++  INSTALL_DIR = "${shell cygpath -w $(BIN_DIR)}"
++else
++  INSTALL_DIR = $(BIN_DIR)
++endif
++
++CONFIG_EXAMPLES_MM_QUARANTINE_TEST_PROGNAME ?= quartest$(EXEEXT)
++PROGNAME = $(CONFIG_EXAMPLES_MM_QUARANTINE_TEST_PROGNAME)
++
++ROOTDEPPATH = --dep-path .
++
++# Common build
++
++all: .built
++.PHONY: clean depend distclean
++
++$(AOBJS): %$(OBJEXT): %.S
++	$(call ASSEMBLE, $<, $@)
++
++$(COBJS) $(MAINOBJ): %$(OBJEXT): %.c
++	$(call COMPILE, $<, $@)
++
++.built: $(OBJS)
++	$(call ARCHIVE, $(BIN), $(OBJS))
++	@touch .built
++
++ifeq ($(CONFIG_BUILD_KERNEL),y)
++$(BIN_DIR)$(DELIM)$(PROGNAME): $(OBJS) $(MAINOBJ)
++	@echo "LD: $(PROGNAME)"
++	$(Q) $(LD) $(LDELFFLAGS) $(LDLIBPATH) -o $(INSTALL_DIR)$(DELIM)$(PROGNAME) $(ARCHCRT0OBJ) $(MAINOBJ) $(LDLIBS)
++	$(Q) $(NM) -u  $(INSTALL_DIR)$(DELIM)$(PROGNAME)
++
++install: $(BIN_DIR)$(DELIM)$(PROGNAME)
++
++else
++install:
++
++endif
++
++ifeq ($(CONFIG_BUILTIN_APPS)$(CONFIG_EXAMPLES_MM_QUARANTINE_TEST),yy)
++$(BUILTIN_REGISTRY)$(DELIM)$(FUNCNAME).bdat: $(DEPCONFIG) Makefile
++	$(call REGISTER,$(APPNAME),$(FUNCNAME),$(THREADEXEC))
++
++context: $(BUILTIN_REGISTRY)$(DELIM)$(APPNAME)_main.bdat
++
++else
++context:
++
++endif
++
++.depend: Makefile $(SRCS)
++	@$(MKDEP) $(ROOTDEPPATH) "$(CC)" -- $(CFLAGS) -- $(SRCS) >Make.dep
++	@touch $@
++
++depend: .depend
++
++clean:
++	$(call DELFILE, .built)
++	$(call CLEAN)
++
++distclean: clean
++	$(call DELFILE, Make.dep)
++	$(call DELFILE, .depend)
++
++-include Make.dep
++.PHONY: preconfig
++preconfig:
+diff --git a/apps/examples/mm_quarantine_test/README.txt b/apps/examples/mm_quarantine_test/README.txt
+new file mode 100644
+index 00000000..f589c519
+--- /dev/null
++++ b/apps/examples/mm_quarantine_test/README.txt
+@@ -0,0 +1,49 @@
++apps/examples/mm_quarantine_test
++================================
++
++Exercises CONFIG_DEBUG_MM_QUARANTINE and reports pass or fail per check,
++rather than asking the reader to interpret a log.
++
++Build with CONFIG_EXAMPLES_MM_QUARANTINE_TEST=y, which requires
++CONFIG_DEBUG_MM_QUARANTINE. Run it from TASH as "quartest". The exit status
++is zero when every check passed.
++
++Checks
++------
++
++  1. A freed address is not handed straight back by the next allocation of
++     the same size. This is the whole point of the quarantine: it is what
++     leaves a stale write somewhere harmless to land.
++
++  2. The delay is bounded. Churning one size many times over must bring
++     addresses back round, or the quarantine would simply be a leak, and the
++     number of addresses in circulation must stay within the configured ring
++     depth.
++
++  3. A chunk larger than CONFIG_DEBUG_MM_QUARANTINE_MAX_SIZE is not held.
++     Reported rather than asserted, because whether the identical address
++     returns also depends on coalescing and on
++     CONFIG_MM_ALLOC_LARGE_FROM_BACK.
++
++  4. Held memory is released rather than failing an allocation. The heap is
++     filled, emptied so the quarantine is holding as much as it may, then
++     filled again; the second pass must fit as much as the first. This is the
++     check that goes red if the quarantine flush in mm_malloc() is ever
++     removed, which is the highest risk part of the feature.
++
++Demonstrations
++--------------
++
++These run last because they corrupt the heap on purpose, and they are read
++from the log rather than asserted.
++
++  5. A write through a stale pointer after another allocation has already
++     taken the block. This is the case the free list detector cannot see at
++     all. The write is at offset 0, which is only covered because a held
++     block carries the pattern across its whole payload.
++
++  6. Freeing a block which is still held. A held block still looks allocated,
++     so the ordinary double free test cannot see it and the quarantine is
++     scanned instead; the report names both callers.
++
++Do not enable this in a product build.
+diff --git a/apps/examples/mm_quarantine_test/mm_quarantine_test.c b/apps/examples/mm_quarantine_test/mm_quarantine_test.c
+new file mode 100644
+index 00000000..57fc7344
+--- /dev/null
++++ b/apps/examples/mm_quarantine_test/mm_quarantine_test.c
+@@ -0,0 +1,464 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++#include <stdbool.h>
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++/* Small enough that the quarantine will always accept it */
++
++#define SMALL_SIZE	64
++
++/* Larger than the largest chunk the quarantine will hold, so it must go
++ * straight back to the free list.
++ */
++
++#define LARGE_SIZE	(CONFIG_DEBUG_MM_QUARANTINE_MAX_SIZE + 256)
++
++/* Enough allocations to push anything held right through the ring */
++
++#define CHURN_ROUNDS	(CONFIG_DEBUG_MM_QUARANTINE_CHUNKS * 4)
++
++/* Pointer bookkeeping lives in .bss, not on the heap, so that the test does
++ * not perturb the thing it is measuring.
++ */
++
++#define MAX_BLOCKS	512
++#define MAX_TRACKED	64
++
++#define STALE_VALUE	0xdeadbeef
++
++/****************************************************************************
++ * Private Data
++ ****************************************************************************/
++
++static FAR void *g_blocks[MAX_BLOCKS];
++static FAR void *g_seen[MAX_TRACKED];
++
++static int g_passed;
++static int g_failed;
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++static void banner(FAR const char *what)
++{
++	printf("\n------------------------------------------------------------\n");
++	printf("%s\n", what);
++	printf("------------------------------------------------------------\n");
++}
++
++static void check(bool ok, FAR const char *what)
++{
++	if (ok) {
++		g_passed++;
++		printf("  [PASS] %s\n", what);
++	} else {
++		g_failed++;
++		printf("  [FAIL] %s\n", what);
++	}
++}
++
++static int largest_free_block(void)
++{
++	struct mallinfo info;
++
++#ifdef CONFIG_CAN_PASS_STRUCTS
++	info = mallinfo();
++#else
++	(void)mallinfo(&info);
++#endif
++
++	return info.mxordblk;
++}
++
++/****************************************************************************
++ * Name: fill_heap
++ *
++ * Description:
++ *   Allocate 'size' blocks until the allocator refuses, recording them in
++ *   g_blocks. Returns how many were obtained.
++ *
++ ****************************************************************************/
++
++static int fill_heap(size_t size)
++{
++	int count = 0;
++
++	while (count < MAX_BLOCKS) {
++		FAR void *p = malloc(size);
++		if (p == NULL) {
++			break;
++		}
++
++		g_blocks[count++] = p;
++	}
++
++	return count;
++}
++
++static void empty_heap(int count)
++{
++	int i;
++
++	for (i = 0; i < count; i++) {
++		free(g_blocks[i]);
++		g_blocks[i] = NULL;
++	}
++}
++
++/****************************************************************************
++ * Name: case_delayed_reuse
++ *
++ * Description:
++ *   The defining behaviour. A freed address must not come straight back from
++ *   the next allocation of the same size, because that is what gives a write
++ *   through a stale pointer somewhere harmless to land.
++ *
++ ****************************************************************************/
++
++static void case_delayed_reuse(void)
++{
++	FAR void *first;
++	FAR void *second;
++
++	banner("Case 1: a freed address is not handed straight back");
++
++	first = malloc(SMALL_SIZE);
++	if (first == NULL) {
++		printf("  malloc failed, skipping\n");
++		return;
++	}
++
++	free(first);
++	second = malloc(SMALL_SIZE);
++
++	printf("  freed   %p\n", first);
++	printf("  next    %p\n", second);
++
++	check(second != NULL, "the following allocation still succeeds");
++	check(second != first, "the freed address is not reused immediately");
++
++	free(second);
++}
++
++/****************************************************************************
++ * Name: case_bounded_holding
++ *
++ * Description:
++ *   The delay has to be bounded, or the quarantine would be a leak. Churn
++ *   the same size many times over and confirm that addresses start coming
++ *   back round, and that the number of addresses in circulation stays small.
++ *
++ ****************************************************************************/
++
++static void case_bounded_holding(void)
++{
++	int distinct = 0;
++	int reused = 0;
++	int i;
++	int j;
++
++	banner("Case 2: the delay is bounded, so memory is still recycled");
++
++	for (i = 0; i < CHURN_ROUNDS; i++) {
++		FAR void *p = malloc(SMALL_SIZE);
++		bool known = false;
++
++		if (p == NULL) {
++			printf("  malloc failed at round %d, stopping\n", i);
++			break;
++		}
++
++		for (j = 0; j < distinct; j++) {
++			if (g_seen[j] == p) {
++				known = true;
++				break;
++			}
++		}
++
++		if (known) {
++			reused++;
++		} else if (distinct < MAX_TRACKED) {
++			g_seen[distinct++] = p;
++		}
++
++		free(p);
++	}
++
++	printf("  %d rounds, %d distinct addresses, %d reuses\n", CHURN_ROUNDS, distinct, reused);
++
++	check(reused > 0, "addresses come back round, so nothing is leaked");
++	/* A model of the allocator settles at exactly CHUNKS + 1 distinct
++	 * addresses. Allow generous headroom for coalescing effects on a real
++	 * heap: a genuine leak would show CHURN_ROUNDS distinct addresses, which
++	 * is four times the ring depth, so this still fails loudly.
++	 */
++
++	check(distinct <= CONFIG_DEBUG_MM_QUARANTINE_CHUNKS * 2,
++		  "addresses in circulation stay within the configured ring depth");
++}
++
++/****************************************************************************
++ * Name: case_oversized_bypass
++ *
++ * Description:
++ *   A chunk larger than CONFIG_DEBUG_MM_QUARANTINE_MAX_SIZE is not worth
++ *   holding on a small heap, so it goes straight back to the free list.
++ *
++ *   Reported rather than asserted: whether the identical address returns also
++ *   depends on coalescing and on CONFIG_MM_ALLOC_LARGE_FROM_BACK, so a
++ *   different address here is not by itself a defect.
++ *
++ ****************************************************************************/
++
++static void case_oversized_bypass(void)
++{
++	FAR void *first;
++	FAR void *second;
++
++	banner("Case 3: an oversized chunk is not held (observation only)");
++
++	first = malloc(LARGE_SIZE);
++	if (first == NULL) {
++		printf("  malloc of %d bytes failed, skipping\n", LARGE_SIZE);
++		return;
++	}
++
++	free(first);
++	second = malloc(LARGE_SIZE);
++
++	printf("  quarantine holds at most %d bytes per chunk\n", CONFIG_DEBUG_MM_QUARANTINE_MAX_SIZE);
++	printf("  freed   %p\n", first);
++	printf("  next    %p  (%s)\n", second,
++		   (second == first) ? "same address, went straight back to the free list"
++							 : "different address, see the note in the source");
++
++	check(second != NULL, "an oversized allocation still succeeds after free");
++
++	free(second);
++}
++
++/****************************************************************************
++ * Name: case_no_spurious_failure
++ *
++ * Description:
++ *   The one that matters for anything but a toy. Holding memory back must
++ *   never turn into an allocation failure which would not happen with the
++ *   option disabled, so malloc flushes the quarantine before giving up.
++ *
++ *   Fill the heap, note how much fitted, release it all so that the
++ *   quarantine is holding as much as it is allowed to, then fill the heap
++ *   again. The second pass must fit as much as the first. If the flush in
++ *   mm_malloc() is ever removed, this is the check that goes red.
++ *
++ ****************************************************************************/
++
++static void case_no_spurious_failure(void)
++{
++	FAR void *ballast = NULL;
++	size_t room;
++	int first_pass;
++	int second_pass;
++	int largest;
++
++	banner("Case 4: held memory is released rather than failing an allocation");
++
++	/* Take out a large block first so that the heap can actually be filled
++	 * within MAX_BLOCKS. Without it, a roomy heap reaches the block cap while
++	 * memory is still available, the allocator never has to refuse, the flush
++	 * is never reached and the check below passes without testing anything.
++	 */
++
++	room = (size_t)(MAX_BLOCKS / 2) * (SMALL_SIZE + 32);
++	largest = largest_free_block();
++	if ((size_t)largest > room) {
++		ballast = malloc((size_t)largest - room);
++	}
++
++	printf("  largest free block %d bytes, reserved %s to leave room for about %d blocks\n",
++		   largest, ballast ? "a ballast block" : "nothing", MAX_BLOCKS / 2);
++
++	first_pass = fill_heap(SMALL_SIZE);
++	printf("  first pass  : %d blocks of %d bytes before the heap was full\n", first_pass, SMALL_SIZE);
++	empty_heap(first_pass);
++
++	printf("  freed them all, so the quarantine is now holding up to %d bytes\n",
++		   CONFIG_DEBUG_MM_QUARANTINE_BYTES);
++
++	second_pass = fill_heap(SMALL_SIZE);
++	printf("  second pass : %d blocks\n", second_pass);
++	empty_heap(second_pass);
++
++	check(first_pass > 0, "the heap could be filled at all");
++	check(first_pass < MAX_BLOCKS,
++		  "the allocator actually ran out, so the release path was reached");
++	check(second_pass >= first_pass,
++		  "the second pass fits as much as the first, so nothing stayed held back");
++
++	if (ballast != NULL) {
++		free(ballast);
++	}
++
++	largest = largest_free_block();
++	printf("  largest free block afterwards: %d bytes\n", largest);
++	check(largest > 0, "the heap still reports free space afterwards");
++}
++
++/****************************************************************************
++ * Name: case_stale_write_after_reuse
++ *
++ * Description:
++ *   The scenario the quarantine exists for, and the reason the plain free
++ *   list detector cannot see it: one owner frees a block, somebody else
++ *   allocates, and only then does the first owner write through its stale
++ *   pointer.
++ *
++ *   This corrupts the heap on purpose. It is reported through the log rather
++ *   than asserted, because the report is what is being demonstrated.
++ *
++ ****************************************************************************/
++
++static void case_stale_write_after_reuse(void)
++{
++	FAR uint32_t *stale;
++	FAR void *other;
++	int i;
++
++	banner("Case 5: write through a stale pointer after somebody else allocated");
++
++	stale = (FAR uint32_t *)malloc(SMALL_SIZE);
++	if (stale == NULL) {
++		printf("  malloc failed, skipping\n");
++		return;
++	}
++
++	printf("  owner allocated %p and frees it\n", stale);
++	free(stale);
++
++	other = malloc(SMALL_SIZE);
++	printf("  another allocation of the same size landed at %p\n", other);
++	printf("  the held block is not reachable by anybody else while it waits\n");
++
++	printf("  now writing 0x%08x through the stale pointer, at offset 0\n", STALE_VALUE);
++	stale[0] = STALE_VALUE;
++
++	printf("  churning so the held block ages out of the quarantine\n");
++	for (i = 0; i < CHURN_ROUNDS; i++) {
++		FAR void *tmp = malloc(SMALL_SIZE);
++		if (tmp != NULL) {
++			free(tmp);
++		}
++	}
++
++	printf("  EXPECTED above: a \"Use after free detected\" report naming the\n");
++	printf("                  task which allocated the block. Offset 0 is only\n");
++	printf("                  covered because a held block carries the pattern\n");
++	printf("                  across its whole payload.\n");
++
++	if (other != NULL) {
++		free(other);
++	}
++}
++
++/****************************************************************************
++ * Name: case_double_free_while_held
++ *
++ * Description:
++ *   A held block still looks allocated, so the ordinary double free test
++ *   cannot see it and the quarantine is scanned instead. The pay-off is that
++ *   both callers are known at the time of the report.
++ *
++ ****************************************************************************/
++
++static void case_double_free_while_held(void)
++{
++	FAR void *p;
++
++	banner("Case 6: freeing a block which is still held");
++
++	p = malloc(SMALL_SIZE);
++	if (p == NULL) {
++		printf("  malloc failed, skipping\n");
++		return;
++	}
++
++	printf("  allocated %p, freeing it once\n", p);
++	free(p);
++
++	printf("  freeing it a second time while it is still held\n");
++	free(p);
++
++	printf("  EXPECTED above: a double free warning naming both callers, and\n");
++	printf("                  the node dumped as a quarantined node\n");
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++#ifdef CONFIG_BUILD_KERNEL
++int main(int argc, FAR char *argv[])
++#else
++int quartest_main(int argc, char *argv[])
++#endif
++{
++	printf("\n############################################################\n");
++	printf("Heap quarantine test\n");
++	printf("  chunks held at most : %d\n", CONFIG_DEBUG_MM_QUARANTINE_CHUNKS);
++	printf("  bytes held at most  : %d\n", CONFIG_DEBUG_MM_QUARANTINE_BYTES);
++	printf("  largest chunk held  : %d\n", CONFIG_DEBUG_MM_QUARANTINE_MAX_SIZE);
++	printf("  poison window       : %d bytes\n", CONFIG_DEBUG_MM_UAF_POISON_SIZE);
++	printf("############################################################\n");
++
++	/* Checks first, while the heap is still sound */
++
++	case_delayed_reuse();
++	case_bounded_holding();
++	case_oversized_bypass();
++	case_no_spurious_failure();
++
++	printf("\n============================================================\n");
++	printf("Checks: %d passed, %d failed\n", g_passed, g_failed);
++	printf("============================================================\n");
++
++	/* Demonstrations last, because they corrupt the heap deliberately */
++
++	printf("\nThe remaining cases corrupt the heap on purpose to show the\n");
++	printf("reports the quarantine makes possible. Reboot afterwards.\n");
++
++	case_stale_write_after_reuse();
++	case_double_free_while_held();
++
++	printf("\nDone. %d checks passed, %d failed.\n", g_passed, g_failed);
++
++	return (g_failed == 0) ? 0 : 1;
++}

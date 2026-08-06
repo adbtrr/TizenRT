@@ -1,0 +1,618 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_pr_fixes_use_quaran <>
+Date: Thu, 6 Aug 2026 20:45:44 +0000
+Subject: [PATCH 4/8] os/mm: Add a quarantine so freed chunks are not reusable
+ immediately
+
+The poison and verify detector only watches a chunk while it is on the
+free list, and the check runs at the moment the chunk is handed out.
+The allocator hands a just freed chunk straight back, because it is a
+perfect fit for the next request of the same size, so the window in
+which a stale write can be caught is often a single malloc call wide.
+
+If one thread frees a block, a second thread allocates it, and the
+first thread only then writes through its stale pointer, the write
+falls outside that window. It lands in memory which legitimately
+belongs to the second thread, so there is no pattern left to compare
+against and no check of the contents could tell the two writers apart.
+This is not a limit of the implementation: at the allocator level both
+writes are a store to a validly allocated address.
+
+Delaying the reuse is what separates them, and on this platform it is
+the only option, since the alternatives need an MMU or hardware pointer
+tagging.
+
+On free, offer the chunk to a bounded ring instead of returning it to
+the free list. A held chunk keeps MM_ALLOC_BIT set, which is what stops
+malloc from finding it and stops the neighbours from merging into it,
+so its address cannot reach anybody else. When it ages out, the pattern
+is checked and the chunk is coalesced and released as usual.
+
+The ring lives in struct mm_heap_s rather than in the chunks. Putting
+the links in the payload, as the delay list does, would place them
+exactly where the write being hunted usually lands, so the corruption
+would destroy the list instead of being reported.
+
+Because a held chunk still looks allocated, the existing double free
+test in mm_free() cannot see it, and a second free would enter the same
+chunk into the ring twice. Scan the ring explicitly. That also turns a
+double free of a held chunk into a report which names both callers.
+
+malloc and memalign flush the whole quarantine before reporting
+failure, so holding memory back for debugging never turns into an
+allocation failure that would not happen with the option off.
+
+The coalescing tail of mm_free_internal() becomes mm_free_coalesce() so
+that the release path can reuse it.
+---
+ os/Kconfig.debug              |  65 ++++++++++
+ os/include/tinyara/mm/mm.h    |  22 ++++
+ os/mm/mm_heap/Make.defs       |   4 +
+ os/mm/mm_heap/mm_free.c       |  61 ++++++++-
+ os/mm/mm_heap/mm_initialize.c |   4 +
+ os/mm/mm_heap/mm_malloc.c     |  26 ++++
+ os/mm/mm_heap/mm_memalign.c   |  26 ++++
+ os/mm/mm_heap/mm_quarantine.c | 224 ++++++++++++++++++++++++++++++++++
+ 8 files changed, 428 insertions(+), 4 deletions(-)
+ create mode 100644 os/mm/mm_heap/mm_quarantine.c
+
+diff --git a/os/Kconfig.debug b/os/Kconfig.debug
+index 79dc55d1..85d72bc1 100644
+--- a/os/Kconfig.debug
++++ b/os/Kconfig.debug
+@@ -828,6 +828,71 @@ config DEBUG_MM_UAF_PANIC
+ 		If disabled, the corruption is only reported and the allocation
+ 		proceeds.
+ 
++config DEBUG_MM_QUARANTINE
++	bool "Delay the reuse of freed chunks"
++	default n
++	---help---
++		Hold a freed chunk out of the free list for a while instead of making
++		it reusable straight away, and check its poison pattern when it is
++		finally released.
++
++		This is what makes the case DEBUG_MM_UAF cannot see detectable: one
++		thread frees a block, a second thread allocates the same block, and
++		the first thread then writes through its stale pointer. Without the
++		delay the address already belongs to the second thread by the time the
++		bad write happens, so no check of the contents can tell that write
++		apart from a legitimate one. While the chunk is held, the second
++		thread is given a different one, so the stale write lands in memory
++		nobody owns and the pattern check finds it.
++
++		A held chunk keeps its allocated bit set, so it does not merge with
++		its neighbours. Its owner, allocating address and freeing address
++		therefore survive intact and the report names the right code. Freeing
++		a held chunk a second time is also reported, with both callers.
++
++		malloc releases the whole quarantine before it reports failure, so
++		enabling this does not cause allocation failures which would not
++		happen otherwise.
++
++		This widens the window in which a stale write is detectable, it does
++		not close it. A write which happens after the chunk has aged out and
++		been reallocated is still missed, and reads through a stale pointer
++		are not detected at all. Holding chunks back also costs contiguous
++		free space, which matters most on a small heap, so this is intended
++		for test and soak builds rather than for a product configuration.
++
++if DEBUG_MM_QUARANTINE
++
++config DEBUG_MM_QUARANTINE_CHUNKS
++	int "Maximum number of chunks to hold"
++	default 32
++	range 1 256
++	---help---
++		Size of the quarantine ring. Costs one pointer of static memory per
++		slot per heap. A larger ring keeps addresses out of circulation for
++		longer, which widens the window in which a stale write is still
++		detectable.
++
++config DEBUG_MM_QUARANTINE_BYTES
++	int "Maximum number of bytes to hold"
++	default 4096
++	range 64 65536
++	---help---
++		Total size of the chunks held at any one time. The oldest chunks are
++		released to stay within this budget. Keep it small relative to the
++		heap: the memory is unavailable until it is released.
++
++config DEBUG_MM_QUARANTINE_MAX_SIZE
++	int "Largest chunk to hold (bytes)"
++	default 1024
++	range 32 65536
++	---help---
++		Chunks larger than this go straight back to the free list instead of
++		being held. Holding a large buffer costs more of a small heap than
++		the extra detection is worth.
++
++endif # DEBUG_MM_QUARANTINE
++
+ endif # DEBUG_MM_UAF
+ 
+ config DEBUG_IRQ
+diff --git a/os/include/tinyara/mm/mm.h b/os/include/tinyara/mm/mm.h
+index 635efcbe..07300ea4 100644
+--- a/os/include/tinyara/mm/mm.h
++++ b/os/include/tinyara/mm/mm.h
+@@ -411,6 +411,19 @@ struct mm_heap_s {
+ 
+ 	FAR struct mm_delaynode_s *mm_delaylist[CONFIG_SMP_NCPUS];
+ 
++#ifdef CONFIG_DEBUG_MM_QUARANTINE
++	/* Chunks which have been freed but are deliberately not reusable yet, so
++	 * that a write through a stale pointer lands in memory nobody owns and
++	 * can still be recognised. Held out of band, in this array rather than in
++	 * the chunks themselves, so that the very write being hunted cannot
++	 * corrupt the list.
++	 */
++
++	FAR struct mm_allocnode_s *mm_quarantine[CONFIG_DEBUG_MM_QUARANTINE_CHUNKS];
++	uint16_t mm_qhead;			/* Slot of the oldest held chunk */
++	uint16_t mm_qcount;			/* Number of chunks held */
++	size_t mm_qbytes;			/* Total size of the chunks held */
++#endif
+ };
+ 
+ /****************************************************************************
+@@ -664,6 +677,15 @@ void mm_shrinkchunk(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *node,
+ 
+ void mm_addfreechunk(FAR struct mm_heap_s *heap, FAR struct mm_freenode_s *node);
+ 
++void mm_free_coalesce(FAR struct mm_heap_s *heap, FAR struct mm_freenode_s *node);
++
++#ifdef CONFIG_DEBUG_MM_QUARANTINE
++void mm_quarantine_init(FAR struct mm_heap_s *heap);
++bool mm_quarantine_contains(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *node);
++bool mm_quarantine_add(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *node);
++size_t mm_quarantine_flush(FAR struct mm_heap_s *heap);
++#endif
++
+ /* Functions contained in mm_size2ndx.c.c ***********************************/
+ 
+ int mm_size2ndx(size_t size);
+diff --git a/os/mm/mm_heap/Make.defs b/os/mm/mm_heap/Make.defs
+index 732c094c..5012ec65 100644
+--- a/os/mm/mm_heap/Make.defs
++++ b/os/mm/mm_heap/Make.defs
+@@ -66,6 +66,10 @@ ifeq ($(CONFIG_DEBUG_MM_UAF),y)
+ CSRCS += mm_uaf.c
+ endif
+ 
++ifeq ($(CONFIG_DEBUG_MM_QUARANTINE),y)
++CSRCS += mm_quarantine.c
++endif
++
+ ifeq ($(CONFIG_DEBUG_MM_HEAPINFO),y)
+ CSRCS += mm_heapinfo_parse_heap.c mm_heapinfo_utils.c
+ ifeq ($(CONFIG_HEAPINFO_USER_GROUP),y)
+diff --git a/os/mm/mm_heap/mm_free.c b/os/mm/mm_heap/mm_free.c
+index 6b7043e1..079404ef 100644
+--- a/os/mm/mm_heap/mm_free.c
++++ b/os/mm/mm_heap/mm_free.c
+@@ -121,8 +121,6 @@ static void mm_add_delaylist(FAR struct mm_heap_s *heap, FAR void *mem)
+ static void mm_free_internal(FAR struct mm_heap_s *heap, FAR void *mem, mmaddress_t free_call_addr, pid_t free_call_pid)
+ {
+ 	FAR struct mm_freenode_s *node;
+-	FAR struct mm_freenode_s *prev;
+-	FAR struct mm_freenode_s *next;
+ 	char task_name[CONFIG_TASK_NAME_SIZE + 1];
+ 
+ 	mvdbg("Freeing %p\n", mem);
+@@ -185,17 +183,73 @@ static void mm_free_internal(FAR struct mm_heap_s *heap, FAR void *mem, mmaddres
+ 		mm_givesemaphore(heap);
+ 		return;
+ 	}
++#ifdef CONFIG_DEBUG_MM_QUARANTINE
++	if (mm_quarantine_contains(heap, (FAR struct mm_allocnode_s *)node)) {
++		/* The chunk is being held in the quarantine, so it still looks
++		 * allocated and the test above could not catch this. Freeing it again
++		 * is a double free, and unlike the usual case both callers are known.
++		 */
++
++		mdbg("WARNING!! Double free of a pointer which is still in quarantine\n");
++#ifdef CONFIG_DEBUG_MM_FREEINFO
++		GET_TASK_NAME_BY_PID(task_name, node->free_call_pid);
++		mdbg("1st free: released by %s (%d) at addr 0x%08x\n", task_name, node->free_call_pid, node->free_call_addr);
++#endif
++		GET_TASK_NAME_BY_PID(task_name, free_call_pid);
++		mdbg("2nd free (double free): now try to release by %s (%d) at addr 0x%08x\n", task_name, free_call_pid, free_call_addr);
++		mm_dump_node((struct mm_allocnode_s *)node, "QUARANTINED NODE");
++		mm_givesemaphore(heap);
++		return;
++	}
++#endif
++
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 	heapinfo_subtract_size(heap, ((struct mm_allocnode_s *)node)->pid, ((struct mm_allocnode_s *)node)->size);
+ 	heapinfo_update_total_size(heap, ((-1) * ((struct mm_allocnode_s *)node)->size), ((struct mm_allocnode_s *)node)->pid);
+ #endif
+-	node->preceding &= ~MM_ALLOC_BIT;
+ #ifdef CONFIG_DEBUG_MM_FREEINFO
+ 	/* Record free metadata and quarantine sequence */
+ 	node->free_call_addr = free_call_addr;
+ 	node->free_call_pid = free_call_pid;
+ #endif
+ 
++#ifdef CONFIG_DEBUG_MM_QUARANTINE
++	/* Offer the chunk to the quarantine before it becomes reusable. If it is
++	 * taken, MM_ALLOC_BIT deliberately stays set: that keeps the neighbours
++	 * from merging into it and keeps malloc from finding it, so the address
++	 * cannot be handed to anybody else while it is held.
++	 */
++
++	if (mm_quarantine_add(heap, (FAR struct mm_allocnode_s *)node)) {
++		mm_givesemaphore(heap);
++		return;
++	}
++#endif
++
++	node->preceding &= ~MM_ALLOC_BIT;
++
++	mm_free_coalesce(heap, node);
++	mm_givesemaphore(heap);
++}
++
++/****************************************************************************
++ * Name: mm_free_coalesce
++ *
++ * Description:
++ *   Merge 'node' with any free neighbour and put the result on the free list.
++ *
++ *   NOTES:
++ *     (1) MM_ALLOC_BIT must already be cleared in node->preceding.
++ *     (2) the caller must hold the MM semaphore, and still holds it on
++ *         return.
++ *
++ ****************************************************************************/
++
++void mm_free_coalesce(FAR struct mm_heap_s *heap, FAR struct mm_freenode_s *node)
++{
++	FAR struct mm_freenode_s *prev;
++	FAR struct mm_freenode_s *next;
++
+ 	/* Check if the following node is free and, if so, merge it */
+ 
+ 	next = (FAR struct mm_freenode_s *)((char *)node + node->size);
+@@ -252,7 +306,6 @@ static void mm_free_internal(FAR struct mm_heap_s *heap, FAR void *mem, mmaddres
+ 	/* Add the merged node to the nodelist */
+ 
+ 	mm_addfreechunk(heap, node);
+-	mm_givesemaphore(heap);
+ }
+ 
+ /****************************************************************************
+diff --git a/os/mm/mm_heap/mm_initialize.c b/os/mm/mm_heap/mm_initialize.c
+index 692de114..250f13b1 100644
+--- a/os/mm/mm_heap/mm_initialize.c
++++ b/os/mm/mm_heap/mm_initialize.c
+@@ -254,6 +254,10 @@ int mm_initialize(FAR struct mm_heap_s *heap, FAR void *heapstart, size_t heapsi
+ 		heap->mm_delaylist[i] = NULL;
+ 	}
+ 
++#ifdef CONFIG_DEBUG_MM_QUARANTINE
++	mm_quarantine_init(heap);
++#endif
++
+ 	/* Initialize the malloc semaphore to one (to support one-at-
+ 	 * a-time access to private data sets).
+ 	 */
+diff --git a/os/mm/mm_heap/mm_malloc.c b/os/mm/mm_heap/mm_malloc.c
+index 0420cc87..1d259a2f 100644
+--- a/os/mm/mm_heap/mm_malloc.c
++++ b/os/mm/mm_heap/mm_malloc.c
+@@ -149,6 +149,9 @@ FAR void *mm_malloc(FAR struct mm_heap_s *heap, size_t size, mmaddress_t caller_
+ 	void *ret = NULL;
+ 	int ndx;
+ 	bool gc_done = false;
++#ifdef CONFIG_DEBUG_MM_QUARANTINE
++	bool qflush_done = false;
++#endif
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 	size_t gc_before_size;
+ #endif
+@@ -297,6 +300,29 @@ retry_after_gc:
+ 
+ 	mm_givesemaphore(heap);
+ 
++#ifdef CONFIG_DEBUG_MM_QUARANTINE
++	if (!ret && qflush_done == false) {
++		/* Before anything more drastic, hand back the memory which is only
++		 * being held for use-after-free detection. Without this step the
++		 * quarantine would turn into allocation failures which do not happen
++		 * with the option disabled.
++		 */
++
++		size_t qfreed;
++
++		mm_takesemaphore(heap);
++		qfreed = mm_quarantine_flush(heap);
++		mm_givesemaphore(heap);
++
++		qflush_done = true;
++
++		if (qfreed > 0) {
++			mdbg("Allocation failed, released %u bytes from the quarantine\n", qfreed);
++			goto retry_after_gc;
++		}
++	}
++#endif
++
+ 	if (!ret && gc_done == false) {
+ 		mdbg("Allocation failed!!! We dont have enough memory. Try to free dead task stack areas\n");
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+diff --git a/os/mm/mm_heap/mm_memalign.c b/os/mm/mm_heap/mm_memalign.c
+index 7410e60e..d1ac8917 100644
+--- a/os/mm/mm_heap/mm_memalign.c
++++ b/os/mm/mm_heap/mm_memalign.c
+@@ -117,6 +117,9 @@ FAR void *mm_memalign(FAR struct mm_heap_s *heap, size_t alignment, size_t size,
+ 	bool found_align = false;
+ 	size_t mask = (size_t)(alignment - 1);
+ 	bool gc_done = false;
++#ifdef CONFIG_DEBUG_MM_QUARANTINE
++	bool qflush_done = false;
++#endif
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 	size_t gc_before_size;
+ #endif
+@@ -277,6 +280,29 @@ retry_after_gc:
+ 
+ 	mm_givesemaphore(heap);
+ 
++#ifdef CONFIG_DEBUG_MM_QUARANTINE
++	if (!ret && qflush_done == false) {
++		/* Before anything more drastic, hand back the memory which is only
++		 * being held for use-after-free detection. Without this step the
++		 * quarantine would turn into allocation failures which do not happen
++		 * with the option disabled.
++		 */
++
++		size_t qfreed;
++
++		mm_takesemaphore(heap);
++		qfreed = mm_quarantine_flush(heap);
++		mm_givesemaphore(heap);
++
++		qflush_done = true;
++
++		if (qfreed > 0) {
++			mdbg("Allocation failed, released %u bytes from the quarantine\n", qfreed);
++			goto retry_after_gc;
++		}
++	}
++#endif
++
+ 	if (!ret && gc_done == false) {
+ 		mdbg("Allocation failed!!! We dont have enough memory. Try to free dead task stack areas\n");
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+diff --git a/os/mm/mm_heap/mm_quarantine.c b/os/mm/mm_heap/mm_quarantine.c
+new file mode 100644
+index 00000000..3e15c5c2
+--- /dev/null
++++ b/os/mm/mm_heap/mm_quarantine.c
+@@ -0,0 +1,224 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <assert.h>
++#include <debug.h>
++
++#include <tinyara/mm/mm.h>
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++#define QUARANTINE_SLOTS CONFIG_DEBUG_MM_QUARANTINE_CHUNKS
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: quarantine_release_oldest
++ *
++ * Description:
++ *   Take the oldest chunk out of the quarantine and give it back to the
++ *   allocator. The poison pattern is checked on the way out: this is the
++ *   point at which a write through a pointer freed long ago is found,
++ *   because until now nothing else could have written to the chunk.
++ *
++ *   NOTES:
++ *     (1) the quarantine must not be empty.
++ *     (2) the caller must hold the MM semaphore.
++ *
++ ****************************************************************************/
++
++static void quarantine_release_oldest(FAR struct mm_heap_s *heap)
++{
++	FAR struct mm_allocnode_s *node;
++
++	DEBUGASSERT(heap->mm_qcount > 0);
++
++	node = heap->mm_quarantine[heap->mm_qhead];
++	heap->mm_quarantine[heap->mm_qhead] = NULL;
++	heap->mm_qhead = (heap->mm_qhead + 1) % QUARANTINE_SLOTS;
++	heap->mm_qcount--;
++	heap->mm_qbytes -= node->size;
++
++	/* Check the chunk before anything else can touch it. Clear the allocated
++	 * bit first so that a report describes it as a free node rather than an
++	 * allocated one.
++	 */
++
++	node->preceding &= ~MM_ALLOC_BIT;
++
++	mm_uaf_verify((FAR struct mm_freenode_s *)node);
++
++	/* Now it may be merged with its neighbours and become reusable */
++
++	mm_free_coalesce(heap, (FAR struct mm_freenode_s *)node);
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: mm_quarantine_init
++ *
++ * Description:
++ *   Reset the quarantine of a heap. Called from mm_initialize().
++ *
++ ****************************************************************************/
++
++void mm_quarantine_init(FAR struct mm_heap_s *heap)
++{
++	int i;
++
++	for (i = 0; i < QUARANTINE_SLOTS; i++) {
++		heap->mm_quarantine[i] = NULL;
++	}
++
++	heap->mm_qhead = 0;
++	heap->mm_qcount = 0;
++	heap->mm_qbytes = 0;
++}
++
++/****************************************************************************
++ * Name: mm_quarantine_contains
++ *
++ * Description:
++ *   Test whether a chunk is currently held in the quarantine.
++ *
++ *   A held chunk keeps MM_ALLOC_BIT set, so it is indistinguishable from a
++ *   live allocation by its header alone and the usual double free test in
++ *   mm_free() cannot see it. This scan is what makes that case detectable,
++ *   and it is also what stops a second free from entering the same chunk
++ *   into the ring twice. The ring is small and bounded, so the scan is a
++ *   short walk over an array of pointers.
++ *
++ *   NOTES:
++ *     (1) the caller must hold the MM semaphore.
++ *
++ ****************************************************************************/
++
++bool mm_quarantine_contains(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *node)
++{
++	uint16_t i;
++	uint16_t slot;
++
++	for (i = 0; i < heap->mm_qcount; i++) {
++		slot = (heap->mm_qhead + i) % QUARANTINE_SLOTS;
++		if (heap->mm_quarantine[slot] == node) {
++			return true;
++		}
++	}
++
++	return false;
++}
++
++/****************************************************************************
++ * Name: mm_quarantine_add
++ *
++ * Description:
++ *   Offer a chunk which has just been freed to the quarantine.
++ *
++ *   Returns true when the chunk has been taken, in which case the caller
++ *   must not touch it any further: it keeps MM_ALLOC_BIT set and stays out
++ *   of the free list, so its address cannot be handed to anybody else until
++ *   it ages out. Returns false when the chunk should be freed normally.
++ *
++ *   A chunk larger than CONFIG_DEBUG_MM_QUARANTINE_MAX_SIZE is never taken.
++ *   Holding a large buffer costs more of a small heap than the extra
++ *   detection is worth.
++ *
++ *   NOTES:
++ *     (1) node->size must already be set to its final value.
++ *     (2) MM_ALLOC_BIT must still be set in node->preceding.
++ *     (3) the caller must hold the MM semaphore.
++ *
++ ****************************************************************************/
++
++bool mm_quarantine_add(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *node)
++{
++	uint16_t slot;
++
++	if (node->size > CONFIG_DEBUG_MM_QUARANTINE_MAX_SIZE) {
++		return false;
++	}
++
++	/* Make room. Releasing the oldest entries here is safe even though the
++	 * caller's chunk may be adjacent to one of them: the caller's chunk still
++	 * has MM_ALLOC_BIT set, so a released neighbour cannot merge into it.
++	 */
++
++	while (heap->mm_qcount >= QUARANTINE_SLOTS ||
++		   heap->mm_qbytes + node->size > CONFIG_DEBUG_MM_QUARANTINE_BYTES) {
++		if (heap->mm_qcount == 0) {
++			/* The chunk on its own does not fit under the byte budget */
++
++			return false;
++		}
++
++		quarantine_release_oldest(heap);
++	}
++
++	/* Lay down the pattern while nothing owns the chunk */
++
++	mm_uaf_poison((FAR struct mm_freenode_s *)node);
++
++	slot = (heap->mm_qhead + heap->mm_qcount) % QUARANTINE_SLOTS;
++	heap->mm_quarantine[slot] = node;
++	heap->mm_qcount++;
++	heap->mm_qbytes += node->size;
++
++	return true;
++}
++
++/****************************************************************************
++ * Name: mm_quarantine_flush
++ *
++ * Description:
++ *   Release everything the quarantine is holding and return the number of
++ *   bytes handed back to the allocator.
++ *
++ *   This is what keeps the quarantine from turning into spurious allocation
++ *   failures: malloc calls it before giving up, so memory which is only held
++ *   back for debugging is always available to a real request.
++ *
++ *   NOTES:
++ *     (1) the caller must hold the MM semaphore.
++ *
++ ****************************************************************************/
++
++size_t mm_quarantine_flush(FAR struct mm_heap_s *heap)
++{
++	size_t released = heap->mm_qbytes;
++
++	while (heap->mm_qcount > 0) {
++		quarantine_release_oldest(heap);
++	}
++
++	return released;
++}

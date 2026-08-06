@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_pr_fixes_use_quaran <>
+Date: Thu, 6 Aug 2026 20:46:06 +0000
+Subject: [PATCH 5/8] os/mm: Poison the whole payload of a quarantined chunk
+
+The quarantine used the free list window, which starts after flink,
+blink and the free debug info. That leaves the first bytes of the
+payload unchecked: eight of them without CONFIG_DEBUG_MM_FREEINFO,
+sixteen with it. Those bytes are exactly where a write to the first
+member of a freed object lands, which is the commonest shape of the bug
+the quarantine exists to catch, so without this the delay would widen
+the time window while leaving the same blind spot in place.
+
+A held chunk is in no list at all, so those fields are not in use and
+there is nothing to preserve. Use the range based primitive to cover
+the payload from its first byte to the end of the chunk. The free list
+path is untouched and keeps its narrower window.
+
+No extra clamp is applied to the length. It is already bounded by
+CONFIG_DEBUG_MM_QUARANTINE_MAX_SIZE, which is what decides whether a
+chunk is worth holding, so the poisoning cost per chunk is bounded by
+the same knob that bounds the memory cost.
+---
+ os/mm/mm_heap/mm_quarantine.c | 42 ++++++++++++++++++++++++++++++++---
+ 1 file changed, 39 insertions(+), 3 deletions(-)
+
+diff --git a/os/mm/mm_heap/mm_quarantine.c b/os/mm/mm_heap/mm_quarantine.c
+index 3e15c5c2..d97c482c 100644
+--- a/os/mm/mm_heap/mm_quarantine.c
++++ b/os/mm/mm_heap/mm_quarantine.c
+@@ -39,6 +39,33 @@
+  * Private Functions
+  ****************************************************************************/
+ 
++/****************************************************************************
++ * Name: quarantine_area
++ *
++ * Description:
++ *   Work out which part of a held chunk carries the poison pattern.
++ *
++ *   Unlike a chunk on the free list, a held chunk is in no list at all, so
++ *   flink, blink and the free debug info are not in use and the pattern can
++ *   cover the whole user data area. That matters: the free list window has
++ *   to start after those fields, which leaves the first bytes of the payload
++ *   unchecked, and those are exactly where a write to the first member of a
++ *   freed object lands.
++ *
++ *   No further clamp is applied. The length is already bounded by
++ *   CONFIG_DEBUG_MM_QUARANTINE_MAX_SIZE, which is what decides whether a
++ *   chunk is worth holding at all.
++ *
++ ****************************************************************************/
++
++static void quarantine_area(FAR struct mm_allocnode_s *node, FAR void **start, FAR size_t *nbytes)
++{
++	size_t offset = MM_UAF_ALIGN_UP(SIZEOF_MM_ALLOCNODE);
++
++	*start = (FAR void *)((FAR char *)node + offset);
++	*nbytes = (node->size > offset) ? node->size - offset : 0;
++}
++
+ /****************************************************************************
+  * Name: quarantine_release_oldest
+  *
+@@ -57,6 +84,8 @@
+ static void quarantine_release_oldest(FAR struct mm_heap_s *heap)
+ {
+ 	FAR struct mm_allocnode_s *node;
++	FAR void *start;
++	size_t nbytes;
+ 
+ 	DEBUGASSERT(heap->mm_qcount > 0);
+ 
+@@ -73,7 +102,8 @@ static void quarantine_release_oldest(FAR struct mm_heap_s *heap)
+ 
+ 	node->preceding &= ~MM_ALLOC_BIT;
+ 
+-	mm_uaf_verify((FAR struct mm_freenode_s *)node);
++	quarantine_area(node, &start, &nbytes);
++	mm_uaf_verify_range(node, start, nbytes);
+ 
+ 	/* Now it may be merged with its neighbours and become reusable */
+ 
+@@ -162,6 +192,8 @@ bool mm_quarantine_contains(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_
+ 
+ bool mm_quarantine_add(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *node)
+ {
++	FAR void *start;
++	size_t nbytes;
+ 	uint16_t slot;
+ 
+ 	if (node->size > CONFIG_DEBUG_MM_QUARANTINE_MAX_SIZE) {
+@@ -184,9 +216,13 @@ bool mm_quarantine_add(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *no
+ 		quarantine_release_oldest(heap);
+ 	}
+ 
+-	/* Lay down the pattern while nothing owns the chunk */
++	/* Lay down the pattern while nothing owns the chunk. The whole payload is
++	 * covered here, not just the free list window, because a held chunk is in
++	 * no list and has no links to preserve.
++	 */
+ 
+-	mm_uaf_poison((FAR struct mm_freenode_s *)node);
++	quarantine_area(node, &start, &nbytes);
++	mm_uaf_poison_range(start, nbytes);
+ 
+ 	slot = (heap->mm_qhead + heap->mm_qcount) % QUARANTINE_SLOTS;
+ 	heap->mm_quarantine[slot] = node;

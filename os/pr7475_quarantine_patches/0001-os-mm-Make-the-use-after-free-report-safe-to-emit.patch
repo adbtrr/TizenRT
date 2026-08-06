@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_pr_fixes_use_quaran <>
+Date: Thu, 6 Aug 2026 20:43:02 +0000
+Subject: [PATCH 1/8] os/mm: Make the use-after-free report safe to emit
+
+Two problems on the reporting path, both of which get worse as the
+detector finds more.
+
+The hex dump covered the whole chunk. The most likely victim of a stray
+write is the large top of heap free chunk, and mm_dump_heap_region()
+emits one line per 32 bytes, so a 128 KB chunk produced roughly 4096
+console lines with the memory manager semaphore held. On a serial
+console that is long enough to trip the watchdog, and in report only
+mode it happened on a path meant to be recoverable. Bound the dump to
+256 bytes. A smaller chunk is still shown in full so the bytes on
+either side of the corruption stay visible, and the checked window is
+always included even though it fits inside the bound with the default
+poison size.
+
+The pattern was also left corrupted after reporting. mm_realloc()
+verifies both neighbours before deciding whether to consume either of
+them, so a neighbour it does not consume stays on the free list still
+damaged and every later realloc touching it reprints the same report.
+Re-fill the window once the report has been printed, so a second report
+means a genuinely new write. The repair is skipped under
+CONFIG_DEBUG_MM_UAF_PANIC, where the crash dump should show the
+corrupting value.
+---
+ os/mm/mm_heap/mm_uaf.c | 39 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/os/mm/mm_heap/mm_uaf.c b/os/mm/mm_heap/mm_uaf.c
+index a5706630..c81418c9 100644
+--- a/os/mm/mm_heap/mm_uaf.c
++++ b/os/mm/mm_heap/mm_uaf.c
+@@ -30,6 +30,19 @@
+ 
+ #include "mm_node.h"
+ 
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++/* Upper bound on the hex dump printed when a corrupted chunk is found. A
++ * chunk smaller than this is dumped in full so that the bytes on either side
++ * of the corruption stay visible; a larger one is truncated. Without the
++ * bound, a corrupted top of heap chunk dumps the whole remaining heap, one
++ * line per 32 bytes, with the memory manager semaphore held.
++ */
++
++#define MM_UAF_DUMP_MAX		256
++
+ /****************************************************************************
+  * Private Functions
+  ****************************************************************************/
+@@ -129,6 +142,7 @@ void mm_uaf_verify(struct mm_freenode_s *node)
+ {
+ 	uint32_t *poison;
+ 	size_t nwords;
++	size_t dumpsize;
+ 	size_t i;
+ 
+ 	nwords = mm_uaf_area(node, &poison);
+@@ -144,12 +158,35 @@ void mm_uaf_verify(struct mm_freenode_s *node)
+ 		return;
+ 	}
+ 
++	/* Show the checked window whatever happens, plus as much of the rest of
++	 * the chunk as the bound allows.
++	 */
++
++	dumpsize = MM_ALIGN_UP(SIZEOF_MM_FREENODE) + nwords * sizeof(uint32_t);
++	if (dumpsize < MM_UAF_DUMP_MAX) {
++		dumpsize = MM_UAF_DUMP_MAX;
++	}
++
++	if (dumpsize > node->size) {
++		dumpsize = node->size;
++	}
++
+ 	heap_dbg("#########################################################################################\n");
+ 	mfdbg("ERROR: Use after free detected.\n");
+ 	mm_dump_node((struct mm_allocnode_s *)node, "FREE NODE");
+-	mm_dump_heap_region((uint32_t)node, (uint32_t)node + node->size);
++	mm_dump_heap_region((uint32_t)node, (uint32_t)node + dumpsize);
+ 
+ #ifdef CONFIG_DEBUG_MM_UAF_PANIC
+ 	PANIC();
++#else
++	/* Repair the pattern now that the corruption has been reported.
++	 *
++	 * mm_realloc() verifies both neighbours before it decides whether to
++	 * consume either of them. A neighbour it does not consume stays on the
++	 * free list still corrupted, so without this repair every later realloc
++	 * touching it prints the same report again, forever, from one defect.
++	 */
++
++	mm_uaf_poison(node);
+ #endif
+ }
