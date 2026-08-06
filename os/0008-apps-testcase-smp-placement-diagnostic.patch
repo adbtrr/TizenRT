@@ -1,0 +1,775 @@
+From 92496b1710398af23a466fae40b4abf6ae6bcdc1 Mon Sep 17 00:00:00 2001
+From: adbtrr_work6_sched_fixed <>
+Date: Thu, 6 Aug 2026 19:27:09 +0000
+Subject: [PATCH] apps/testcase: SMP placement diagnostic for the three
+ residual failures
+
+SCN-SMP-01, SCN-PRI-02 and SCN-AFF-04 remain red after PR 7465.  All three
+reduce to one question: two unpinned tasks, two CPUs, and both tasks run on
+CPU0 while CPU1 is not used.  AFF-04 states it outright, reporting
+union_mask=0x1 against an expected 0x3, and it reports it only after its per
+worker sample counts have passed, so the workers were running -- just never
+on the second CPU.
+
+Round-robin is not involved.  sched_select_cpu() decides where an unpinned
+task is placed, and it can decline the second CPU for exactly three reasons:
+the CPU is not in g_active_cpus_mask, the CPU is not idle and holds a task
+the newcomer cannot displace, or it is idle and still not chosen.  The three
+call for different fixes, so the cause has to be read rather than guessed.
+
+Add TESTIOC_SCHED_CPUSTATE, which snapshots the placement state -- the head
+of every g_assignedtasks[] list, the depth of each, the contents of
+g_readytorun with each waiter's affinity mask, g_active_cpus_mask, and what
+sched_select_cpu() returns for an unpinned task -- all inside one critical
+section so that every field describes the same instant.
+
+Add SCN-DIAG-01 through SCN-DIAG-04, which reproduce the idle system, the
+AFF-04 pair, the PRI-02 ladder and a forced migration to the second CPU, and
+print the snapshot underneath each.  The diagnostic reads scheduler state and
+moves nothing; every scenario reports success so that a diagnostic run cannot
+mask a regression elsewhere in the suite.
+---
+ apps/examples/testcase/le_tc/kernel/Make.defs |   1 +
+ .../testcase/le_tc/kernel/kernel_tc_main.c    |   1 +
+ .../testcase/le_tc/kernel/stc_sched_diag.c    | 454 ++++++++++++++++++
+ .../testcase/le_tc/kernel/tc_internal.h       |   1 +
+ os/drivers/os_api_test/kernel/test_sched.c    | 121 +++++
+ os/drivers/os_api_test/os_api_test_drv.c      |   3 +
+ os/include/tinyara/os_api_test_drv.h          |  55 +++
+ 7 files changed, 636 insertions(+)
+ create mode 100644 apps/examples/testcase/le_tc/kernel/stc_sched_diag.c
+
+diff --git a/apps/examples/testcase/le_tc/kernel/Make.defs b/apps/examples/testcase/le_tc/kernel/Make.defs
+index 125640de..69522466 100644
+--- a/apps/examples/testcase/le_tc/kernel/Make.defs
++++ b/apps/examples/testcase/le_tc/kernel/Make.defs
+@@ -186,6 +186,7 @@ ifeq ($(CONFIG_STC_KERNEL_SCHED),y)
+   CSRCS += stc_sched_smp.c
+   CSRCS += stc_sched_priority.c
+   CSRCS += stc_sched_affinity.c
++  CSRCS += stc_sched_diag.c
+ endif
+ 
+ # Include kernel build support
+diff --git a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+index 81f17257..2f3e59b2 100644
+--- a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
++++ b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+@@ -231,6 +231,7 @@ int tc_kernel_main(int argc, char *argv[])
+ 	stc_sched_smp_main();
+ 	stc_sched_priority_main();
+ 	stc_sched_affinity_main();
++	stc_sched_diag_main();
+ #endif
+ 
+ 	close(g_tc_fd);
+diff --git a/apps/examples/testcase/le_tc/kernel/stc_sched_diag.c b/apps/examples/testcase/le_tc/kernel/stc_sched_diag.c
+new file mode 100644
+index 00000000..6c0843e1
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/stc_sched_diag.c
+@@ -0,0 +1,454 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file stc_sched_diag.c
++
++/// @brief SMP placement diagnostic (family D)
++///
++/// SCN-SMP-01, SCN-PRI-02 and SCN-AFF-04 all fail the same way on a two CPU
++/// board: unpinned tasks pile onto one CPU while the other appears to have
++/// nothing to do.  AFF-04 measures it directly, reporting union_mask = 0x1
++/// where 0x3 was expected, and it reports that after its per worker sample
++/// counts have already passed, so both workers were running -- just never on
++/// the second CPU.
++///
++/// This file does not assert anything about that.  It reproduces the two
++/// failing shapes and prints the scheduler state underneath them, so that the
++/// cause can be read off rather than guessed at.  There are exactly three
++/// possibilities and the printout separates them:
++///
++///   1. g_active_cpus_mask does not include the second CPU.  Then
++///      sched_select_cpu() filters it out before looking at load at all, and
++///      no unpinned task can ever be placed there.
++///   2. The second CPU is not idle: some task is resident on it at a priority
++///      the workers cannot displace.  sched_addreadytorun() compares with a
++///      strict less-than, so an equal priority task never preempts, and
++///      sched_select_cpu() breaks ties toward the lowest numbered CPU.
++///   3. The second CPU is genuinely idle and still is not selected.  Then the
++///      defect is in the placement path itself.
++///
++/// Every scenario here is reported as a pass so that a diagnostic run never
++/// masks a real regression elsewhere in the suite.  The value is in the log,
++/// not in the verdict.
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++#include <errno.h>
++#include <sched.h>
++#include <sys/types.h>
++#include <sys/ioctl.h>
++#include <tinyara/os_api_test_drv.h>
++
++#include "tc_internal.h"
++#include "stc_sched_common.h"
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++#ifdef CONFIG_SMP
++
++/* How long the load runs before the state is sampled.  Long enough that
++ * start-up placement has settled and any round-robin rotation has happened
++ * many times over, short enough to keep the diagnostic quick.
++ */
++
++#define STC_DIAG_SETTLE_MS      600
++
++/* Number of snapshots taken per shape.  Placement is not necessarily stable,
++ * so a single sample could catch an unrepresentative instant.  Repeating it
++ * distinguishes "always on one CPU" from "moves, but rarely".
++ */
++
++#define STC_DIAG_SNAPSHOTS      5
++#define STC_DIAG_SNAP_GAP_MS    120
++
++/****************************************************************************
++ * Private Data
++ ****************************************************************************/
++
++static struct test_cpustate_s g_diag_state;
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_diag_snapshot
++ *
++ * Description:
++ *   Pull one consistent snapshot of the scheduler's placement state.
++ *
++ ****************************************************************************/
++
++static int stc_diag_snapshot(void)
++{
++	int fd = tc_get_drvfd();
++
++	memset(&g_diag_state, 0, sizeof(g_diag_state));
++
++	return ioctl(fd, TESTIOC_SCHED_CPUSTATE, (unsigned long)&g_diag_state);
++}
++
++/****************************************************************************
++ * Name: stc_diag_print
++ *
++ * Description:
++ *   Print one snapshot in a fixed, greppable layout.
++ *
++ *   The caller's own CPU is called out because the sampling task has to be
++ *   running somewhere, and that CPU is therefore occupied by the diagnostic
++ *   rather than by the workload.  Reading the log without accounting for that
++ *   would make one CPU look busy when it is only busy with the measurement.
++ *
++ ****************************************************************************/
++
++static void stc_diag_print(const char *tag, int snap)
++{
++	int i;
++
++	printf("[SCN-DIAG %s #%d] caller_cpu=%d active_mask=0x%x "
++	       "sched_locked=%d select_cpu(all)=%d rtr_depth=%d\n",
++	       tag, snap, (int)g_diag_state.caller_cpu,
++	       (unsigned int)g_diag_state.active_mask,
++	       (int)g_diag_state.sched_locked,
++	       (int)g_diag_state.select_all,
++	       (int)g_diag_state.nrtr);
++
++	for (i = 0; i < g_diag_state.ncpus && i < CONFIG_SMP_NCPUS; i++) {
++		printf("[SCN-DIAG %s #%d]   cpu%d: pid=%d prio=%d state=%d "
++		       "nassigned=%d idle_only=%d name=%s\n",
++		       tag, snap, i,
++		       (int)g_diag_state.cpu[i].pid,
++		       (int)g_diag_state.cpu[i].priority,
++		       (int)g_diag_state.cpu[i].state,
++		       (int)g_diag_state.cpu[i].nassigned,
++		       (int)g_diag_state.cpu[i].idle_only,
++		       g_diag_state.cpu[i].name);
++	}
++
++	for (i = 0; i < g_diag_state.nrtr_reported; i++) {
++		printf("[SCN-DIAG %s #%d]   rtr[%d]: pid=%d prio=%d affinity=0x%x "
++		       "name=%s\n",
++		       tag, snap, i,
++		       (int)g_diag_state.rtr[i].pid,
++		       (int)g_diag_state.rtr[i].priority,
++		       (unsigned int)g_diag_state.rtr[i].affinity,
++		       g_diag_state.rtr[i].name);
++	}
++}
++
++/****************************************************************************
++ * Name: stc_diag_observe
++ *
++ * Description:
++ *   Take and print the snapshot series for whatever load is currently
++ *   running.
++ *
++ ****************************************************************************/
++
++static void stc_diag_observe(const char *tag)
++{
++	int ret;
++	int i;
++
++	for (i = 0; i < STC_DIAG_SNAPSHOTS; i++) {
++		ret = stc_diag_snapshot();
++		if (ret != OK) {
++			printf("[SCN-DIAG %s] snapshot failed, ret=%d errno=%d\n",
++			       tag, ret, errno);
++			return;
++		}
++
++		stc_diag_print(tag, i);
++		usleep(STC_DIAG_SNAP_GAP_MS * 1000);
++	}
++}
++
++/****************************************************************************
++ * Name: stc_sched_diag01_idle_system
++ *
++ * @testcase             :stc_sched_diag01_idle_system
++ * @brief                :SCN-DIAG-01, placement state with no load
++ * @scenario             :Sample the scheduler with nothing running but the
++ *                        test itself.  This is the reference picture: it
++ *                        shows whether both CPUs are active, what is resident
++ *                        on each of them when no test load exists, and which
++ *                        CPU an unpinned task would be given.
++ *                        If a CPU already looks busy here, the workload
++ *                        scenarios were never going to be able to use it, and
++ *                        that fact belongs at the top of the log.
++ * @apicovered           :ioctl TESTIOC_SCHED_CPUSTATE
++ * @precondition         :CONFIG_SMP_NCPUS greater than one
++ * @postcondition        :none
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_diag01_idle_system(void)
++{
++	stc_diag_observe("idle");
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sched_diag02_unpinned_pair
++ *
++ * @testcase             :stc_sched_diag02_unpinned_pair
++ * @brief                :SCN-DIAG-02, placement under the AFF-04 load
++ * @scenario             :Recreate SCN-AFF-04 exactly -- two unpinned, equal
++ *                        priority, CPU bound tasks on a two CPU board -- and
++ *                        sample the scheduler underneath it.
++ *                        This is the shape that produced union_mask = 0x1.
++ *                        The snapshot says which CPU each worker is assigned
++ *                        to, whether the other CPU is running only its IDLE
++ *                        task, whether a worker is sitting unassigned in
++ *                        g_readytorun, and what affinity mask the workers
++ *                        actually ended up with.
++ * @apicovered           :ioctl TESTIOC_SCHED_CPUSTATE, task_create
++ * @precondition         :CONFIG_SMP_NCPUS greater than one
++ * @postcondition        :all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_diag02_unpinned_pair(void)
++{
++	struct stc_workload_s wl;
++	int nworkers = stc_ncpus();
++	int start_ret;
++	int i;
++
++	if (nworkers > STC_MAX_WORKERS) {
++		nworkers = STC_MAX_WORKERS;
++	}
++
++	stc_workload_init(&wl, nworkers, SCHED_PRIORITY_DEFAULT, SCHED_RR);
++	wl.sample_cpu = true;
++
++	start_ret = stc_workload_start(&wl);
++
++	if (start_ret == OK) {
++		for (i = 0; i < nworkers; i++) {
++			printf("[SCN-DIAG pair] worker %d pid=%d\n",
++			       i, (int)stc_worker_pid(i));
++		}
++
++		usleep(STC_DIAG_SETTLE_MS * 1000);
++		stc_diag_observe("pair");
++
++		/* Report where the workers were actually observed running, so
++		 * the snapshot can be cross checked against the workers' own
++		 * view of themselves.
++		 */
++
++		stc_workload_sample(STC_DIAG_SETTLE_MS);
++
++		for (i = 0; i < nworkers; i++) {
++			printf("[SCN-DIAG pair] worker %d count=%u seen=0x%x\n",
++			       i, (unsigned int)stc_count(i),
++			       (unsigned int)stc_cpu_seen_mask(i));
++		}
++	} else {
++		printf("[SCN-DIAG pair] workload start failed\n");
++	}
++
++	(void)stc_workload_finish(nworkers);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sched_diag03_priority_ladder
++ *
++ * @testcase             :stc_sched_diag03_priority_ladder
++ * @brief                :SCN-DIAG-03, placement under the PRI-02 load
++ * @scenario             :Recreate SCN-PRI-02 -- ncpus + 2 unpinned CPU bound
++ *                        tasks at descending priorities -- and sample the
++ *                        scheduler underneath it.
++ *                        PRI-02 failed because one of the top two tasks
++ *                        recorded no work at all.  If that task appears in
++ *                        g_readytorun in these snapshots while a CPU reports
++ *                        idle_only, the scheduler is leaving a runnable task
++ *                        unassigned next to an idle CPU, which is a stronger
++ *                        statement than the fairness failures and does not
++ *                        depend on round-robin at all.
++ * @apicovered           :ioctl TESTIOC_SCHED_CPUSTATE, task_create
++ * @precondition         :CONFIG_SMP_NCPUS greater than one
++ * @postcondition        :all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_diag03_priority_ladder(void)
++{
++	struct stc_workload_s wl;
++	int prios[STC_MAX_WORKERS];
++	int ncpus = stc_ncpus();
++	int nworkers = ncpus + 2;
++	int start_ret;
++	int i;
++
++	if (nworkers > STC_MAX_WORKERS) {
++		nworkers = STC_MAX_WORKERS;
++	}
++
++	for (i = 0; i < nworkers; i++) {
++		prios[i] = SCHED_PRIORITY_DEFAULT + (nworkers - 1 - i) * 10;
++	}
++
++	stc_workload_init(&wl, nworkers, prios[0], SCHED_RR);
++	wl.priorities = prios;
++	wl.sample_cpu = true;
++
++	start_ret = stc_workload_start(&wl);
++
++	if (start_ret == OK) {
++		for (i = 0; i < nworkers; i++) {
++			printf("[SCN-DIAG ladder] worker %d pid=%d prio=%d\n",
++			       i, (int)stc_worker_pid(i), prios[i]);
++		}
++
++		usleep(STC_DIAG_SETTLE_MS * 1000);
++		stc_diag_observe("ladder");
++
++		stc_workload_sample(STC_DIAG_SETTLE_MS);
++
++		for (i = 0; i < nworkers; i++) {
++			printf("[SCN-DIAG ladder] worker %d prio=%d count=%u seen=0x%x\n",
++			       i, prios[i], (unsigned int)stc_count(i),
++			       (unsigned int)stc_cpu_seen_mask(i));
++		}
++	} else {
++		printf("[SCN-DIAG ladder] workload start failed\n");
++	}
++
++	(void)stc_workload_finish(nworkers);
++
++	TC_SUCCESS_RESULT();
++}
++
++/****************************************************************************
++ * Name: stc_sched_diag04_forced_migration
++ *
++ * @testcase             :stc_sched_diag04_forced_migration
++ * @brief                :SCN-DIAG-04, does the second CPU accept work at all
++ * @scenario             :Take the same two unpinned workers and explicitly
++ *                        pin one of them to the highest numbered CPU with
++ *                        sched_setaffinity, then sample again.
++ *                        This separates "the second CPU cannot run tasks"
++ *                        from "the second CPU is never chosen".  The affinity
++ *                        scenarios already suggest the latter, since AFF-01
++ *                        and AFF-02 pass while pinned to that CPU, but doing
++ *                        it inside the same load removes any doubt that the
++ *                        difference comes from something else in those tests.
++ *                        If the worker migrates here and not otherwise, the
++ *                        defect is in CPU selection, not in the CPU.
++ * @apicovered           :sched_setaffinity, ioctl TESTIOC_SCHED_CPUSTATE
++ * @precondition         :CONFIG_SMP_NCPUS greater than one
++ * @postcondition        :all workers exited
++ * @return               :void
++ *
++ ****************************************************************************/
++
++static void stc_sched_diag04_forced_migration(void)
++{
++	struct stc_workload_s wl;
++	cpu_set_t mask = 0;
++	int ncpus = stc_ncpus();
++	int target = ncpus - 1;
++	int nworkers = 2;
++	int start_ret;
++	int set_ret = ERROR;
++	int i;
++
++	stc_workload_init(&wl, nworkers, SCHED_PRIORITY_DEFAULT, SCHED_RR);
++	wl.sample_cpu = true;
++
++	start_ret = stc_workload_start(&wl);
++
++	if (start_ret == OK) {
++		usleep(STC_DIAG_SETTLE_MS * 1000);
++
++		printf("[SCN-DIAG forced] before pinning worker 1 to cpu%d\n",
++		       target);
++		stc_diag_observe("forced-before");
++
++		CPU_SET(target, &mask);
++		set_ret = sched_setaffinity(stc_worker_pid(1),
++					    sizeof(cpu_set_t), &mask);
++
++		printf("[SCN-DIAG forced] setaffinity ret=%d\n", set_ret);
++
++		usleep(STC_DIAG_SETTLE_MS * 1000);
++		stc_diag_observe("forced-after");
++
++		stc_workload_sample(STC_DIAG_SETTLE_MS);
++
++		for (i = 0; i < nworkers; i++) {
++			printf("[SCN-DIAG forced] worker %d count=%u seen=0x%x\n",
++			       i, (unsigned int)stc_count(i),
++			       (unsigned int)stc_cpu_seen_mask(i));
++		}
++	} else {
++		printf("[SCN-DIAG forced] workload start failed\n");
++	}
++
++	(void)stc_workload_finish(nworkers);
++
++	TC_SUCCESS_RESULT();
++}
++
++#endif							/* CONFIG_SMP */
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: stc_sched_diag_main
++ ****************************************************************************/
++
++int stc_sched_diag_main(void)
++{
++#ifdef CONFIG_SMP
++	if (stc_ncpus() < 2) {
++		printf("[SCN-DIAG] skipped, single CPU configuration\n");
++		return 0;
++	}
++
++	printf("[SCN-DIAG] SMP placement diagnostic, ncpus=%d\n", stc_ncpus());
++
++	stc_sched_diag01_idle_system();
++	stc_sched_diag02_unpinned_pair();
++	stc_sched_diag03_priority_ladder();
++	stc_sched_diag04_forced_migration();
++#else
++	printf("[SCN-DIAG] skipped, built without CONFIG_SMP\n");
++#endif
++
++	return 0;
++}
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_internal.h b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+index 6e640736..79c3c19f 100644
+--- a/apps/examples/testcase/le_tc/kernel/tc_internal.h
++++ b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+@@ -104,6 +104,7 @@ int stc_sched_rr_main(void);
+ int stc_sched_smp_main(void);
+ int stc_sched_priority_main(void);
+ int stc_sched_affinity_main(void);
++int stc_sched_diag_main(void);
+ int tc_get_drvfd(void);
+ 
+ #endif /* __EXAMPLES_TESTCASE_KERNEL_TC_INTERNAL_H */
+diff --git a/os/drivers/os_api_test/kernel/test_sched.c b/os/drivers/os_api_test/kernel/test_sched.c
+index 8b2e9971..b2f8e594 100644
+--- a/os/drivers/os_api_test/kernel/test_sched.c
++++ b/os/drivers/os_api_test/kernel/test_sched.c
+@@ -26,6 +26,11 @@
+ 
+ #include <tinyara/os_api_test_drv.h>
+ #include <tinyara/sched.h>
++#ifdef CONFIG_SMP
++#include <string.h>
++#include <tinyara/irq.h>
++#include "sched/sched.h"
++#endif
+ 
+ /****************************************************************************
+  * Private Data
+@@ -71,6 +76,117 @@ static void test_sched_foreach(unsigned long arg)
+ 	sched_foreach((void *)arg, NULL);
+ }
+ 
++#ifdef CONFIG_SMP
++/****************************************************************************
++ * Name: test_sched_copyname
++ ****************************************************************************/
++
++static void test_sched_copyname(char *dest, FAR struct tcb_s *tcb)
++{
++#if CONFIG_TASK_NAME_SIZE > 0
++	strncpy(dest, tcb->name, TEST_CPUSTATE_NAMELEN - 1);
++	dest[TEST_CPUSTATE_NAMELEN - 1] = '\0';
++#else
++	dest[0] = '\0';
++#endif
++}
++
++/****************************************************************************
++ * Name: test_sched_cpustate
++ *
++ * Description:
++ *   Take a consistent snapshot of the SMP placement state: what each CPU is
++ *   running, what is waiting unassigned in g_readytorun, and which CPU
++ *   sched_select_cpu() would hand an unpinned task to right now.
++ *
++ *   The whole snapshot is taken inside one critical section so that the CPU
++ *   slots, the ready-to-run list and the select result all describe the same
++ *   instant.  Taking them separately would let the lists move underneath the
++ *   reader and produce a picture that never actually existed.
++ *
++ *   This reads scheduler state and nothing more; no list is modified and no
++ *   task is moved.
++ *
++ ****************************************************************************/
++
++static int test_sched_cpustate(unsigned long arg)
++{
++	FAR struct test_cpustate_s *st = (FAR struct test_cpustate_s *)arg;
++	FAR struct tcb_s *tcb;
++	irqstate_t flags;
++	int n;
++	int i;
++
++	if (st == NULL) {
++		return -EINVAL;
++	}
++
++	memset(st, 0, sizeof(struct test_cpustate_s));
++
++	flags = enter_critical_section();
++
++	st->ncpus = CONFIG_SMP_NCPUS;
++	st->caller_cpu = (uint8_t)this_cpu();
++	st->active_mask = (uint32_t)g_active_cpus_mask;
++	st->sched_locked = sched_islocked_global() ? 1 : 0;
++
++	/* What sched_select_cpu() would return for a task allowed on every CPU.
++	 * This is the decision that places an unpinned task, so it is the value
++	 * that explains where such a task ends up.
++	 */
++
++	st->select_all = (int8_t)sched_select_cpu((cpu_set_t)((1 << CONFIG_SMP_NCPUS) - 1));
++
++	/* Per CPU: the running task and the depth of its assigned list.  The
++	 * idle_only flag is the exact test sched_select_cpu() applies, recorded
++	 * here so that its decision can be checked against its input.
++	 */
++
++	for (i = 0; i < CONFIG_SMP_NCPUS; i++) {
++		tcb = (FAR struct tcb_s *)g_assignedtasks[i].head;
++		if (tcb == NULL) {
++			continue;
++		}
++
++		st->cpu[i].pid = tcb->pid;
++		st->cpu[i].priority = tcb->sched_priority;
++		st->cpu[i].state = tcb->task_state;
++		st->cpu[i].idle_only = (tcb->flink == NULL) ? 1 : 0;
++		test_sched_copyname(st->cpu[i].name, tcb);
++
++		for (n = 0; tcb != NULL && n < 255; tcb = (FAR struct tcb_s *)tcb->flink) {
++			n++;
++		}
++
++		st->cpu[i].nassigned = (uint8_t)n;
++	}
++
++	/* The unassigned runnable tasks, in the order the scheduler sees them. */
++
++	n = 0;
++	for (tcb = (FAR struct tcb_s *)g_readytorun.head; tcb != NULL;
++	     tcb = (FAR struct tcb_s *)tcb->flink) {
++		if (n < TEST_CPUSTATE_MAXRTR) {
++			st->rtr[n].pid = tcb->pid;
++			st->rtr[n].priority = tcb->sched_priority;
++			st->rtr[n].affinity = (uint32_t)tcb->affinity;
++			test_sched_copyname(st->rtr[n].name, tcb);
++		}
++
++		if (++n >= 255) {
++			break;
++		}
++	}
++
++	st->nrtr = (uint8_t)n;
++	st->nrtr_reported = (uint8_t)(n < TEST_CPUSTATE_MAXRTR ? n : TEST_CPUSTATE_MAXRTR);
++
++	leave_critical_section(flags);
++
++	return OK;
++}
++#endif							/* CONFIG_SMP */
++
+ /****************************************************************************
+  * Public Functions
+  ****************************************************************************/
+@@ -91,6 +207,11 @@ int test_sched(int cmd, unsigned long arg)
+ 	case TESTIOC_SCHED_FOREACH:
+ 		test_sched_foreach(arg);
+ 		break;
++#ifdef CONFIG_SMP
++	case TESTIOC_SCHED_CPUSTATE:
++		ret = test_sched_cpustate(arg);
++		break;
++#endif
+ 	}
+ 	return ret;
+ }
+diff --git a/os/drivers/os_api_test/os_api_test_drv.c b/os/drivers/os_api_test/os_api_test_drv.c
+index fa1cdae2..e76599bb 100644
+--- a/os/drivers/os_api_test/os_api_test_drv.c
++++ b/os/drivers/os_api_test/os_api_test_drv.c
+@@ -101,6 +101,9 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long
+ 	case TESTIOC_IS_ALIVE_THREAD:
+ 	case TESTIOC_GET_TCB_ADJ_STACK_SIZE:
+ 	case TESTIOC_SCHED_FOREACH:
++#ifdef CONFIG_SMP
++	case TESTIOC_SCHED_CPUSTATE:
++#endif
+ 		ret = test_sched(cmd, arg);
+ 		break;
+ 	case TESTIOC_CLOCK_ABSTIME2TICKS_TEST:
+diff --git a/os/include/tinyara/os_api_test_drv.h b/os/include/tinyara/os_api_test_drv.h
+index 59969b84..98201572 100644
+--- a/os/include/tinyara/os_api_test_drv.h
++++ b/os/include/tinyara/os_api_test_drv.h
+@@ -28,6 +28,8 @@
+  ****************************************************************************/
+ 
+ #include <tinyara/config.h>
++#include <stdint.h>
++#include <sys/types.h>
+ #include <tinyara/fs/ioctl.h>
+ 
+ #ifdef CONFIG_DRIVERS_OS_API_TEST
+@@ -88,8 +90,61 @@
+ #define TESTIOC_GET_FS_PARTNO			_TESTIOC(24)
+ #endif
+ 
++#ifdef CONFIG_SMP
++#define TESTIOC_SCHED_CPUSTATE			_TESTIOC(25)
++#endif
++
+ #define OS_API_TEST_DRVPATH	"/dev/os_api_test"
+ 
++#ifdef CONFIG_SMP
++/* Snapshot of the SMP scheduler's placement state.
++ *
++ * TESTIOC_SCHED_CPUSTATE fills one of these from inside a critical section so
++ * that every field describes the same instant.  It answers a single question:
++ * when an unassigned task is waiting in g_readytorun, why was it not given to
++ * an idle CPU?
++ *
++ * Read only.  Nothing here changes scheduler state.
++ */
++
++#define TEST_CPUSTATE_MAXRTR	8
++#define TEST_CPUSTATE_NAMELEN	16
++
++/* One entry per CPU, describing the head of g_assignedtasks[cpu] -- that is,
++ * the task the CPU is actually executing.
++ */
++
++struct test_cpu_slot_s {
++	pid_t pid;
++	uint8_t priority;
++	uint8_t state;				/* tstate_t of the running task */
++	uint8_t nassigned;			/* Length of g_assignedtasks[cpu] */
++	uint8_t idle_only;			/* head->flink == NULL, i.e. only IDLE here */
++	char name[TEST_CPUSTATE_NAMELEN];
++};
++
++/* One entry per waiting task in g_readytorun, in priority order. */
++
++struct test_rtr_slot_s {
++	pid_t pid;
++	uint8_t priority;
++	uint32_t affinity;
++	char name[TEST_CPUSTATE_NAMELEN];
++};
++
++struct test_cpustate_s {
++	uint8_t ncpus;				/* CONFIG_SMP_NCPUS */
++	uint8_t caller_cpu;			/* CPU the caller is running on */
++	uint32_t active_mask;			/* g_active_cpus_mask */
++	uint8_t sched_locked;			/* sched_islocked_global() */
++	int8_t select_all;			/* sched_select_cpu(all CPUs) */
++	uint8_t nrtr;				/* Length of g_readytorun */
++	uint8_t nrtr_reported;			/* Entries filled in rtr[] */
++	struct test_cpu_slot_s cpu[CONFIG_SMP_NCPUS];
++	struct test_rtr_slot_s rtr[TEST_CPUSTATE_MAXRTR];
++};
++#endif							/* CONFIG_SMP */
++
+ /****************************************************************************
+  * Public Data
+  ****************************************************************************/
+-- 
+2.43.0
+
