@@ -1,0 +1,76 @@
+From 13649899cfc8883c9dbf57ece700064f5f88c1d6 Mon Sep 17 00:00:00 2001
+From: adbtrr_work5 <adbtrr_work5@local>
+Date: Fri, 7 Aug 2026 09:38:10 +0000
+Subject: [PATCH] mm/heapinfo: drop unrelated whitespace changes
+
+Addresses review feedback on the heapinfo capture window change: the diff
+carried cosmetic whitespace edits that are unrelated to the feature and make
+the change harder to read and to merge.
+
+ - apps/system/utils/utils_heapinfo.c: restore the blank line that separated
+   the --help check from the option loop, drop the tab-only line introduced
+   after optind, and align the terminator of the new comment block.
+ - os/mm/mm_heap/mm_heapinfo_utils.c: restore the two lines in
+   heapinfo_set_pid() whose indentation was reformatted; only the two
+   heapinfo_add_size()/heapinfo_subtract_size() call sites needed to change.
+ - lib/libc/sched/Make.defs: restore the blank line that separated the CSRCS
+   assignment from the CONFIG_BUILD_PROTECTED block.
+
+No functional change. After this, "git diff" and "git diff -w" of the branch
+against its base report identical statistics, i.e. the branch no longer
+contains any whitespace-only edit.
+---
+ apps/system/utils/utils_heapinfo.c | 5 +++--
+ lib/libc/sched/Make.defs           | 1 +
+ os/mm/mm_heap/mm_heapinfo_utils.c  | 4 ++--
+ 3 files changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/apps/system/utils/utils_heapinfo.c b/apps/system/utils/utils_heapinfo.c
+index 30275a52..d7d4514f 100644
+--- a/apps/system/utils/utils_heapinfo.c
++++ b/apps/system/utils/utils_heapinfo.c
+@@ -225,12 +225,13 @@ int utils_heapinfo(int argc, char **args)
+ 	if (argc >= 2 && !strncmp(args[1], "--help", strlen("--help") + 1)) {
+ 		goto usage;
+ 	}
++
+ 	/* Reset getopt's global state so that a previous invocation which returned
+ 	 * early (e.g. -s) does not leave optind/g_binitialized stale, causing the
+ 	 * next call to start parsing from the wrong argv position.
+-	*/
++	 */
+ 	optind = 0;
+-	
++
+ 	while ((opt = getopt(argc, args, "ikb:d:ap:fgrc:s:")) != ERROR) {
+ 		switch (opt) {
+ 		/* i : initialize the peak allocated memory size. */
+diff --git a/lib/libc/sched/Make.defs b/lib/libc/sched/Make.defs
+index 3fdd85ee..85514875 100644
+--- a/lib/libc/sched/Make.defs
++++ b/lib/libc/sched/Make.defs
+@@ -53,6 +53,7 @@
+ # Add the sched C files to the build
+ 
+ CSRCS += sched_getprioritymax.c sched_getprioritymin.c sched_backtrace.c
++
+ ifeq ($(CONFIG_BUILD_PROTECTED),y)
+ CSRCS += task_startup.c
+ endif
+diff --git a/os/mm/mm_heap/mm_heapinfo_utils.c b/os/mm/mm_heap/mm_heapinfo_utils.c
+index 764a72ab..17c8f683 100644
+--- a/os/mm/mm_heap/mm_heapinfo_utils.c
++++ b/os/mm/mm_heap/mm_heapinfo_utils.c
+@@ -371,10 +371,10 @@ void heapinfo_set_pid(void *address, pid_t pid)
+ 			/* Subtract from old PID's accounting */
+ 			heapinfo_subtract_size(heap, old_pid, node->size, node);
+ 			heapinfo_update_total_size(heap, (-1) * node->size, old_pid);
+-
++			
+ 			/* Update node PID */
+ 			node->pid = pid;
+-
++			
+ 			/* Add to new PID's accounting */
+ 			heapinfo_add_size(heap, pid, node->size, node);
+ 			heapinfo_update_total_size(heap, node->size, pid);
