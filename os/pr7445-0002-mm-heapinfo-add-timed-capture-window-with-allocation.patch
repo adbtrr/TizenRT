@@ -1,0 +1,1156 @@
+From 2a3c2d16855859e03960ba962eda10e7d1aab1f5 Mon Sep 17 00:00:00 2001
+From: adbtrr_work5 <adbtrr_work5@local>
+Date: Mon, 10 Aug 2026 14:05:19 +0000
+Subject: [PATCH 2/3] mm/heapinfo: add timed capture window with allocation
+ backtrace
+
+Adds heap leak detection over a bounded time window, plus the allocation
+call-stack needed to trace a leak candidate back to its origin.
+
+Allocation backtrace
+ - sched_backtrace() (lib/libc/sched) returns the call stack of the current
+   thread by walking the compiler generated EHABI unwind tables through
+   libgcc's _Unwind_Backtrace.  No frame pointer, no stack scan heuristic and
+   no syscall trap.
+ - Heap nodes carry the immediate malloc caller plus HEAPINFO_BACKTRACE_DEPTH-1
+   deeper frames, recorded on the allocation path for user space allocations.
+ - Toolchain support: -funwind-tables for the code being unwound.
+
+Capture window
+ - "heapinfo -c start" arms a window on the selected heap, "heapinfo -c stop"
+   disarms it and reports, in three sections: blocks allocated during the
+   window and still alive, pre window blocks resized inside it with their old
+   and new size, and pre window blocks freed inside it.
+ - The table is maintained on the same code path that updates the per pid
+   heapinfo counter, so the reported totals reconcile with the counter delta
+   rather than being derived from a separate heap walk.
+ - Capture state lives in struct mm_heap_s so the kernel side ioctl can arm a
+   window that the user side allocator observes in a protected build.  The
+   table is allocated from the target heap only while a window is active.
+ - heapinfo_add_size()/heapinfo_subtract_size()/heapinfo_update_node() take
+   the node and the heap so the table can be updated in step with the counter.
+
+Kernel and allocator side only; the heapinfo command line options that drive
+this are a separate commit.
+---
+ build/configs/rtl8730e/Make.defs       |   5 +
+ lib/libc/sched/Make.defs               |   2 +-
+ lib/libc/sched/sched_backtrace.c       | 165 +++++++++++++++++
+ os/arch/arm/src/armv7-a/Toolchain.defs |   7 +
+ os/drivers/memory/mminfo.c             |  31 ++++
+ os/include/tinyara/mm/mm.h             |  80 ++++++++-
+ os/mm/mm_heap/mm_free.c                |   2 +-
+ os/mm/mm_heap/mm_heapinfo_parse_heap.c | 138 +++++++++++++-
+ os/mm/mm_heap/mm_heapinfo_utils.c      | 240 ++++++++++++++++++++++++-
+ os/mm/mm_heap/mm_initialize.c          |  16 +-
+ os/mm/mm_heap/mm_malloc.c              |  62 ++++++-
+ os/mm/mm_heap/mm_memalign.c            |   4 +-
+ os/mm/mm_heap/mm_realloc.c             |  17 +-
+ 13 files changed, 739 insertions(+), 30 deletions(-)
+ create mode 100644 lib/libc/sched/sched_backtrace.c
+
+diff --git a/build/configs/rtl8730e/Make.defs b/build/configs/rtl8730e/Make.defs
+index c26305d4..fc3ae5b1 100644
+--- a/build/configs/rtl8730e/Make.defs
++++ b/build/configs/rtl8730e/Make.defs
+@@ -175,6 +175,11 @@ endif
+   CXXFLAGS += -pedantic -D_DEBUG -D_LIBCPP_BUILD_STATIC -ffunction-sections -fdata-sections -D__GLIBCXX__
+ endif
+ 
++ifeq ($(findstring __KERNEL__,$(EXTRADEFINES)),)
++  ARCHCFLAGS += -funwind-tables
++  ARCHCXXFLAGS += -funwind-tables
++endif
++
+ ifeq ($(CONFIG_LIBCXX_EXCEPTION),y)
+   CXXFLAGS += -fexceptions
+ else
+diff --git a/lib/libc/sched/Make.defs b/lib/libc/sched/Make.defs
+index b279410b..85514875 100644
+--- a/lib/libc/sched/Make.defs
++++ b/lib/libc/sched/Make.defs
+@@ -52,7 +52,7 @@
+ 
+ # Add the sched C files to the build
+ 
+-CSRCS += sched_getprioritymax.c sched_getprioritymin.c
++CSRCS += sched_getprioritymax.c sched_getprioritymin.c sched_backtrace.c
+ 
+ ifeq ($(CONFIG_BUILD_PROTECTED),y)
+ CSRCS += task_startup.c
+diff --git a/lib/libc/sched/sched_backtrace.c b/lib/libc/sched/sched_backtrace.c
+new file mode 100644
+index 00000000..212b30db
+--- /dev/null
++++ b/lib/libc/sched/sched_backtrace.c
+@@ -0,0 +1,165 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++/****************************************************************************
++ * lib/libc/sched/sched_backtrace.c
++ *
++ * Ported from NuttX (libs/libc/sched/sched_backtrace.c).
++ *
++ * Returns the call-stack (return addresses) of the CURRENT thread using the
++ * compiler-generated EHABI unwind tables (.ARM.exidx) via libgcc's
++ * _Unwind_Backtrace.  This is precise (no frame pointer, no stack-scan
++ * heuristic) and runs entirely in the caller's context - no syscall trap.
++ *
++ * Requires the unwound code to be compiled with unwind tables
++ * (-funwind-tables); CONFIG_SCHED_BACKTRACE turns that on.
++ *
++ * Note: only the current thread is supported (tid must be the caller).
++ * Backtracing another (sleeping) thread needs its saved context and is not
++ * provided by this user-space implementation.
++ ****************************************************************************/
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++
++#ifdef CONFIG_SCHED_BACKTRACE
++
++#include <sys/types.h>
++#include <unistd.h>
++#include <unwind.h>
++
++/****************************************************************************
++ * Private Data Types
++ ****************************************************************************/
++
++struct trace_arg {
++	FAR void **array;	/* Caller-supplied buffer for return addresses */
++	_Unwind_Word cfa;	/* Canonical Frame Address of the previous frame */
++	int cnt;		/* Number of entries stored so far (starts negative
++				 * to honour 'skip') */
++	int size;		/* Capacity of 'array' */
++};
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/* Allow arch-specific adjustment of a return address (weak: identity). */
++
++__attribute__((weak))
++FAR void *unwind_arch_adjustment(FAR void *prev, FAR void *addr)
++{
++	(void)prev;
++	return addr;
++}
++
++/****************************************************************************
++ * Name: backtrace_helper
++ *
++ * Description:
++ *   Called by _Unwind_Backtrace once per stack frame.  Records the return
++ *   address (instruction pointer) of each frame into the caller's buffer.
++ ****************************************************************************/
++
++static _Unwind_Reason_Code backtrace_helper(FAR struct _Unwind_Context *ctx, FAR void *a)
++{
++	FAR struct trace_arg *arg = a;
++
++	/* We are first called with the address inside this backtrace machinery;
++	 * negative 'cnt' skips those (and any user-requested 'skip') frames.
++	 */
++
++	if (arg->cnt >= 0) {
++		arg->array[arg->cnt] = (FAR void *)_Unwind_GetIP(ctx);
++		if (arg->cnt > 0) {
++			arg->array[arg->cnt] = unwind_arch_adjustment(arg->array[arg->cnt - 1], arg->array[arg->cnt]);
++		}
++
++		/* Detect lack of progress (same IP + CFA) -> end of stack. */
++
++		_Unwind_Word cfa = _Unwind_GetCFA(ctx);
++
++		if (arg->cnt > 0 && arg->array[arg->cnt - 1] == arg->array[arg->cnt] && cfa == arg->cfa) {
++			return _URC_END_OF_STACK;
++		}
++
++		arg->cfa = cfa;
++	}
++
++	if (++arg->cnt >= arg->size) {
++		return _URC_END_OF_STACK;
++	}
++
++	return _URC_NO_REASON;
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: sched_backtrace
++ *
++ * Description:
++ *   Get the backtrace (return addresses) of the specified thread.  Only the
++ *   calling thread (tid == getpid()) is supported.
++ *
++ * Input Parameters:
++ *   tid    - Thread ID (must be the current thread)
++ *   buffer - Where the return addresses are stored
++ *   size   - Maximum number of addresses to store
++ *   skip   - Number of innermost frames to omit
++ *
++ * Returned Value:
++ *   The number of addresses stored in 'buffer', or 0 on failure.
++ *
++ ****************************************************************************/
++
++int sched_backtrace(pid_t tid, FAR void **buffer, int size, int skip)
++{
++	struct trace_arg arg;
++
++	if (buffer == NULL || size <= 0) {
++		return 0;
++	}
++
++	/* This user-space implementation can only unwind its own stack. */
++
++	if (tid != getpid()) {
++		return 0;
++	}
++
++	arg.array = buffer;
++	arg.cfa = 0;
++	arg.size = size;
++	arg.cnt = -skip - 1;
++
++	_Unwind_Backtrace(backtrace_helper, &arg);
++
++	/* _Unwind_Backtrace tends to leave a trailing NULL above _start. */
++
++	if (arg.cnt > 1 && arg.array[arg.cnt - 1] == NULL) {
++		--arg.cnt;
++	}
++
++	return arg.cnt > 0 ? arg.cnt : 0;
++}
++
++#endif /* CONFIG_SCHED_BACKTRACE */
+diff --git a/os/arch/arm/src/armv7-a/Toolchain.defs b/os/arch/arm/src/armv7-a/Toolchain.defs
+index b74f6b63..8e085ab8 100644
+--- a/os/arch/arm/src/armv7-a/Toolchain.defs
++++ b/os/arch/arm/src/armv7-a/Toolchain.defs
+@@ -138,6 +138,13 @@ else
+   ARCHOPTIMIZATION += -fomit-frame-pointer
+ endif
+ 
++ifeq ($(CONFIG_SCHED_BACKTRACE),y)
++ifeq ($(findstring __KERNEL__,$(EXTRADEFINES)),)
++  ARCHCFLAGS += -funwind-tables
++  ARCHCXXFLAGS += -funwind-tables
++endif
++endif
++
+ ifeq ($(CONFIG_STACK_CANARIES),y)
+   ARCHOPTIMIZATION += -fstack-protector-all
+ endif
+diff --git a/os/drivers/memory/mminfo.c b/os/drivers/memory/mminfo.c
+index ea205813..8c0a23ad 100644
+--- a/os/drivers/memory/mminfo.c
++++ b/os/drivers/memory/mminfo.c
+@@ -131,6 +131,37 @@ static int mminfo_ioctl(FAR struct file *filep, int cmd, unsigned long arg)
+ 			heap->peak_alloc_size = 0;
+ 			break;
+ 		}
++		if (option->mode == HEAPINFO_CAPTURE_START || option->mode == HEAPINFO_CAPTURE_STOP) {
++			/* Capture state lives in each heap struct. START arms the window and
++			 * clears any stale tags; STOP disarms it and reports the blocks that
++			 * were allocated during the window and are still not freed.
++			 */
++#if CONFIG_KMM_NHEAPS > 1
++			if (option->heap_type == HEAPINFO_HEAP_TYPE_KERNEL) {
++				int heap_idx;
++				for (heap_idx = HEAP_START_IDX; heap_idx <= HEAP_END_IDX; heap_idx++) {
++					if (option->mode == HEAPINFO_CAPTURE_START) {
++						heapinfo_capture_reset(&heap[heap_idx]);
++						heapinfo_capture_start(&heap[heap_idx], option->pid);
++					} else {
++						heapinfo_capture_stop(&heap[heap_idx]);
++						heapinfo_capture_report(&heap[heap_idx], option->pid);
++					}
++				}
++			} else
++#endif
++			{
++				if (option->mode == HEAPINFO_CAPTURE_START) {
++					heapinfo_capture_reset(heap);
++					heapinfo_capture_start(heap, option->pid);
++				} else {
++					heapinfo_capture_stop(heap);
++					heapinfo_capture_report(heap, option->pid);
++				}
++			}
++			ret = OK;
++			break;
++		}
+ #if CONFIG_KMM_NHEAPS > 1
+ 		if (option->heap_type == HEAPINFO_HEAP_TYPE_KERNEL) {
+ 			int heap_idx;
+diff --git a/os/include/tinyara/mm/mm.h b/os/include/tinyara/mm/mm.h
+index 56c4d5ed..95bd500a 100644
+--- a/os/include/tinyara/mm/mm.h
++++ b/os/include/tinyara/mm/mm.h
+@@ -183,6 +183,8 @@
+ #define HEAPINFO_DETAIL_SPECIFIC_HEAP 5
+ #define HEAPINFO_INIT_PEAK 6
+ #define HEAPINFO_DUMP_HEAP 7
++#define HEAPINFO_CAPTURE_START 8
++#define HEAPINFO_CAPTURE_STOP 9
+ #define HEAPINFO_PID_ALL -1
+ 
+ #define HEAPINFO_INIT_INFO -1
+@@ -232,13 +234,32 @@ typedef size_t mmsize_t;
+ typedef void *mmaddress_t;             /* 32 bit address space */
+ 
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+-#define SIZEOF_MM_MALLOC_DEBUG_INFO (sizeof(mmaddress_t) + sizeof(pid_t) + sizeof(uint16_t))
++/* Total malloc caller backtrace levels recorded per allocated node.
++ * Level 0 is the immediate caller (alloc_call_addr); the remaining
++ * (HEAPINFO_BACKTRACE_DEPTH - 1) deeper frames are stored in
++ * alloc_caller_backtrace[]. */
++#define HEAPINFO_BACKTRACE_DEPTH 3
++
++/* Innermost frames to omit so the recorded frames are application callers:
++ * sched_backtrace(), the capture helper, and the mm/malloc wrapper frames
++ * down to the malloc call site (alloc_call_addr already holds that immediate
++ * caller as backtrace level 0). Tune to your product's malloc wrapper depth.
++ * This is the compile-time default; the runtime value is stored in the
++ * global variable g_backtrace_skip in mm_malloc.c and can be changed at
++ * runtime from the heapinfo app (heapinfo -s SKIP).
++ */
++#ifndef HEAPINFO_BACKTRACE_SKIP
++#define HEAPINFO_BACKTRACE_SKIP 3
++#endif
++
++#define SIZEOF_MM_MALLOC_DEBUG_INFO (HEAPINFO_BACKTRACE_DEPTH * sizeof(mmaddress_t) + sizeof(pid_t) + sizeof(uint16_t))
+ 
+ /* Memory state values */
+ #define MM_MEMORY_STATE_UNUSED   0  /* Initial state */
+ #define MM_MEMORY_STATE_USED     1  /* Memory is referenced */
+ #define MM_MEMORY_STATE_LEAK     2  /* Potential memory leak */
+ #define MM_MEMORY_STATE_BROKEN   3  /* Heap corruption detected */
++#define MM_MEMORY_STATE_CAPTURED 4  /* Allocated within an active capture window */
+ #else
+ #define SIZEOF_MM_MALLOC_DEBUG_INFO 0
+ #endif
+@@ -257,7 +278,8 @@ typedef void *mmaddress_t;             /* 32 bit address space */
+ struct mm_allocnode_s {
+ 	mmsize_t preceding;				/* Size of the preceding chunk */
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+-	mmaddress_t alloc_call_addr;			/* malloc call address */
++	mmaddress_t alloc_call_addr;			/* malloc call address (backtrace level 0) */
++	mmaddress_t alloc_caller_backtrace[HEAPINFO_BACKTRACE_DEPTH - 1];	/* deeper malloc caller frames (levels 1..) */
+ 	pid_t pid;					/* PID info */
+ 	uint16_t memory_state;				/* Memory state for leak detection. */
+ #endif
+@@ -278,7 +300,8 @@ struct mm_allocnode_s {
+ struct mm_freenode_s {
+ 	mmsize_t preceding;			/* Size of the preceding chunk */
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+-	mmaddress_t alloc_call_addr;			/* malloc call address */
++	mmaddress_t alloc_call_addr;			/* malloc call address (backtrace level 0) */
++	mmaddress_t alloc_caller_backtrace[HEAPINFO_BACKTRACE_DEPTH - 1];	/* deeper malloc caller frames (levels 1..) */
+ 	pid_t pid;					/* PID info */
+ 	uint16_t memory_state;				/* Memory state for leak detection. */
+ #endif
+@@ -325,6 +348,30 @@ struct heapinfo_tcb_info_s {
+ 	int num_alloc_free;
+ };
+ typedef struct heapinfo_tcb_info_s heapinfo_tcb_info_t;
++
++/* One live window allocation recorded by the heap capture tracker. Entries
++ * are added and removed at the same points the per pid heapinfo counter is
++ * updated, so the tracked totals reconcile with the counter by construction.
++ */
++/* Entry types : how the entry counts in the window delta */
++#define HEAPINFO_CAPTURE_ALLOC   0	/* new allocation, still alive : +size */
++#define HEAPINFO_CAPTURE_FREED   1	/* pre window block freed : -size */
++#define HEAPINFO_CAPTURE_REALLOC 2	/* pre window block realloced : +size -old_size */
++
++struct heapinfo_capture_entry_s {
++	void *addr;			/* node address of the allocation */
++	mmsize_t size;			/* node size, same unit the counter uses */
++	mmsize_t old_size;		/* previous size, realloc entries only */
++	mmaddress_t caller;		/* malloc caller return address */
++	mmaddress_t backtrace[HEAPINFO_BACKTRACE_DEPTH - 1];	/* deeper malloc caller frames (levels 1..) */
++	pid_t pid;			/* owner pid as accounted by the counter */
++	uint8_t type;			/* HEAPINFO_CAPTURE_ALLOC / FREED / REALLOC */
++};
++
++/* Capacity of the capture table, allocated from the target heap at start */
++#ifndef HEAPINFO_CAPTURE_MAX_ENTRIES
++#define HEAPINFO_CAPTURE_MAX_ENTRIES 1024
++#endif
+ #ifdef CONFIG_HEAPINFO_USER_GROUP
+ struct heapinfo_group_info_s {
+ 	int pid;
+@@ -371,6 +418,21 @@ struct mm_heap_s {
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 	size_t peak_alloc_size;
+ 	size_t total_alloc_size;
++	/* Heap capture window state. Stored per-heap (not as a module global) so it
++	 * is shared between the kernel (which arms/reports it via the mminfo ioctl)
++	 * and the allocator (which tags nodes) even in a protected/loadable build
++	 * where the mm code is linked separately into kernel and user binaries.
++	 */
++	bool mm_capture_active;
++	pid_t mm_capture_pid;
++	/* Capture table : live window allocations, maintained inside the counter
++	 * update path. Allocated from this heap at start, freed at stop.
++	 */
++	struct heapinfo_capture_entry_s *mm_capture_table;
++	int mm_capture_count;			/* entries currently in the table */
++	int mm_capture_lost;			/* allocations dropped, table full */
++	size_t mm_capture_prewindow_freed;	/* bytes of pre window blocks freed in window */
++	int mm_capture_start_size;		/* heapinfo counter snapshot at start */
+ #ifdef CONFIG_HEAPINFO_USER_GROUP
+ 	int max_group;
+ 	struct heapinfo_group_s group[HEAPINFO_USER_GROUP_NUM];
+@@ -665,18 +727,24 @@ int heap_dbg(const char *fmt, ...);
+ /* Functions contained in kmm_mallinfo.c . Used to display memory allocation details */
+ void heapinfo_parse_heap(FAR struct mm_heap_s *heap, int mode, pid_t pid);
+ /* Funciton to add memory allocation info */
+-void heapinfo_update_node(FAR struct mm_allocnode_s *node, mmaddress_t caller_retaddr);
++void heapinfo_update_node(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *node, mmaddress_t caller_retaddr);
+ void heapinfo_set_caller_addr(void *address, mmaddress_t caller_retaddr);
+ void heapinfo_set_pid(void *address, pid_t pid);
+ 
+-void heapinfo_add_size(struct mm_heap_s *heap, pid_t pid, mmsize_t size);
+-void heapinfo_subtract_size(struct mm_heap_s *heap, pid_t pid, mmsize_t size);
++void heapinfo_add_size(struct mm_heap_s *heap, pid_t pid, mmsize_t size, FAR struct mm_allocnode_s *node);
++void heapinfo_subtract_size(struct mm_heap_s *heap, pid_t pid, mmsize_t size, FAR struct mm_allocnode_s *node);
+ void heapinfo_update_total_size(struct mm_heap_s *heap, mmsize_t size, pid_t pid);
+ void heapinfo_set_stack_node(void *stack_ptr, pid_t pid);
+ void heapinfo_exclude_stacksize(void *stack_ptr);
+ void heapinfo_peak_init(struct mm_heap_s *heap);
+ void heapinfo_dealloc_tcbinfo(void *address, pid_t pid);
+ void heapinfo_dump_heap(struct mm_heap_s *heap);
++/* Heap capture window : report blocks allocated between start and stop that are still not freed */
++void heapinfo_capture_start(struct mm_heap_s *heap, pid_t pid);
++void heapinfo_capture_stop(struct mm_heap_s *heap);
++void heapinfo_capture_reset(struct mm_heap_s *heap);
++void heapinfo_capture_report(struct mm_heap_s *heap, pid_t pid);
++void heapinfo_capture_note_realloc(struct mm_heap_s *heap, FAR struct mm_allocnode_s *new_node, FAR void *old_node_addr);
+ #ifdef CONFIG_HEAPINFO_USER_GROUP
+ void heapinfo_update_group(mmsize_t size, pid_t pid);
+ void heapinfo_update_group_info(pid_t pid, int group, int type);
+diff --git a/os/mm/mm_heap/mm_free.c b/os/mm/mm_heap/mm_free.c
+index 38713c6d..e1221604 100644
+--- a/os/mm/mm_heap/mm_free.c
++++ b/os/mm/mm_heap/mm_free.c
+@@ -186,7 +186,7 @@ static void mm_free_internal(FAR struct mm_heap_s *heap, FAR void *mem, mmaddres
+ 		return;
+ 	}
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+-	heapinfo_subtract_size(heap, ((struct mm_allocnode_s *)node)->pid, ((struct mm_allocnode_s *)node)->size);
++	heapinfo_subtract_size(heap, ((struct mm_allocnode_s *)node)->pid, ((struct mm_allocnode_s *)node)->size, (struct mm_allocnode_s *)node);
+ 	heapinfo_update_total_size(heap, ((-1) * ((struct mm_allocnode_s *)node)->size), ((struct mm_allocnode_s *)node)->pid);
+ #endif
+ 	node->preceding &= ~MM_ALLOC_BIT;
+diff --git a/os/mm/mm_heap/mm_heapinfo_parse_heap.c b/os/mm/mm_heap/mm_heapinfo_parse_heap.c
+index fead25ca..75d9e73b 100644
+--- a/os/mm/mm_heap/mm_heapinfo_parse_heap.c
++++ b/os/mm/mm_heap/mm_heapinfo_parse_heap.c
+@@ -194,9 +194,9 @@ void heapinfo_parse_heap(FAR struct mm_heap_s *heap, int mode, pid_t pid)
+ 			if ((pid == HEAPINFO_PID_ALL || node->pid == pid) && (node->preceding & MM_ALLOC_BIT) != 0) {
+ 				if (mode == HEAPINFO_DETAIL_ALL || mode == HEAPINFO_DETAIL_PID || mode == HEAPINFO_DETAIL_SPECIFIC_HEAP) {
+ 					if (node->pid >= 0) {
+-						heap_dbg("0x%x | %8u |   %c    | 0x%8x | %3d   |\n", node, node->size, 'A', node->alloc_call_addr, node->pid);
++						heap_dbg("0x%x | %8u |   %c    | 0x%8x | %3d   | bt: 0x%x 0x%x\n", node, node->size, 'A', node->alloc_call_addr, node->pid, node->alloc_caller_backtrace[0], node->alloc_caller_backtrace[1]);
+ 					} else {
+-						heap_dbg("0x%x | %8u |   %c    | 0x%8x | %3d(S)|\n", node, node->size, 'A', node->alloc_call_addr, -(node->pid));
++						heap_dbg("0x%x | %8u |   %c    | 0x%8x | %3d(S)| bt: 0x%x 0x%x\n", node, node->size, 'A', node->alloc_call_addr, -(node->pid), node->alloc_caller_backtrace[0], node->alloc_caller_backtrace[1]);
+ 					}
+ 				}
+ 
+@@ -320,4 +320,138 @@ void heapinfo_parse_heap(FAR struct mm_heap_s *heap, int mode, pid_t pid)
+ #endif
+ 	return;
+ }
++
++/****************************************************************************
++ * Name: heapinfo_capture_reset
++ *
++ * Description:
++ *   Clear any stale MM_MEMORY_STATE_CAPTURED tags in the heap. Called when a
++ *   capture window is (re)started so that tags left over from an aborted
++ *   session do not pollute the next report.
++ ****************************************************************************/
++void heapinfo_capture_reset(FAR struct mm_heap_s *heap)
++{
++	struct mm_allocnode_s *node;
++#if CONFIG_KMM_REGIONS > 1
++	int region;
++#else
++#define region 0
++#endif
++
++#if CONFIG_KMM_REGIONS > 1
++	for (region = 0; region < heap->mm_nregions; region++)
++#endif
++	{
++		DEBUGASSERT(mm_takesemaphore(heap));
++		for (node = heap->mm_heapstart[region]; node < heap->mm_heapend[region]; node = (struct mm_allocnode_s *)((char *)node + node->size)) {
++			if ((node->preceding & MM_ALLOC_BIT) != 0 && node->memory_state == MM_MEMORY_STATE_CAPTURED) {
++				node->memory_state = MM_MEMORY_STATE_UNUSED;
++			}
++		}
++		mm_givesemaphore(heap);
++	}
++#undef region
++}
++
++/****************************************************************************
++ * Name: heapinfo_capture_report
++ *
++ * Description:
++ *   Print the entries that make up the window delta, in three sections :
++ *     (1) NEW ALLOCATIONS  : allocated in the window and still alive (+size)
++ *     (2) REALLOCATIONS    : pre window blocks resized in the window, with the
++ *                            old and new size (delta contribution = new - old)
++ *     (3) FREED            : pre window blocks freed in the window (-size)
++ *   Recorded on the heapinfo counter update path, no heap walk. By
++ *   construction : sum(1 sizes) + sum(2 new - old) - sum(3 sizes) == the
++ *   heapinfo counter delta (CURR_HEAP stop - start).
++ ****************************************************************************/
++void heapinfo_capture_report(FAR struct mm_heap_s *heap, pid_t pid)
++{
++	struct heapinfo_capture_entry_s *table;
++	int alloc_sum = 0;
++	int realloc_delta = 0;
++	int freed_sum = 0;
++	int alloc_cnt = 0;
++	int realloc_cnt = 0;
++	int freed_cnt = 0;
++	int count;
++	int lost;
++	int start_size;
++	int stop_size = 0;
++	pid_t hash_pid;
++	int i;
++
++	/* Detach the table and snapshot the counters under the semaphore */
++	DEBUGASSERT(mm_takesemaphore(heap));
++	table = heap->mm_capture_table;
++	heap->mm_capture_table = NULL;
++	count = heap->mm_capture_count;
++	lost = heap->mm_capture_lost;
++	start_size = heap->mm_capture_start_size;
++	if (pid == HEAPINFO_PID_ALL) {
++		stop_size = (int)heap->total_alloc_size;
++	} else {
++		hash_pid = PIDHASH(pid);
++		if (heap->alloc_list[hash_pid].pid == pid) {
++			stop_size = heap->alloc_list[hash_pid].curr_alloc_size;
++		}
++	}
++	mm_givesemaphore(heap);
++
++	if (!table) {
++		heap_dbg(" Heap Capture : no data (window not started or start failed)\n");
++		return;
++	}
++
++	/* (1) new allocations still alive */
++	heap_dbg("****************************************************************\n");
++	heap_dbg(" [1] NEW ALLOCATIONS (allocated in window, not freed)\n");
++	heap_dbg("  MemAddr |   Size   |    Owner   |  Pid  | bt: level1 level2\n");
++	heap_dbg("----------|----------|------------|-------|------------------------\n");
++	for (i = 0; i < count; i++) {
++		if (table[i].type == HEAPINFO_CAPTURE_ALLOC) {
++			heap_dbg("0x%x | %8u | 0x%8x | %3d   | bt: 0x%x 0x%x\n", table[i].addr, table[i].size, table[i].caller, table[i].pid, table[i].backtrace[0], table[i].backtrace[1]);
++			alloc_sum += (int)table[i].size;
++			alloc_cnt++;
++		}
++	}
++	heap_dbg(" [1] total : %d blocks, %d bytes\n", alloc_cnt, alloc_sum);
++
++	/* (2) reallocations of pre window blocks */
++	heap_dbg("\n [2] REALLOCATIONS (pre window block resized in window)\n");
++	heap_dbg("  MemAddr | Old Size | New Size |  Diff   |    Owner   |  Pid  | bt: level1 level2\n");
++	heap_dbg("----------|----------|----------|---------|------------|-------|------------------------\n");
++	for (i = 0; i < count; i++) {
++		if (table[i].type == HEAPINFO_CAPTURE_REALLOC) {
++			heap_dbg("0x%x | %8u | %8u | %7d | 0x%8x | %3d   | bt: 0x%x 0x%x\n", table[i].addr, table[i].old_size, table[i].size, (int)table[i].size - (int)table[i].old_size, table[i].caller, table[i].pid, table[i].backtrace[0], table[i].backtrace[1]);
++			realloc_delta += (int)table[i].size - (int)table[i].old_size;
++			realloc_cnt++;
++		}
++	}
++	heap_dbg(" [2] total : %d blocks, diff %d bytes\n", realloc_cnt, realloc_delta);
++
++	/* (3) pre window blocks freed in the window */
++	heap_dbg("\n [3] FREED (pre window block freed in window)\n");
++	heap_dbg("  MemAddr |   Size   |    Owner   |  Pid  | bt: level1 level2\n");
++	heap_dbg("----------|----------|------------|-------|------------------------\n");
++	for (i = 0; i < count; i++) {
++		if (table[i].type == HEAPINFO_CAPTURE_FREED) {
++			heap_dbg("0x%x | %8u | 0x%8x | %3d   | bt: 0x%x 0x%x\n", table[i].addr, table[i].size, table[i].caller, table[i].pid, table[i].backtrace[0], table[i].backtrace[1]);
++			freed_sum += (int)table[i].size;
++			freed_cnt++;
++		}
++	}
++	heap_dbg(" [3] total : %d blocks, %d bytes\n", freed_cnt, freed_sum);
++
++	/* reconciliation */
++	heap_dbg("\n****************************************************************\n");
++	if (lost) {
++		heap_dbg(" WARNING : table full, %d events were not recorded\n", lost);
++	}
++	heap_dbg(" [1] + [2] - [3] = %d + %d - %d = %d bytes\n", alloc_sum, realloc_delta, freed_sum, alloc_sum + realloc_delta - freed_sum);
++	heap_dbg(" heapinfo CURR_HEAP delta (stop - start) = %d - %d = %d bytes\n", stop_size, start_size, stop_size - start_size);
++
++	mm_free(heap, table);
++}
+ #endif
+diff --git a/os/mm/mm_heap/mm_heapinfo_utils.c b/os/mm/mm_heap/mm_heapinfo_utils.c
+index 8f2b43b8..17c8f683 100644
+--- a/os/mm/mm_heap/mm_heapinfo_utils.c
++++ b/os/mm/mm_heap/mm_heapinfo_utils.c
+@@ -55,18 +55,205 @@
+ #include <tinyara/config.h>
+ #include <unistd.h>
+ #include <stdint.h>
++#include <string.h>
+ #include <sys/types.h>
+ #include <tinyara/sched.h>
+ #include <tinyara/arch.h>
+ #include <tinyara/mm/mm.h>
+ 
++/****************************************************************************
++ * Name: heapinfo_capture_insert / heapinfo_capture_remove
++ *
++ * Description:
++ * Table helpers for the capture window. Called only from the counter update
++ * path with the heap semaphore held, so every table change mirrors a counter
++ * change one to one.
++ ****************************************************************************/
++static void heapinfo_capture_insert(struct mm_heap_s *heap, FAR struct mm_allocnode_s *node)
++{
++	struct heapinfo_capture_entry_s *entry;
++
++	if (heap->mm_capture_count < HEAPINFO_CAPTURE_MAX_ENTRIES) {
++		entry = &heap->mm_capture_table[heap->mm_capture_count++];
++		entry->addr = (void *)node;
++		entry->size = node->size;
++		entry->old_size = 0;
++		entry->caller = node->alloc_call_addr;
++		memcpy(entry->backtrace, node->alloc_caller_backtrace, sizeof(entry->backtrace));
++		entry->pid = node->pid;
++		entry->type = HEAPINFO_CAPTURE_ALLOC;
++	} else {
++		heap->mm_capture_lost++;
++	}
++}
++
++/* Record a pre window block that was freed inside the window. These count
++ * negative in the delta, so the printed entries sum up to it exactly.
++ */
++static void heapinfo_capture_insert_freed(struct mm_heap_s *heap, FAR struct mm_allocnode_s *node, pid_t pid, mmsize_t size)
++{
++	struct heapinfo_capture_entry_s *entry;
++
++	if (heap->mm_capture_count < HEAPINFO_CAPTURE_MAX_ENTRIES) {
++		entry = &heap->mm_capture_table[heap->mm_capture_count++];
++		entry->addr = (void *)node;
++		entry->size = size;
++		entry->old_size = 0;
++		entry->caller = node->alloc_call_addr;
++		memcpy(entry->backtrace, node->alloc_caller_backtrace, sizeof(entry->backtrace));
++		entry->pid = pid;
++		entry->type = HEAPINFO_CAPTURE_FREED;
++	} else {
++		heap->mm_capture_lost++;
++	}
++}
++
++static bool heapinfo_capture_remove(struct mm_heap_s *heap, FAR struct mm_allocnode_s *node)
++{
++	int i;
++
++	/* Newest first, so address reuse matches the living entry. Freed entries
++	 * are history and never match.
++	 */
++	for (i = heap->mm_capture_count - 1; i >= 0; i--) {
++		if (heap->mm_capture_table[i].addr == (void *)node && heap->mm_capture_table[i].type != HEAPINFO_CAPTURE_FREED) {
++			if (heap->mm_capture_table[i].type == HEAPINFO_CAPTURE_ALLOC) {
++				/* replace with the last entry, order does not matter */
++				heap->mm_capture_table[i] = heap->mm_capture_table[--heap->mm_capture_count];
++			} else {
++				/* a realloced pre window block died : keep the loss of its
++				 * original size in the books
++				 */
++				heap->mm_capture_table[i].size = heap->mm_capture_table[i].old_size;
++				heap->mm_capture_table[i].old_size = 0;
++				heap->mm_capture_table[i].type = HEAPINFO_CAPTURE_FREED;
++			}
++			return true;
++		}
++	}
++	return false;
++}
++
++/****************************************************************************
++ * Name: heapinfo_capture_start
++ *
++ * Description:
++ * Arm a heap capture window on the given heap. While active, every update of
++ * the per pid heapinfo counter also updates the capture table, so at stop the
++ * table holds exactly the blocks allocated in the window and not yet freed,
++ * accounted the same way heapinfo accounts them. pid == HEAPINFO_PID_ALL
++ * captures every task. The state lives in the heap struct (shared kernel/user
++ * memory) so a kernel ioctl can arm a window the user side allocator observes.
++ ****************************************************************************/
++void heapinfo_capture_start(struct mm_heap_s *heap, pid_t pid)
++{
++	pid_t hash_pid;
++	struct heapinfo_capture_entry_s *table;
++	struct heapinfo_capture_entry_s *old_table;
++
++	/* Drop any table left over from a previous session */
++	DEBUGASSERT(mm_takesemaphore(heap));
++	old_table = heap->mm_capture_table;
++	heap->mm_capture_table = NULL;
++	heap->mm_capture_active = false;
++	mm_givesemaphore(heap);
++	if (old_table) {
++		mm_free(heap, old_table);
++	}
++
++	/* Allocate the table before arming, so it is never tracked itself */
++	table = (struct heapinfo_capture_entry_s *)mm_malloc(heap, HEAPINFO_CAPTURE_MAX_ENTRIES * sizeof(struct heapinfo_capture_entry_s), NULL);
++	if (!table) {
++		mdbg("capture start failed : no memory for %d entries\n", HEAPINFO_CAPTURE_MAX_ENTRIES);
++		return;
++	}
++
++	DEBUGASSERT(mm_takesemaphore(heap));
++	heap->mm_capture_pid = pid;
++	heap->mm_capture_table = table;
++	heap->mm_capture_count = 0;
++	heap->mm_capture_lost = 0;
++	heap->mm_capture_prewindow_freed = 0;
++	/* Snapshot the same counter that the heapinfo pid row shows */
++	if (pid == HEAPINFO_PID_ALL) {
++		heap->mm_capture_start_size = (int)heap->total_alloc_size;
++	} else {
++		hash_pid = PIDHASH(pid);
++		if (heap->alloc_list[hash_pid].pid == pid) {
++			heap->mm_capture_start_size = heap->alloc_list[hash_pid].curr_alloc_size;
++		} else {
++			heap->mm_capture_start_size = 0;
++		}
++	}
++	heap->mm_capture_active = true;
++	mm_givesemaphore(heap);
++}
++
++/****************************************************************************
++ * Name: heapinfo_capture_stop
++ *
++ * Description:
++ * Disarm the heap capture window. Tagged nodes remain marked until reported.
++ ****************************************************************************/
++void heapinfo_capture_stop(struct mm_heap_s *heap)
++{
++	DEBUGASSERT(mm_takesemaphore(heap));
++	heap->mm_capture_active = false;
++	mm_givesemaphore(heap);
++}
++
++/****************************************************************************
++ * Name: heapinfo_capture_note_realloc
++ *
++ * Description:
++ * Called by mm_realloc after it resized a block. If the old block was from
++ * before the window, the table holds a FREED entry for it and an ALLOC entry
++ * for the new block : merge the two into one REALLOC entry that shows the old
++ * and new size. Old blocks from inside the window already collapsed into a
++ * single ALLOC entry, so nothing to do then. Value neutral for the delta.
++ ****************************************************************************/
++void heapinfo_capture_note_realloc(struct mm_heap_s *heap, FAR struct mm_allocnode_s *new_node, FAR void *old_node_addr)
++{
++	int i;
++	int freed_idx = -1;
++	int alloc_idx = -1;
++
++	if (!heap->mm_capture_table) {
++		return;
++	}
++	DEBUGASSERT(mm_takesemaphore(heap));
++	if (heap->mm_capture_table) {
++		/* newest first, to match the events this realloc just made */
++		for (i = heap->mm_capture_count - 1; i >= 0; i--) {
++			if (freed_idx < 0 && heap->mm_capture_table[i].type == HEAPINFO_CAPTURE_FREED && heap->mm_capture_table[i].addr == old_node_addr) {
++				freed_idx = i;
++			}
++			if (alloc_idx < 0 && heap->mm_capture_table[i].type == HEAPINFO_CAPTURE_ALLOC && heap->mm_capture_table[i].addr == (void *)new_node) {
++				alloc_idx = i;
++			}
++			if (freed_idx >= 0 && alloc_idx >= 0) {
++				break;
++			}
++		}
++		if (freed_idx >= 0 && alloc_idx >= 0) {
++			/* the freed record keeps the true original size, even over
++			 * a chain of reallocs on the same block
++			 */
++			heap->mm_capture_table[alloc_idx].type = HEAPINFO_CAPTURE_REALLOC;
++			heap->mm_capture_table[alloc_idx].old_size = heap->mm_capture_table[freed_idx].size;
++			heap->mm_capture_table[freed_idx] = heap->mm_capture_table[--heap->mm_capture_count];
++		}
++	}
++	mm_givesemaphore(heap);
++}
++
+ /****************************************************************************
+  * Name: heapinfo_add_size
+  *
+  * Description:
+  * Add the allocated size in tcb
+  ****************************************************************************/
+-void heapinfo_add_size(struct mm_heap_s *heap, pid_t pid, mmsize_t size)
++void heapinfo_add_size(struct mm_heap_s *heap, pid_t pid, mmsize_t size, FAR struct mm_allocnode_s *node)
+ {
+ 	pid_t hash_pid;
+ 
+@@ -78,6 +265,12 @@ void heapinfo_add_size(struct mm_heap_s *heap, pid_t pid, mmsize_t size)
+ 			heap->alloc_list[hash_pid].peak_alloc_size = heap->alloc_list[hash_pid].curr_alloc_size;
+ 		}
+ 		heap->alloc_list[hash_pid].num_alloc_free++;
++		/* Capture window : record the allocation exactly when the counter
++		 * counted it, so the table follows the heapinfo accounting path.
++		 */
++		if (heap->mm_capture_active && heap->mm_capture_table && node && (heap->mm_capture_pid == HEAPINFO_PID_ALL || pid == heap->mm_capture_pid)) {
++			heapinfo_capture_insert(heap, node);
++		}
+ 	}
+ }
+ 
+@@ -87,7 +280,7 @@ void heapinfo_add_size(struct mm_heap_s *heap, pid_t pid, mmsize_t size)
+  * Description:
+  * Subtract the allocated size in tcb
+  ****************************************************************************/
+-void heapinfo_subtract_size(struct mm_heap_s *heap, pid_t pid, mmsize_t size)
++void heapinfo_subtract_size(struct mm_heap_s *heap, pid_t pid, mmsize_t size, FAR struct mm_allocnode_s *node)
+ {
+ 	pid_t hash_pid;
+ 
+@@ -95,6 +288,15 @@ void heapinfo_subtract_size(struct mm_heap_s *heap, pid_t pid, mmsize_t size)
+ 	if (heap->alloc_list[hash_pid].pid == pid) {
+ 			heap->alloc_list[hash_pid].curr_alloc_size -= size;
+ 			heap->alloc_list[hash_pid].num_alloc_free--;
++			/* Capture window : a tracked block freed drops out of the table;
++			 * an untracked one was allocated before the window started.
++			 */
++			if (heap->mm_capture_table && node) {
++				if (!heapinfo_capture_remove(heap, node) && heap->mm_capture_active && (heap->mm_capture_pid == HEAPINFO_PID_ALL || pid == heap->mm_capture_pid)) {
++					heap->mm_capture_prewindow_freed += size;
++					heapinfo_capture_insert_freed(heap, node, pid, size);
++				}
++			}
+ 	}
+ }
+ 
+@@ -121,12 +323,27 @@ void heapinfo_update_total_size(struct mm_heap_s *heap, mmsize_t size, pid_t pid
+  * Description:
+  * Adds pid and malloc caller return address to mem chunk
+  ****************************************************************************/
+-void heapinfo_update_node(FAR struct mm_allocnode_s *node, mmaddress_t caller_retaddr)
++void heapinfo_update_node(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *node, mmaddress_t caller_retaddr)
+ {
++	int i;
+ 	DEBUGASSERT(node);
+ 	node->alloc_call_addr = caller_retaddr;
+-	node->memory_state = MM_MEMORY_STATE_UNUSED;
++	/* Default the deeper backtrace levels to NULL for every allocation (user
++	 * and kernel). User-space allocations get them filled in mm_malloc(). */
++	for (i = 0; i < HEAPINFO_BACKTRACE_DEPTH - 1; i++) {
++		node->alloc_caller_backtrace[i] = NULL;
++	}
+ 	node->pid = getpid();
++	/* Tag this allocation if a capture window is active on this heap and the pid
++	 * matches. Blocks freed before the window is stopped are coalesced (they
++	 * lose MM_ALLOC_BIT), so only blocks still allocated at stop time are
++	 * reported. This is always called with the heap semaphore held.
++	 */
++	if (heap->mm_capture_active && (heap->mm_capture_pid == HEAPINFO_PID_ALL || node->pid == heap->mm_capture_pid)) {
++		node->memory_state = MM_MEMORY_STATE_CAPTURED;
++	} else {
++		node->memory_state = MM_MEMORY_STATE_UNUSED;
++	}
+ }
+ 
+ /****************************************************************************
+@@ -152,14 +369,14 @@ void heapinfo_set_pid(void *address, pid_t pid)
+ 		old_pid = node->pid;
+ 		if (old_pid != pid) {
+ 			/* Subtract from old PID's accounting */
+-			heapinfo_subtract_size(heap, old_pid, node->size);
++			heapinfo_subtract_size(heap, old_pid, node->size, node);
+ 			heapinfo_update_total_size(heap, (-1) * node->size, old_pid);
+ 			
+ 			/* Update node PID */
+ 			node->pid = pid;
+ 			
+ 			/* Add to new PID's accounting */
+-			heapinfo_add_size(heap, pid, node->size);
++			heapinfo_add_size(heap, pid, node->size, node);
+ 			heapinfo_update_total_size(heap, node->size, pid);
+ 		}
+ 		
+@@ -185,7 +402,7 @@ void heapinfo_set_caller_addr(void *address, mmaddress_t caller_retaddr)
+ 	if (heap) {
+ 		node = (struct mm_allocnode_s *)((char *)address - SIZEOF_MM_ALLOCNODE);
+ 		DEBUGASSERT(mm_takesemaphore(heap));
+-		heapinfo_update_node(node, caller_retaddr);
++		heapinfo_update_node(heap, node, caller_retaddr);
+ 		mm_givesemaphore(heap);
+ 	} else {
+ 		mdbg("Failed to set caller address, heap not found. addr:%x\n", address);
+@@ -229,6 +446,15 @@ void heapinfo_exclude_stacksize(void *stack_ptr)
+ 	DEBUGASSERT(node);
+ 	hash_pid = PIDHASH(node->pid);
+ 	heap->alloc_list[hash_pid].curr_alloc_size -= node->size;
++	/* Capture window : the stack chunk was recorded at malloc time but the
++	 * counter excludes stacks here, so drop it from the table as well. This
++	 * function runs without the heap semaphore, take it for the table only.
++	 */
++	if (heap->mm_capture_table) {
++		DEBUGASSERT(mm_takesemaphore(heap));
++		heapinfo_capture_remove(heap, node);
++		mm_givesemaphore(heap);
++	}
+ #ifdef CONFIG_HEAPINFO_USER_GROUP
+ 	int check_idx;
+ 	int group_num;
+diff --git a/os/mm/mm_heap/mm_initialize.c b/os/mm/mm_heap/mm_initialize.c
+index 692de114..8e34429d 100644
+--- a/os/mm/mm_heap/mm_initialize.c
++++ b/os/mm/mm_heap/mm_initialize.c
+@@ -158,14 +158,14 @@ int mm_addregion(FAR struct mm_heap_s *heap, FAR void *heapstart, size_t heapsiz
+ 	heap->mm_heapstart[IDX]->preceding = MM_ALLOC_BIT;
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 	/* fill magic number 0xDEAD as malloc info for head node */
+-	heapinfo_update_node((FAR struct mm_allocnode_s *)heap->mm_heapstart[IDX], (mmaddress_t)0xDEAD);
++	heapinfo_update_node(heap, (FAR struct mm_allocnode_s *)heap->mm_heapstart[IDX], (mmaddress_t)0xDEAD);
+ #endif
+ 
+ 	node            = (FAR struct mm_freenode_s *)(heapbase + SIZEOF_MM_ALLOCNODE);
+ 	node->size      = heapsize - 2 * SIZEOF_MM_ALLOCNODE;
+ 	node->preceding = SIZEOF_MM_ALLOCNODE;
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+-	heapinfo_update_node((FAR struct mm_allocnode_s *)node, (mmaddress_t)0xDEADDEAD);
++	heapinfo_update_node(heap, (FAR struct mm_allocnode_s *)node, (mmaddress_t)0xDEADDEAD);
+ #endif
+ #ifdef CONFIG_DEBUG_MM_FREEINFO
+ 	node->free_call_addr = NULL;
+@@ -177,7 +177,7 @@ int mm_addregion(FAR struct mm_heap_s *heap, FAR void *heapstart, size_t heapsiz
+ 	heap->mm_heapend[IDX]->preceding = node->size | MM_ALLOC_BIT;
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 	/* Fill magic number 0xDEADDEAD as malloc info for tail node */
+-	heapinfo_update_node((FAR struct mm_allocnode_s *)heap->mm_heapend[IDX], (mmaddress_t)0xDEADDEAD);
++	heapinfo_update_node(heap, (FAR struct mm_allocnode_s *)heap->mm_heapend[IDX], (mmaddress_t)0xDEADDEAD);
+ #endif
+ 
+ #undef IDX
+@@ -262,6 +262,16 @@ int mm_initialize(FAR struct mm_heap_s *heap, FAR void *heapstart, size_t heapsi
+ 
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 	heap->total_alloc_size = heap->peak_alloc_size = 0;
++	/* No capture window is active until armed via the mminfo ioctl. Initialize
++	 * before mm_addregion() as it stamps the guard nodes via heapinfo_update_node().
++	 */
++	heap->mm_capture_active = false;
++	heap->mm_capture_pid = HEAPINFO_PID_ALL;
++	heap->mm_capture_table = NULL;
++	heap->mm_capture_count = 0;
++	heap->mm_capture_lost = 0;
++	heap->mm_capture_prewindow_freed = 0;
++	heap->mm_capture_start_size = 0;
+ #endif
+ 
+ 	/* Add the initial region of memory to the heap */
+diff --git a/os/mm/mm_heap/mm_malloc.c b/os/mm/mm_heap/mm_malloc.c
+index 7f8e5c67..bb055ad6 100644
+--- a/os/mm/mm_heap/mm_malloc.c
++++ b/os/mm/mm_heap/mm_malloc.c
+@@ -57,6 +57,7 @@
+ #include <tinyara/config.h>
+ 
+ #include <debug.h>
++#include <unistd.h>
+ 
+ #include <tinyara/mm/mm.h>
+ 
+@@ -128,6 +129,59 @@ static void mm_free_delaylist(FAR struct mm_heap_s *heap)
+ #endif
+ }
+ 
++#if defined(CONFIG_DEBUG_MM_HEAPINFO) && !defined(__KERNEL__)
++/****************************************************************************
++ * Name: heapinfo_capture_backtrace
++ *
++ * Description:
++ *   Record up to (HEAPINFO_BACKTRACE_DEPTH - 1) application caller frames
++ *   (beyond the immediate caller stored in alloc_call_addr, backtrace
++ *   level 0) into the allocated node header.
++ *
++ *   This helper is compiled only for user-space builds (__KERNEL__ not
++ *   defined), so the captured frames belong to the application call stack.
++ *
++ *   The deeper frames are captured from the application call stack of the
++ *   current (user) thread using sched_backtrace(), which walks the compiler
++ *   EHABI unwind tables. Only application frames are recorded (this helper is
++ *   user-space only). When CONFIG_SCHED_BACKTRACE is off, the frames are left
++ *   NULL.
++ ****************************************************************************/
++
++#ifdef CONFIG_SCHED_BACKTRACE
++/* Provided by the user-space C library (lib/libc/sched/sched_backtrace.c).
++ * Declared here to avoid a hard header dependency in mm_malloc.c. */
++extern int sched_backtrace(pid_t tid, FAR void **buffer, int size, int skip);
++#endif
++
++/* Runtime backtrace skip value. Initialized to the compile-time default
++ * HEAPINFO_BACKTRACE_SKIP. Can be changed at runtime from the heapinfo app
++ * (heapinfo -s SKIP) since this variable lives in the same binary as the
++ * heapinfo command in a protected build.
++ */
++int g_backtrace_skip = HEAPINFO_BACKTRACE_SKIP;
++
++static void heapinfo_capture_backtrace(FAR struct mm_allocnode_s *node)
++{
++	int i;
++#ifdef CONFIG_SCHED_BACKTRACE
++	int n;
++	FAR void *frames[HEAPINFO_BACKTRACE_DEPTH - 1];
++
++	/* Application call stack of the current (user) thread. */
++	n = sched_backtrace(getpid(), frames, HEAPINFO_BACKTRACE_DEPTH - 1, g_backtrace_skip);
++
++	for (i = 0; i < HEAPINFO_BACKTRACE_DEPTH - 1; i++) {
++		node->alloc_caller_backtrace[i] = (i < n) ? frames[i] : NULL;
++	}
++#else
++	for (i = 0; i < HEAPINFO_BACKTRACE_DEPTH - 1; i++) {
++		node->alloc_caller_backtrace[i] = NULL;
++	}
++#endif
++}
++#endif
++
+ /****************************************************************************
+  * Public Functions
+  ****************************************************************************/
+@@ -284,8 +338,12 @@ retry_after_gc:
+ 		allocnode->preceding |= MM_ALLOC_BIT;
+ 
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+-		heapinfo_update_node(allocnode, caller_retaddr);
+-		heapinfo_add_size(heap, allocnode->pid, allocnode->size);
++		heapinfo_update_node(heap, allocnode, caller_retaddr);
++#if !defined(__KERNEL__)
++		/* Capture the application call stack for user-space allocations only. */
++		heapinfo_capture_backtrace(allocnode);
++#endif
++		heapinfo_add_size(heap, allocnode->pid, allocnode->size, allocnode);
+ 		heapinfo_update_total_size(heap, allocnode->size, allocnode->pid);
+ #endif
+ 		ret = (void *)((char *)allocnode + SIZEOF_MM_ALLOCNODE);
+diff --git a/os/mm/mm_heap/mm_memalign.c b/os/mm/mm_heap/mm_memalign.c
+index d4f10e68..1dabfa5b 100644
+--- a/os/mm/mm_heap/mm_memalign.c
++++ b/os/mm/mm_heap/mm_memalign.c
+@@ -263,8 +263,8 @@ retry_after_gc:
+ 		}
+ 
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+-		heapinfo_update_node((struct mm_allocnode_s *)node, caller_retaddr);
+-		heapinfo_add_size(heap, ((struct mm_allocnode_s *)node)->pid, node->size);
++		heapinfo_update_node(heap, (struct mm_allocnode_s *)node, caller_retaddr);
++		heapinfo_add_size(heap, ((struct mm_allocnode_s *)node)->pid, node->size, (struct mm_allocnode_s *)node);
+ 		heapinfo_update_total_size(heap, node->size, ((struct mm_allocnode_s *)node)->pid);
+ #endif
+ 
+diff --git a/os/mm/mm_heap/mm_realloc.c b/os/mm/mm_heap/mm_realloc.c
+index a738fc6c..f2941df6 100644
+--- a/os/mm/mm_heap/mm_realloc.c
++++ b/os/mm/mm_heap/mm_realloc.c
+@@ -154,17 +154,18 @@ FAR void *mm_realloc(FAR struct mm_heap_s *heap, FAR void *oldmem, size_t size,
+ 		if (newsize < oldsize) {
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 			/* modify the current allocated size of old node */
+-			heapinfo_subtract_size(heap, oldnode->pid, oldsize);
++			heapinfo_subtract_size(heap, oldnode->pid, oldsize, oldnode);
+ 			heapinfo_update_total_size(heap, (-1) * oldsize, oldnode->pid);
+ #endif
+ 
+ 			mm_shrinkchunk(heap, oldnode, newsize);
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 			/* update the chunk to realloc task information */
+-			heapinfo_update_node(oldnode, caller_retaddr);
++			heapinfo_update_node(heap, oldnode, caller_retaddr);
+ 
+-			heapinfo_add_size(heap, oldnode->pid, oldnode->size);
++			heapinfo_add_size(heap, oldnode->pid, oldnode->size, oldnode);
+ 			heapinfo_update_total_size(heap, oldnode->size, oldnode->pid);
++			heapinfo_capture_note_realloc(heap, oldnode, (FAR char *)oldmem - SIZEOF_MM_ALLOCNODE);
+ #endif
+ 		}
+ 
+@@ -199,7 +200,7 @@ FAR void *mm_realloc(FAR struct mm_heap_s *heap, FAR void *oldmem, size_t size,
+ 
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 		/* modify the current allocated size of old node */
+-		heapinfo_subtract_size(heap, oldnode->pid, oldsize);
++		heapinfo_subtract_size(heap, oldnode->pid, oldsize, oldnode);
+ 		heapinfo_update_total_size(heap, (-1) * oldsize, oldnode->pid);
+ #endif
+ 
+@@ -340,10 +341,11 @@ FAR void *mm_realloc(FAR struct mm_heap_s *heap, FAR void *oldmem, size_t size,
+ 		}
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 		/* update the chunk to realloc task information */
+-		heapinfo_update_node(oldnode, caller_retaddr);
++		heapinfo_update_node(heap, oldnode, caller_retaddr);
+ 
+-		heapinfo_add_size(heap, oldnode->pid, oldnode->size);
++		heapinfo_add_size(heap, oldnode->pid, oldnode->size, oldnode);
+ 		heapinfo_update_total_size(heap, oldnode->size, oldnode->pid);
++		heapinfo_capture_note_realloc(heap, oldnode, (FAR char *)oldmem - SIZEOF_MM_ALLOCNODE);
+ #endif
+ 
+ 		mm_givesemaphore(heap);
+@@ -363,6 +365,9 @@ FAR void *mm_realloc(FAR struct mm_heap_s *heap, FAR void *oldmem, size_t size,
+ 		if (newmem) {
+ 			memcpy(newmem, oldmem, oldsize - SIZEOF_MM_ALLOCNODE);
+ 			mm_free(heap, oldmem);
++#ifdef CONFIG_DEBUG_MM_HEAPINFO
++			heapinfo_capture_note_realloc(heap, (FAR struct mm_allocnode_s *)((FAR char *)newmem - SIZEOF_MM_ALLOCNODE), (FAR char *)oldmem - SIZEOF_MM_ALLOCNODE);
++#endif
+ 		}
+ 
+ 		return newmem;

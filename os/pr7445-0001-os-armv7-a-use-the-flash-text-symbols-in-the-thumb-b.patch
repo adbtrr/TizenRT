@@ -1,0 +1,32 @@
+From f116f51aaf0c78b2fafa0129b79362e8299aeed9 Mon Sep 17 00:00:00 2001
+From: adbtrr_work5 <adbtrr_work5@local>
+Date: Mon, 10 Aug 2026 14:05:19 +0000
+Subject: [PATCH 1/3] os/armv7-a: use the flash text symbols in the thumb
+ backtrace range check
+
+in_code_region() bounded the PC against _START_TEXT/_END_TEXT.  On platforms
+whose text is executed in place from flash those macros do not describe the
+region the unwinder walks, so valid return addresses were rejected and the
+backtrace stopped at the first frame.
+
+Use the _stext_flash/_etext_flash linker symbols, which up_checkspace() and
+the armv7-r assert handler already use for the same purpose.
+
+Standalone fix, independent of the heap backtrace work that follows.
+---
+ os/arch/arm/src/armv7-a/arm_backtrace_thumb.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/os/arch/arm/src/armv7-a/arm_backtrace_thumb.c b/os/arch/arm/src/armv7-a/arm_backtrace_thumb.c
+index e65d306c..14389d13 100644
+--- a/os/arch/arm/src/armv7-a/arm_backtrace_thumb.c
++++ b/os/arch/arm/src/armv7-a/arm_backtrace_thumb.c
+@@ -153,7 +153,7 @@ static bool in_code_region(void *pc)
+ {
+ 	int i = 0;
+ 
+-	if ((uintptr_t) pc >= (uintptr_t) _START_TEXT && (uintptr_t) pc < (uintptr_t) _END_TEXT) {
++	if ((uintptr_t) pc >= (uintptr_t) &_stext_flash && (uintptr_t) pc < (uintptr_t) &_etext_flash) {
+ 		return true;
+ 	}
+ 
