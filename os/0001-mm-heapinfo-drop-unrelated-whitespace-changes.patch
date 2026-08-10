@@ -1,12 +1,19 @@
-From 13649899cfc8883c9dbf57ece700064f5f88c1d6 Mon Sep 17 00:00:00 2001
+From cbe99a078edae400684004761c3a226bea75d4ca Mon Sep 17 00:00:00 2001
 From: adbtrr_work5 <adbtrr_work5@local>
-Date: Fri, 7 Aug 2026 09:38:10 +0000
+Date: Mon, 10 Aug 2026 14:48:57 +0000
 Subject: [PATCH] mm/heapinfo: drop unrelated whitespace changes
 
-Addresses review feedback on the heapinfo capture window change: the diff
-carried cosmetic whitespace edits that are unrelated to the feature and make
-the change harder to read and to merge.
+The branch carries cosmetic whitespace edits that are unrelated to the heap
+capture window feature.  They make the change harder to read and to merge, so
+revert every one of them.
 
+ - build/configs/rtl8730e/Make.defs: the file now differs from the base only
+   by trailing whitespace removed from an ARCHCXXFLAGS assignment and from
+   three commented-out CFLAGS lines. Restore it, so the branch no longer
+   touches this file at all.
+ - os/arch/arm/src/armv7-a/Toolchain.defs: restore the trailing whitespace on
+   four lines of the Apache licence header. Only the unwind-tables block
+   belongs to this change.
  - apps/system/utils/utils_heapinfo.c: restore the blank line that separated
    the --help check from the option loop, drop the tab-only line introduced
    after optind, and align the terminator of the new comment block.
@@ -16,14 +23,17 @@ the change harder to read and to merge.
  - lib/libc/sched/Make.defs: restore the blank line that separated the CSRCS
    assignment from the CONFIG_BUILD_PROTECTED block.
 
-No functional change. After this, "git diff" and "git diff -w" of the branch
-against its base report identical statistics, i.e. the branch no longer
-contains any whitespace-only edit.
+No functional change: diffing this against the previous branch head while
+ignoring whitespace and blank lines yields nothing. The branch touches 14
+files instead of 15, and every remaining file's diff is free of
+whitespace-only edits.
 ---
- apps/system/utils/utils_heapinfo.c | 5 +++--
- lib/libc/sched/Make.defs           | 1 +
- os/mm/mm_heap/mm_heapinfo_utils.c  | 4 ++--
- 3 files changed, 6 insertions(+), 4 deletions(-)
+ apps/system/utils/utils_heapinfo.c     | 5 +++--
+ build/configs/rtl8730e/Make.defs       | 8 ++++----
+ lib/libc/sched/Make.defs               | 1 +
+ os/arch/arm/src/armv7-a/Toolchain.defs | 8 ++++----
+ os/mm/mm_heap/mm_heapinfo_utils.c      | 4 ++--
+ 5 files changed, 14 insertions(+), 12 deletions(-)
 
 diff --git a/apps/system/utils/utils_heapinfo.c b/apps/system/utils/utils_heapinfo.c
 index 30275a52..d7d4514f 100644
@@ -45,6 +55,33 @@ index 30275a52..d7d4514f 100644
  	while ((opt = getopt(argc, args, "ikb:d:ap:fgrc:s:")) != ERROR) {
  		switch (opt) {
  		/* i : initialize the peak allocated memory size. */
+diff --git a/build/configs/rtl8730e/Make.defs b/build/configs/rtl8730e/Make.defs
+index f3ae1d34..c26305d4 100644
+--- a/build/configs/rtl8730e/Make.defs
++++ b/build/configs/rtl8730e/Make.defs
+@@ -137,7 +137,7 @@ ifeq ($(CONFIG_FRAME_POINTER),y)
+ endif
+ 
+ ARCHCFLAGS += -fno-builtin -fno-common
+-ARCHCXXFLAGS = -fno-builtin -fexceptions
++ARCHCXXFLAGS = -fno-builtin -fexceptions 
+ ifeq ($(QUICKBUILD),y)
+ ARCHWARNINGS = -Wall -Werror -Wstrict-prototypes -Wshadow -Wundef -Wno-implicit-function-declaration -Wno-unused-function -Wno-unused-but-set-variable
+ ARCHWARNINGSXX = -Wall -Werror -Wshadow -Wundef
+@@ -203,10 +203,10 @@ CFLAGS   += -DTF_LITE_STATIC_MEMORY -DTF_LITE_NDEBUG
+ endif
+ 
+ ##########################################################################################################################################
+-#CFLAGS += -O2 -g
++#CFLAGS += -O2 -g 
+ #CFLAGS += -fno-strict-aliasing -fno-strict-overflow -fno-delete-null-pointer-checks
+-#CFLAGS += -mcpu=cortex-a32 -mfpu=neon -mfloat-abi=hard
+-#CFLAGS += -marm
++#CFLAGS += -mcpu=cortex-a32 -mfpu=neon -mfloat-abi=hard 
++#CFLAGS += -marm 
+ #CFLAGS += -save-temps
+ 
+ #CFLAGS += -gdwarf-3
 diff --git a/lib/libc/sched/Make.defs b/lib/libc/sched/Make.defs
 index 3fdd85ee..85514875 100644
 --- a/lib/libc/sched/Make.defs
@@ -57,6 +94,34 @@ index 3fdd85ee..85514875 100644
  ifeq ($(CONFIG_BUILD_PROTECTED),y)
  CSRCS += task_startup.c
  endif
+diff --git a/os/arch/arm/src/armv7-a/Toolchain.defs b/os/arch/arm/src/armv7-a/Toolchain.defs
+index 69d4dbd9..5571a032 100644
+--- a/os/arch/arm/src/armv7-a/Toolchain.defs
++++ b/os/arch/arm/src/armv7-a/Toolchain.defs
+@@ -1,19 +1,19 @@
+ ############################################################################
+ #
+ #  Copyright 2023 Samsung Electronics All Rights Reserved.
+-#
++#  
+ #  Licensed under the Apache License, Version 2.0 (the "License");
+ #  you may not use this file except in compliance with the License.
+ #  You may obtain a copy of the License at
+-#
++# 
+ #  http://www.apache.org/licenses/LICENSE-2.0
+-#
++# 
+ #  Unless required by applicable law or agreed to in writing,
+ #  software distributed under the License is distributed on an
+ #  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+ #  either express or implied. See the License for the specific
+ #  language governing permissions and limitations under the License.
+-#
++# 
+ ############################################################################
+ ############################################################################
+ # arch/arm/src/armv7-a/Toolchain.defs
 diff --git a/os/mm/mm_heap/mm_heapinfo_utils.c b/os/mm/mm_heap/mm_heapinfo_utils.c
 index 764a72ab..17c8f683 100644
 --- a/os/mm/mm_heap/mm_heapinfo_utils.c
