@@ -1,0 +1,244 @@
+From f0e6eed72728683cdc178626714bd4f1aa283fe7 Mon Sep 17 00:00:00 2001
+From: adbtrr_work11_quaran_fix <adbtrr_work11_quaran_fix@local>
+Date: Tue, 11 Aug 2026 11:56:16 +0000
+Subject: [PATCH 1/2] os/mm: keep the quarantine free caller information out of
+ the held chunk
+
+The pattern which the quarantine lays down covers the whole data area of a
+held chunk, and that area includes the flink, blink and free debug info
+fields of the free node. mm_free() recorded the first free in those fields
+and the double free report read them back, so the report always named the
+pattern instead of the caller: "released by UNKNOWN (-23131) at addr
+0xa5a5a5a5".
+
+Keep the information in the quarantine ring instead, next to the node
+pointer, where neither the pattern nor the stray write which the quarantine
+exists to catch can reach it. mm_quarantine_add() takes it as an argument
+and mm_quarantine_free_info() hands it back for the report.
+---
+ os/include/tinyara/mm/mm.h    | 26 ++++++++++++++-
+ os/mm/mm_heap/mm_free.c       | 27 ++++++++++++++--
+ os/mm/mm_heap/mm_quarantine.c | 61 ++++++++++++++++++++++++++++++++---
+ 3 files changed, 105 insertions(+), 9 deletions(-)
+
+diff --git a/os/include/tinyara/mm/mm.h b/os/include/tinyara/mm/mm.h
+index 07300ea4..e003fb79 100644
+--- a/os/include/tinyara/mm/mm.h
++++ b/os/include/tinyara/mm/mm.h
+@@ -328,6 +328,25 @@ struct mm_delaynode_s {
+ #endif
+ };
+ 
++#ifdef CONFIG_DEBUG_MM_QUARANTINE
++/* One slot of the quarantine ring.
++ *
++ * The free caller information is kept here and not in the chunk itself. While
++ * a chunk is held, its whole data area carries the poison pattern, and that
++ * area covers the flink, blink and free debug info fields of the free node.
++ * Leaving the information in the chunk would mean the pattern destroys the
++ * very data the double free report has to print.
++ */
++
++struct mm_qnode_s {
++	FAR struct mm_allocnode_s *node;	/* The chunk being held */
++#ifdef CONFIG_DEBUG_MM_FREEINFO
++	mmaddress_t free_call_addr;		/* Address of the code which released it */
++	pid_t free_call_pid;			/* PID which released it */
++#endif
++};
++#endif
++
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ struct heapinfo_tcb_info_s {
+ 	int pid;
+@@ -419,7 +438,7 @@ struct mm_heap_s {
+ 	 * corrupt the list.
+ 	 */
+ 
+-	FAR struct mm_allocnode_s *mm_quarantine[CONFIG_DEBUG_MM_QUARANTINE_CHUNKS];
++	struct mm_qnode_s mm_quarantine[CONFIG_DEBUG_MM_QUARANTINE_CHUNKS];
+ 	uint16_t mm_qhead;			/* Slot of the oldest held chunk */
+ 	uint16_t mm_qcount;			/* Number of chunks held */
+ 	size_t mm_qbytes;			/* Total size of the chunks held */
+@@ -682,7 +701,12 @@ void mm_free_coalesce(FAR struct mm_heap_s *heap, FAR struct mm_freenode_s *node
+ #ifdef CONFIG_DEBUG_MM_QUARANTINE
+ void mm_quarantine_init(FAR struct mm_heap_s *heap);
+ bool mm_quarantine_contains(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *node);
++#ifdef CONFIG_DEBUG_MM_FREEINFO
++bool mm_quarantine_add(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *node, mmaddress_t free_call_addr, pid_t free_call_pid);
++bool mm_quarantine_free_info(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *node, FAR mmaddress_t *free_call_addr, FAR pid_t *free_call_pid);
++#else
+ bool mm_quarantine_add(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *node);
++#endif
+ size_t mm_quarantine_flush(FAR struct mm_heap_s *heap);
+ #endif
+ 
+diff --git a/os/mm/mm_heap/mm_free.c b/os/mm/mm_heap/mm_free.c
+index 079404ef..534fa727 100644
+--- a/os/mm/mm_heap/mm_free.c
++++ b/os/mm/mm_heap/mm_free.c
+@@ -185,6 +185,11 @@ static void mm_free_internal(FAR struct mm_heap_s *heap, FAR void *mem, mmaddres
+ 	}
+ #ifdef CONFIG_DEBUG_MM_QUARANTINE
+ 	if (mm_quarantine_contains(heap, (FAR struct mm_allocnode_s *)node)) {
++#ifdef CONFIG_DEBUG_MM_FREEINFO
++		mmaddress_t first_free_addr;
++		pid_t first_free_pid;
++#endif
++
+ 		/* The chunk is being held in the quarantine, so it still looks
+ 		 * allocated and the test above could not catch this. Freeing it again
+ 		 * is a double free, and unlike the usual case both callers are known.
+@@ -192,8 +197,15 @@ static void mm_free_internal(FAR struct mm_heap_s *heap, FAR void *mem, mmaddres
+ 
+ 		mdbg("WARNING!! Double free of a pointer which is still in quarantine\n");
+ #ifdef CONFIG_DEBUG_MM_FREEINFO
+-		GET_TASK_NAME_BY_PID(task_name, node->free_call_pid);
+-		mdbg("1st free: released by %s (%d) at addr 0x%08x\n", task_name, node->free_call_pid, node->free_call_addr);
++		/* The chunk itself no longer carries the first free information: it is
++		 * covered by the poison pattern while the chunk is held. Take it from
++		 * the quarantine slot instead.
++		 */
++
++		if (mm_quarantine_free_info(heap, (FAR struct mm_allocnode_s *)node, &first_free_addr, &first_free_pid)) {
++			GET_TASK_NAME_BY_PID(task_name, first_free_pid);
++			mdbg("1st free: released by %s (%d) at addr 0x%08x\n", task_name, first_free_pid, first_free_addr);
++		}
+ #endif
+ 		GET_TASK_NAME_BY_PID(task_name, free_call_pid);
+ 		mdbg("2nd free (double free): now try to release by %s (%d) at addr 0x%08x\n", task_name, free_call_pid, free_call_addr);
+@@ -218,9 +230,18 @@ static void mm_free_internal(FAR struct mm_heap_s *heap, FAR void *mem, mmaddres
+ 	 * taken, MM_ALLOC_BIT deliberately stays set: that keeps the neighbours
+ 	 * from merging into it and keeps malloc from finding it, so the address
+ 	 * cannot be handed to anybody else while it is held.
++	 *
++	 * The free caller information is handed over as well, because the pattern
++	 * which the quarantine lays down covers the fields in the chunk which were
++	 * just used to record it.
+ 	 */
+ 
+-	if (mm_quarantine_add(heap, (FAR struct mm_allocnode_s *)node)) {
++#ifdef CONFIG_DEBUG_MM_FREEINFO
++	if (mm_quarantine_add(heap, (FAR struct mm_allocnode_s *)node, free_call_addr, free_call_pid))
++#else
++	if (mm_quarantine_add(heap, (FAR struct mm_allocnode_s *)node))
++#endif
++	{
+ 		mm_givesemaphore(heap);
+ 		return;
+ 	}
+diff --git a/os/mm/mm_heap/mm_quarantine.c b/os/mm/mm_heap/mm_quarantine.c
+index d97c482c..c8d82ade 100644
+--- a/os/mm/mm_heap/mm_quarantine.c
++++ b/os/mm/mm_heap/mm_quarantine.c
+@@ -89,8 +89,8 @@ static void quarantine_release_oldest(FAR struct mm_heap_s *heap)
+ 
+ 	DEBUGASSERT(heap->mm_qcount > 0);
+ 
+-	node = heap->mm_quarantine[heap->mm_qhead];
+-	heap->mm_quarantine[heap->mm_qhead] = NULL;
++	node = heap->mm_quarantine[heap->mm_qhead].node;
++	heap->mm_quarantine[heap->mm_qhead].node = NULL;
+ 	heap->mm_qhead = (heap->mm_qhead + 1) % QUARANTINE_SLOTS;
+ 	heap->mm_qcount--;
+ 	heap->mm_qbytes -= node->size;
+@@ -127,7 +127,7 @@ void mm_quarantine_init(FAR struct mm_heap_s *heap)
+ 	int i;
+ 
+ 	for (i = 0; i < QUARANTINE_SLOTS; i++) {
+-		heap->mm_quarantine[i] = NULL;
++		heap->mm_quarantine[i].node = NULL;
+ 	}
+ 
+ 	heap->mm_qhead = 0;
+@@ -160,7 +160,7 @@ bool mm_quarantine_contains(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_
+ 
+ 	for (i = 0; i < heap->mm_qcount; i++) {
+ 		slot = (heap->mm_qhead + i) % QUARANTINE_SLOTS;
+-		if (heap->mm_quarantine[slot] == node) {
++		if (heap->mm_quarantine[slot].node == node) {
+ 			return true;
+ 		}
+ 	}
+@@ -168,6 +168,44 @@ bool mm_quarantine_contains(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_
+ 	return false;
+ }
+ 
++#ifdef CONFIG_DEBUG_MM_FREEINFO
++/****************************************************************************
++ * Name: mm_quarantine_free_info
++ *
++ * Description:
++ *   Retrieve the free caller information which was recorded when 'node' was
++ *   taken into the quarantine.
++ *
++ *   The information cannot be read back from the chunk, because the poison
++ *   pattern covers the free node fields which normally carry it. This is the
++ *   only way to name the first releaser of a chunk which is still held.
++ *
++ *   Returns true when the chunk is held and the values have been filled in,
++ *   false when it is not in the quarantine at all.
++ *
++ *   NOTES:
++ *     (1) the caller must hold the MM semaphore.
++ *
++ ****************************************************************************/
++
++bool mm_quarantine_free_info(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *node, FAR mmaddress_t *free_call_addr, FAR pid_t *free_call_pid)
++{
++	uint16_t i;
++	uint16_t slot;
++
++	for (i = 0; i < heap->mm_qcount; i++) {
++		slot = (heap->mm_qhead + i) % QUARANTINE_SLOTS;
++		if (heap->mm_quarantine[slot].node == node) {
++			*free_call_addr = heap->mm_quarantine[slot].free_call_addr;
++			*free_call_pid = heap->mm_quarantine[slot].free_call_pid;
++			return true;
++		}
++	}
++
++	return false;
++}
++#endif
++
+ /****************************************************************************
+  * Name: mm_quarantine_add
+  *
+@@ -183,6 +221,11 @@ bool mm_quarantine_contains(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_
+  *   Holding a large buffer costs more of a small heap than the extra
+  *   detection is worth.
+  *
++ *   'free_call_addr' and 'free_call_pid' describe the free which is offering
++ *   the chunk. They are copied into the ring slot rather than left in the
++ *   chunk, because the pattern laid down below covers the free node fields
++ *   which would otherwise hold them.
++ *
+  *   NOTES:
+  *     (1) node->size must already be set to its final value.
+  *     (2) MM_ALLOC_BIT must still be set in node->preceding.
+@@ -190,7 +233,11 @@ bool mm_quarantine_contains(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_
+  *
+  ****************************************************************************/
+ 
++#ifdef CONFIG_DEBUG_MM_FREEINFO
++bool mm_quarantine_add(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *node, mmaddress_t free_call_addr, pid_t free_call_pid)
++#else
+ bool mm_quarantine_add(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *node)
++#endif
+ {
+ 	FAR void *start;
+ 	size_t nbytes;
+@@ -225,7 +272,11 @@ bool mm_quarantine_add(FAR struct mm_heap_s *heap, FAR struct mm_allocnode_s *no
+ 	mm_uaf_poison_range(start, nbytes);
+ 
+ 	slot = (heap->mm_qhead + heap->mm_qcount) % QUARANTINE_SLOTS;
+-	heap->mm_quarantine[slot] = node;
++	heap->mm_quarantine[slot].node = node;
++#ifdef CONFIG_DEBUG_MM_FREEINFO
++	heap->mm_quarantine[slot].free_call_addr = free_call_addr;
++	heap->mm_quarantine[slot].free_call_pid = free_call_pid;
++#endif
+ 	heap->mm_qcount++;
+ 	heap->mm_qbytes += node->size;
+ 

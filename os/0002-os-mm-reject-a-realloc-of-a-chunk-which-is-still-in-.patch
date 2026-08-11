@@ -1,0 +1,68 @@
+From d5447a32785d9cd39410aa3447ab3d782eb53bf6 Mon Sep 17 00:00:00 2001
+From: adbtrr_work11_quaran_fix <adbtrr_work11_quaran_fix@local>
+Date: Tue, 11 Aug 2026 11:56:52 +0000
+Subject: [PATCH 2/2] os/mm: reject a realloc of a chunk which is still in
+ quarantine
+
+A held chunk keeps MM_ALLOC_BIT set, so it is indistinguishable from a live
+allocation by its header alone. mm_free() was taught to look in the ring, but
+mm_realloc() was not, and it has no allocated state check of its own: a
+realloc through a stale pointer was accepted as an ordinary request.
+
+That is worse than the stale pointer on its own. When the chunk is extended
+into a free neighbour, node->size grows behind the back of the ring, which
+still accounts for the old size. mm_qbytes then underflows when the chunk
+ages out, and the release clears MM_ALLOC_BIT on memory which is in use again
+and merges it into the free list, corrupting the heap.
+
+Look in the ring before anything else touches the node, report both the code
+which released the chunk and the code which is reallocating it, and fail the
+call. realloc() leaves the original buffer untouched on failure, which is the
+right answer for a pointer which was already released.
+---
+ os/mm/mm_heap/mm_realloc.c | 32 ++++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/os/mm/mm_heap/mm_realloc.c b/os/mm/mm_heap/mm_realloc.c
+index 19f2cb17..18d8a8a4 100644
+--- a/os/mm/mm_heap/mm_realloc.c
++++ b/os/mm/mm_heap/mm_realloc.c
+@@ -142,6 +142,38 @@ FAR void *mm_realloc(FAR struct mm_heap_s *heap, FAR void *oldmem, size_t size,
+ 
+ 	DEBUGASSERT(mm_takesemaphore(heap));
+ 
++#ifdef CONFIG_DEBUG_MM_QUARANTINE
++	if (mm_quarantine_contains(heap, oldnode)) {
++#ifdef CONFIG_DEBUG_MM_FREEINFO
++		mmaddress_t first_free_addr;
++		pid_t first_free_pid;
++#endif
++
++		/* The chunk is being held in the quarantine. It keeps MM_ALLOC_BIT set
++		 * while it is held, so nothing above this point can tell it apart from
++		 * a live allocation and 'oldmem' is in fact a released pointer.
++		 *
++		 * Carrying on would be worse than the stale pointer itself. Extending
++		 * the chunk into a free neighbour changes node->size behind the back of
++		 * the ring, which still accounts for the old size: the byte budget then
++		 * underflows when the chunk ages out, and the release clears
++		 * MM_ALLOC_BIT on memory which is in use again and merges it into the
++		 * free list. Report it and fail the call instead.
++		 */
++
++		mdbg("WARNING!! Attempt to realloc a pointer which is still in quarantine\n");
++#ifdef CONFIG_DEBUG_MM_FREEINFO
++		if (mm_quarantine_free_info(heap, oldnode, &first_free_addr, &first_free_pid)) {
++			mdbg("It was released by pid %d at addr 0x%08x\n", first_free_pid, first_free_addr);
++		}
++#endif
++		mdbg("Now try to realloc at addr 0x%08x\n", caller_retaddr);
++		mm_dump_node(oldnode, "QUARANTINED NODE");
++		mm_givesemaphore(heap);
++		return NULL;
++	}
++#endif
++
+ 	/* Check if this is a request to reduce the size of the allocation. */
+ 
+ 	oldsize = oldnode->size;
