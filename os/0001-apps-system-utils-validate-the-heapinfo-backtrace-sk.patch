@@ -1,0 +1,54 @@
+From c3db5ea5cdac228f833271ad2c1208ecd7b49e99 Mon Sep 17 00:00:00 2001
+From: adbtrr_work25_heapinfo_rm_prodconfig
+ <adbtrr_work25_heapinfo_rm_prodconfig@local>
+Date: Tue, 25 Aug 2026 15:58:11 +0000
+Subject: [PATCH] apps/system/utils: validate the heapinfo backtrace skip value
+
+"heapinfo -s VALUE" parsed its argument with atoi() and only rejected it when
+the result was zero and the text was not "0". atoi("-5") is non-zero, so a
+negative value passed straight through to the backtrace engine, where it made
+sched_backtrace() record its first frame past the end of the caller's buffer.
+
+Parse with strtol() instead and reject anything that is not a whole number in
+0..HEAPINFO_BACKTRACE_SKIP_MAX, so a typo is reported rather than silently
+turned into 0 or into an out-of-range frame count.
+
+The library and driver side of this fix is a separate commit; this one depends
+on HEAPINFO_BACKTRACE_SKIP_MAX from it.
+---
+ apps/system/utils/utils_heapinfo.c | 20 +++++++++++++++-----
+ 1 file changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/apps/system/utils/utils_heapinfo.c b/apps/system/utils/utils_heapinfo.c
+index 44a65bc9..6131945d 100644
+--- a/apps/system/utils/utils_heapinfo.c
++++ b/apps/system/utils/utils_heapinfo.c
+@@ -328,13 +328,23 @@ int utils_heapinfo(int argc, char **args)
+ #if CONFIG_MM_BACKTRACE > 0
+ 	/* s : set the runtime backtrace skip value. */
+ 		case 's':
+-			if (!atoi(optarg) && strncmp(optarg, "0", strlen("0") + 1) != 0) {
+-				printf("Invalid skip value.\n");
+-				goto usage;
+-			}
+ 			{
+-				int skip = atoi(optarg);
++				char *endptr;
++				long skipval;
++				int skip;
+ 				int mminfo_fd;
++
++				/* strtol rather than atoi: the value is used as a frame
++				 * count by the backtrace engine on every allocation, so a
++				 * negative or non-numeric argument has to be rejected here
++				 * and not silently turned into 0.
++				 */
++				skipval = strtol(optarg, &endptr, 0);
++				if (*optarg == '\0' || *endptr != '\0' || skipval < 0 || skipval > HEAPINFO_BACKTRACE_SKIP_MAX) {
++					printf("Invalid skip value. Expected 0..%d\n", HEAPINFO_BACKTRACE_SKIP_MAX);
++					goto usage;
++				}
++				skip = (int)skipval;
+ 				/* Set the user-side copy directly (same binary in flat build,
+ 				 * or the common/user binary in protected build).
+ 				 */

@@ -1,7 +1,7 @@
-From 8d9358ea830ed7c192986374dfc1b5d1b5ef2404 Mon Sep 17 00:00:00 2001
+From 08d22b4b48fbc72870e4f7caa28b72033969020e Mon Sep 17 00:00:00 2001
 From: adbtrr_work25_heapinfo_rm_prodconfig
  <adbtrr_work25_heapinfo_rm_prodconfig@local>
-Date: Tue, 25 Aug 2026 09:11:37 +0000
+Date: Tue, 25 Aug 2026 15:57:47 +0000
 Subject: [PATCH] libc/sched: reject a negative backtrace skip and bound the
  frame store
 
@@ -10,68 +10,27 @@ writes arg->array[arg->cnt] before testing the counter against the buffer size.
 A negative 'skip' therefore starts the counter above zero and the very first
 recorded frame lands past the end of the caller's buffer.
 
-The buffer is the on-stack frames[] array in MM_ADD_BACKTRACE(), so the write
-corrupts the stack frame of whichever function is allocating. The skip value is
-runtime settable and reaches the engine on every allocation, so one bad value
-affects every subsequent malloc, and neither of the two ways to set it validated
-its argument:
-
- - "heapinfo -s VALUE" used atoi(), and atoi("-5") is non-zero, so the existing
-   "is it a number" test passed a negative straight through.
- - MMINFOIOC_SET_BACKTRACE_SKIP assigned (int)arg with no check at all.
-
-Fixed on all three paths:
+The buffer is the on-stack frames[] array used by MM_ADD_BACKTRACE(), so the
+write corrupts the stack frame of whichever function is allocating. The skip
+value is runtime settable and reaches the engine on every allocation, so one bad
+value affects every subsequent malloc, and MMINFOIOC_SET_BACKTRACE_SKIP assigned
+(int)arg without any check.
 
  - sched_backtrace() clamps a negative skip to 0. This also avoids negating
    INT_MIN, which is undefined.
  - backtrace_helper() bounds the store with cnt < size, so the buffer cannot be
    overrun even if a caller supplies an out-of-range starting count.
- - HEAPINFO_BACKTRACE_SKIP_MAX (32) is added to tinyara/mm/mm.h and both entry
-   points validate against it: the heapinfo command switches from atoi() to
-   strtol() with an endptr and range check, and the ioctl returns -EINVAL for an
-   out-of-range value.
+ - HEAPINFO_BACKTRACE_SKIP_MAX (32) is added to tinyara/mm/mm.h and the ioctl
+   returns -EINVAL for a value outside 0..MAX.
 
 Only invalid input is affected; valid skip values behave exactly as before.
+The heapinfo command side of the validation is a separate commit.
 ---
- apps/system/utils/utils_heapinfo.c | 20 +++++++++++++++-----
- lib/libc/sched/sched_backtrace.c   | 17 ++++++++++++++++-
- os/drivers/memory/mminfo.c         | 14 +++++++++++++-
- os/include/tinyara/mm/mm.h         |  7 +++++++
- 4 files changed, 51 insertions(+), 7 deletions(-)
+ lib/libc/sched/sched_backtrace.c | 17 ++++++++++++++++-
+ os/drivers/memory/mminfo.c       | 14 +++++++++++++-
+ os/include/tinyara/mm/mm.h       |  7 +++++++
+ 3 files changed, 36 insertions(+), 2 deletions(-)
 
-diff --git a/apps/system/utils/utils_heapinfo.c b/apps/system/utils/utils_heapinfo.c
-index 44a65bc9..6131945d 100644
---- a/apps/system/utils/utils_heapinfo.c
-+++ b/apps/system/utils/utils_heapinfo.c
-@@ -328,13 +328,23 @@ int utils_heapinfo(int argc, char **args)
- #if CONFIG_MM_BACKTRACE > 0
- 	/* s : set the runtime backtrace skip value. */
- 		case 's':
--			if (!atoi(optarg) && strncmp(optarg, "0", strlen("0") + 1) != 0) {
--				printf("Invalid skip value.\n");
--				goto usage;
--			}
- 			{
--				int skip = atoi(optarg);
-+				char *endptr;
-+				long skipval;
-+				int skip;
- 				int mminfo_fd;
-+
-+				/* strtol rather than atoi: the value is used as a frame
-+				 * count by the backtrace engine on every allocation, so a
-+				 * negative or non-numeric argument has to be rejected here
-+				 * and not silently turned into 0.
-+				 */
-+				skipval = strtol(optarg, &endptr, 0);
-+				if (*optarg == '\0' || *endptr != '\0' || skipval < 0 || skipval > HEAPINFO_BACKTRACE_SKIP_MAX) {
-+					printf("Invalid skip value. Expected 0..%d\n", HEAPINFO_BACKTRACE_SKIP_MAX);
-+					goto usage;
-+				}
-+				skip = (int)skipval;
- 				/* Set the user-side copy directly (same binary in flat build,
- 				 * or the common/user binary in protected build).
- 				 */
 diff --git a/lib/libc/sched/sched_backtrace.c b/lib/libc/sched/sched_backtrace.c
 index 212b30db..a4eb5557 100644
 --- a/lib/libc/sched/sched_backtrace.c
