@@ -1,0 +1,160 @@
+From 0fafd3184081c58a9c8769ca52343738c95a05d1 Mon Sep 17 00:00:00 2001
+From: adbtrr_work5 <adbtrr_work5@local>
+Date: Tue, 25 Aug 2026 07:16:29 +0000
+Subject: [PATCH] drivers/prodconfig: drop the memory alloc/free/leak ioctls
+
+These were added to exercise the leak checker during development and are not
+used by anything: PRODIOC_ALLOC, PRODIOC_FREE and PRODIOC_LEAK have no caller
+anywhere in the tree, and the heap capture window, the per-node allocation
+backtrace and the memleak backtrace report do not depend on them.
+
+Reverting them also removes:
+
+ - an unbounded kernel memory leak reachable from user space. PRODIOC_ALLOC
+   caps the block count at 100, PRODIOC_LEAK does not, so a single ioctl can
+   discard an arbitrary amount of kernel heap. The handler carried no config
+   guard, so it was compiled into every image.
+ - 400 bytes of permanent BSS for the g_alloc_blocks[] tracking array.
+ - printf() from a driver ioctl path.
+ - a change of prodconfig_ioctl() semantics: it used to return 0 for every
+   command, and returned -ENOTTY for unrecognised ones, which is unrelated to
+   this feature and a regression risk for existing callers.
+ - an ioctl base (0x3c00) defined privately in prodconfig.h instead of being
+   registered in tinyara/fs/ioctl.h next to the others.
+
+prodconfig gates secure debug and SWD access; memory fault injection does not
+belong in it. If the capability is still wanted it should be a debug-only test
+driver or example app behind its own Kconfig, with the block count bounded.
+
+MMINFOIOC_SET_BACKTRACE_SKIP in tinyara/fs/ioctl.h is unaffected and stays: it
+is used by the heapinfo skip-value ioctl.
+
+Both files are restored to their pre-branch content.
+---
+ os/drivers/prodconfig/prodconfig.c | 80 +-----------------------------
+ os/include/tinyara/prodconfig.h    |  7 ---
+ 2 files changed, 1 insertion(+), 86 deletions(-)
+
+diff --git a/os/drivers/prodconfig/prodconfig.c b/os/drivers/prodconfig/prodconfig.c
+index f70d99d0..d377d018 100644
+--- a/os/drivers/prodconfig/prodconfig.c
++++ b/os/drivers/prodconfig/prodconfig.c
+@@ -24,9 +24,6 @@
+ #include <tinyara/prodconfig.h>
+ #include <tinyara/fs/fs.h>
+ #include <tinyara/fs/ioctl.h>
+-#include <tinyara/kmalloc.h>
+-#include <tinyara/sched.h>
+-#include <stdio.h>
+ 
+ /****************************************************************************
+  * Private Function Prototypes
+@@ -38,9 +35,6 @@ static ssize_t prodconfig_write(FAR struct file *filep, FAR const char *buffer,
+ /****************************************************************************
+  * Private Data
+  ****************************************************************************/
+-static void *g_alloc_blocks[100];  /* Track allocated blocks */
+-static int g_alloc_count = 0;
+-
+ static const struct file_operations prodconfig_fops = {
+ 	0,                          /* open */
+ 	0,                          /* close */
+@@ -86,79 +80,7 @@ static ssize_t prodconfig_write(FAR struct file *filep, FAR const char *buffer,
+  ************************************************************************************/
+ static int prodconfig_ioctl(FAR struct file *filep, int cmd, unsigned long arg)
+ {
+-	switch (cmd) {
+-	case PRODIOC_ALLOC:
+-		{
+-			/* Allocate kernel memory blocks */
+-			int num_blocks = (int)arg;
+-			int i;
+-			
+-			if (num_blocks <= 0) {
+-				num_blocks = 1;
+-			}
+-			if (num_blocks > 100) {
+-				num_blocks = 100;
+-			}
+-			
+-			for (i = 0; i < num_blocks && g_alloc_count < 100; i++) {
+-				g_alloc_blocks[g_alloc_count] = kmm_malloc(1024);  /* 1KB per block from kernel heap */
+-				if (g_alloc_blocks[g_alloc_count] != NULL) {
+-					g_alloc_count++;
+-				}
+-			}
+-			printf("prodconfig: Allocated %d blocks for PID %d (total tracked: %d)\n", i, getpid(), g_alloc_count);
+-			return OK;
+-		}
+-	case PRODIOC_FREE:
+-		{
+-			/* Free kernel memory blocks */
+-			int num_blocks = (int)arg;
+-			int i;
+-			
+-			if (num_blocks <= 0) {
+-				num_blocks = 1;
+-			}
+-			if (num_blocks > g_alloc_count) {
+-				num_blocks = g_alloc_count;
+-			}
+-			
+-			for (i = 0; i < num_blocks && g_alloc_count > 0; i++) {
+-				g_alloc_count--;
+-				if (g_alloc_blocks[g_alloc_count] != NULL) {
+-					kmm_free(g_alloc_blocks[g_alloc_count]);
+-					g_alloc_blocks[g_alloc_count] = NULL;
+-				}
+-			}
+-			printf("prodconfig: Freed %d blocks for PID %d (remaining tracked: %d)\n", i, getpid(), g_alloc_count);
+-			return OK;
+-		}
+-	case PRODIOC_LEAK:
+-		{
+-			/* Allocate kernel memory without storing the pointer.
+-			 * This creates an unreachable allocation that the mem_leak
+-			 * checker will report as a leak (no reference exists in
+-			 * data, BSS, stack, or heap).
+-			 */
+-			int num_blocks = (int)arg;
+-			int i;
+-
+-			if (num_blocks <= 0) {
+-				num_blocks = 1;
+-			}
+-
+-			for (i = 0; i < num_blocks; i++) {
+-				void *leaked = kmm_malloc(1024);
+-				if (leaked != NULL) {
+-					/* Deliberately discard the pointer to create a leak */
+-					leaked = NULL;
+-				}
+-			}
+-			printf("prodconfig: Leaked %d blocks for PID %d (pointer discarded)\n", num_blocks, getpid());
+-			return OK;
+-		}
+-	default:
+-		return -ENOTTY;
+-	}
++	return 0;
+ }
+ 
+ /****************************************************************************
+diff --git a/os/include/tinyara/prodconfig.h b/os/include/tinyara/prodconfig.h
+index 77f8af42..24cef4fb 100644
+--- a/os/include/tinyara/prodconfig.h
++++ b/os/include/tinyara/prodconfig.h
+@@ -28,13 +28,6 @@
+ #define SWD_ENABLED           (1 << 1)
+ #define SWD_DOWNLOAD_DISABLED 0
+ 
+-/* Prodconfig ioctl commands */
+-#include <tinyara/fs/ioctl.h>
+-#define _PRODIOC(nr)       _IOC(0x3c00, nr)  /* Unique base for prodconfig */
+-#define PRODIOC_ALLOC      _PRODIOC(0x0001)  /* Allocate kernel memory blocks */
+-#define PRODIOC_FREE       _PRODIOC(0x0002)  /* Free kernel memory blocks */
+-#define PRODIOC_LEAK       _PRODIOC(0x0003)  /* Allocate kernel memory without tracking (leak) */
+-
+ int up_check_prodswd(void);
+ int up_check_proddownload(void);
+ void prodconfig_register(void);
