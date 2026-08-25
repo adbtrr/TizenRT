@@ -1,0 +1,78 @@
+From 11bf491b2cbc00ee82d082311f5f55d5e7f94876 Mon Sep 17 00:00:00 2001
+From: adbtrr_work25_heapinfo_rm_prodconfig
+ <adbtrr_work25_heapinfo_rm_prodconfig@local>
+Date: Tue, 25 Aug 2026 16:13:40 +0000
+Subject: [PATCH] configs/rtl8730e: enable the allocation backtrace engine on
+ loadable_ext_ddr_st7785
+
+No configuration selected the backtrace engine, so the feature recorded nothing
+anywhere. CONFIG_DEBUG_MM_HEAPINFO forces CONFIG_MM_BACKTRACE to 3 in
+tinyara/mm/mm.h, which reserves the per-node backtrace[] array, but with
+CONFIG_SCHED_BACKTRACE unset MM_ADD_BACKTRACE() resolves to the arch
+up_backtrace() branch, and with CONFIG_ARCH_HAVE_BACKTRACE unset the only
+up_backtrace() in the link is the weak stub in mm_backtrace.c, which returns 0
+and stores a NULL. Every node therefore paid for the array while "memleak" and
+"heapinfo -t" printed an empty call path.
+
+This config already carried the intended settings, but written as
+"#CONFIG_MM_BACKTRACE=4" and "#CONFIG_SCHED_BACKTRACE=y" - comment lines, not
+settings - placed inside a generated section where savedefconfig would drop
+them. Replace them with real entries in the positions kconfig emits:
+
+  CONFIG_SCHED_BACKTRACE=y      selects the EHABI unwinder, and turns on
+                                -funwind-tables for the user-space pass
+  CONFIG_MM_BACKTRACE=3         the depth mm.h already forces, stated explicitly
+  CONFIG_MM_BACKTRACE_SKIP=3    the existing compile-time default
+
+The depth is left at 3 and the sequence number stays off so the node layout is
+byte for byte what this configuration already had: allocnode and freenode are
+unchanged, and the only cost is the unwind tables in the user image. Raising the
+depth or adding the sequence number is a separate decision with a separate RAM
+cost.
+
+CONFIG_ARCH_HAVE_BACKTRACE stays unset. It is a hidden symbol for an
+architecture that provides a real up_backtrace(); amebasmart does not, and the
+arch Make.defs says so.
+
+Verified against this defconfig: the user pass now resolves MM_ADD_BACKTRACE()
+to sched_backtrace(), the kernel pass to the sequence-number-only form, and both
+passes compile.
+---
+ .../configs/rtl8730e/loadable_ext_ddr_st7785/defconfig | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/build/configs/rtl8730e/loadable_ext_ddr_st7785/defconfig b/build/configs/rtl8730e/loadable_ext_ddr_st7785/defconfig
+index 01a98242..426d5fcd 100644
+--- a/build/configs/rtl8730e/loadable_ext_ddr_st7785/defconfig
++++ b/build/configs/rtl8730e/loadable_ext_ddr_st7785/defconfig
+@@ -416,10 +416,7 @@ CONFIG_SECURITY_LEVEL=y
+ # Kernel Features
+ #
+ # CONFIG_DISABLE_OS_API is not set
+-#CONFIG_ARCH_HAVE_BACKTRACE=y
+-#CONFIG_FRAME_POINTER=y
+-#CONFIG_MM_BACKTRACE=4
+-#CONFIG_SCHED_BACKTRACE=y
++
+ #
+ # Clocks and Timers
+ #
+@@ -501,6 +498,7 @@ CONFIG_BOARD_INITTHREAD_PRIORITY=240
+ CONFIG_SCHED_STARTHOOK=y
+ CONFIG_SCHED_ATEXIT=y
+ CONFIG_SCHED_ONEXIT=y
++CONFIG_SCHED_BACKTRACE=y
+ 
+ #
+ # Signal Numbers
+@@ -1295,6 +1293,10 @@ CONFIG_MM_ASSERT_ON_FAIL=y
+ # CONFIG_MM_DUMP_CORRPUTED_HEAP is not set
+ CONFIG_MM_ALLOC_LARGE_FROM_BACK=y
+ CONFIG_MM_LARGE_ALLOC_THRESHOLD=1048576
++CONFIG_MM_BACKTRACE=3
++# CONFIG_MM_BACKTRACE_SEQNO is not set
++# CONFIG_MM_BACKTRACE_DEFAULT is not set
++CONFIG_MM_BACKTRACE_SKIP=3
+ 
+ #
+ # Work Queue Support
