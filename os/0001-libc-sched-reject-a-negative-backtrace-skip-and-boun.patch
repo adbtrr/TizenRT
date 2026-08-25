@@ -1,0 +1,153 @@
+From 8d9358ea830ed7c192986374dfc1b5d1b5ef2404 Mon Sep 17 00:00:00 2001
+From: adbtrr_work25_heapinfo_rm_prodconfig
+ <adbtrr_work25_heapinfo_rm_prodconfig@local>
+Date: Tue, 25 Aug 2026 09:11:37 +0000
+Subject: [PATCH] libc/sched: reject a negative backtrace skip and bound the
+ frame store
+
+sched_backtrace() starts its frame counter at (-skip - 1) and backtrace_helper()
+writes arg->array[arg->cnt] before testing the counter against the buffer size.
+A negative 'skip' therefore starts the counter above zero and the very first
+recorded frame lands past the end of the caller's buffer.
+
+The buffer is the on-stack frames[] array in MM_ADD_BACKTRACE(), so the write
+corrupts the stack frame of whichever function is allocating. The skip value is
+runtime settable and reaches the engine on every allocation, so one bad value
+affects every subsequent malloc, and neither of the two ways to set it validated
+its argument:
+
+ - "heapinfo -s VALUE" used atoi(), and atoi("-5") is non-zero, so the existing
+   "is it a number" test passed a negative straight through.
+ - MMINFOIOC_SET_BACKTRACE_SKIP assigned (int)arg with no check at all.
+
+Fixed on all three paths:
+
+ - sched_backtrace() clamps a negative skip to 0. This also avoids negating
+   INT_MIN, which is undefined.
+ - backtrace_helper() bounds the store with cnt < size, so the buffer cannot be
+   overrun even if a caller supplies an out-of-range starting count.
+ - HEAPINFO_BACKTRACE_SKIP_MAX (32) is added to tinyara/mm/mm.h and both entry
+   points validate against it: the heapinfo command switches from atoi() to
+   strtol() with an endptr and range check, and the ioctl returns -EINVAL for an
+   out-of-range value.
+
+Only invalid input is affected; valid skip values behave exactly as before.
+---
+ apps/system/utils/utils_heapinfo.c | 20 +++++++++++++++-----
+ lib/libc/sched/sched_backtrace.c   | 17 ++++++++++++++++-
+ os/drivers/memory/mminfo.c         | 14 +++++++++++++-
+ os/include/tinyara/mm/mm.h         |  7 +++++++
+ 4 files changed, 51 insertions(+), 7 deletions(-)
+
+diff --git a/apps/system/utils/utils_heapinfo.c b/apps/system/utils/utils_heapinfo.c
+index 44a65bc9..6131945d 100644
+--- a/apps/system/utils/utils_heapinfo.c
++++ b/apps/system/utils/utils_heapinfo.c
+@@ -328,13 +328,23 @@ int utils_heapinfo(int argc, char **args)
+ #if CONFIG_MM_BACKTRACE > 0
+ 	/* s : set the runtime backtrace skip value. */
+ 		case 's':
+-			if (!atoi(optarg) && strncmp(optarg, "0", strlen("0") + 1) != 0) {
+-				printf("Invalid skip value.\n");
+-				goto usage;
+-			}
+ 			{
+-				int skip = atoi(optarg);
++				char *endptr;
++				long skipval;
++				int skip;
+ 				int mminfo_fd;
++
++				/* strtol rather than atoi: the value is used as a frame
++				 * count by the backtrace engine on every allocation, so a
++				 * negative or non-numeric argument has to be rejected here
++				 * and not silently turned into 0.
++				 */
++				skipval = strtol(optarg, &endptr, 0);
++				if (*optarg == '\0' || *endptr != '\0' || skipval < 0 || skipval > HEAPINFO_BACKTRACE_SKIP_MAX) {
++					printf("Invalid skip value. Expected 0..%d\n", HEAPINFO_BACKTRACE_SKIP_MAX);
++					goto usage;
++				}
++				skip = (int)skipval;
+ 				/* Set the user-side copy directly (same binary in flat build,
+ 				 * or the common/user binary in protected build).
+ 				 */
+diff --git a/lib/libc/sched/sched_backtrace.c b/lib/libc/sched/sched_backtrace.c
+index 212b30db..a4eb5557 100644
+--- a/lib/libc/sched/sched_backtrace.c
++++ b/lib/libc/sched/sched_backtrace.c
+@@ -86,7 +86,13 @@ static _Unwind_Reason_Code backtrace_helper(FAR struct _Unwind_Context *ctx, FAR
+ 	 * negative 'cnt' skips those (and any user-requested 'skip') frames.
+ 	 */
+ 
+-	if (arg->cnt >= 0) {
++	/* 'cnt' is bounded below by the >= 0 test and above by 'size'.  The upper
++	 * test matters because the store happens before the increment below, so a
++	 * caller that started 'cnt' beyond the buffer would otherwise write past
++	 * its end on the very first frame.
++	 */
++
++	if (arg->cnt >= 0 && arg->cnt < arg->size) {
+ 		arg->array[arg->cnt] = (FAR void *)_Unwind_GetIP(ctx);
+ 		if (arg->cnt > 0) {
+ 			arg->array[arg->cnt] = unwind_arch_adjustment(arg->array[arg->cnt - 1], arg->array[arg->cnt]);
+@@ -140,6 +146,15 @@ int sched_backtrace(pid_t tid, FAR void **buffer, int size, int skip)
+ 		return 0;
+ 	}
+ 
++	/* A negative 'skip' would make the initial 'cnt' below positive, so the
++	 * first recorded frame would land past the end of 'buffer'.  Treat it as
++	 * "skip nothing"; negating INT_MIN would also be undefined.
++	 */
++
++	if (skip < 0) {
++		skip = 0;
++	}
++
+ 	/* This user-space implementation can only unwind its own stack. */
+ 
+ 	if (tid != getpid()) {
+diff --git a/os/drivers/memory/mminfo.c b/os/drivers/memory/mminfo.c
+index a3d19cfe..948cd5b3 100644
+--- a/os/drivers/memory/mminfo.c
++++ b/os/drivers/memory/mminfo.c
+@@ -209,8 +209,20 @@ static int mminfo_ioctl(FAR struct file *filep, int cmd, unsigned long arg)
+ 		 * protected/loadable build the user-side copy is set directly
+ 		 * by utils_heapinfo, but the kernel's copy is in a separate
+ 		 * address space and can only be reached via this ioctl.
++		 *
++		 * The value reaches the backtrace engine on every allocation, so
++		 * reject anything out of range here rather than letting it through.
+ 		 */
+-		g_mm_backtrace_skip = (int)arg;
++		{
++			int skip = (int)arg;
++
++			if (skip < 0 || skip > HEAPINFO_BACKTRACE_SKIP_MAX) {
++				mdbg("Invalid backtrace skip %d, expected 0..%d\n", skip, HEAPINFO_BACKTRACE_SKIP_MAX);
++				ret = -EINVAL;
++				break;
++			}
++			g_mm_backtrace_skip = skip;
++		}
+ 		break;
+ #endif
+ 	default:
+diff --git a/os/include/tinyara/mm/mm.h b/os/include/tinyara/mm/mm.h
+index e1b99bc8..1a0818bf 100644
+--- a/os/include/tinyara/mm/mm.h
++++ b/os/include/tinyara/mm/mm.h
+@@ -248,6 +248,13 @@ typedef void *mmaddress_t;             /* 32 bit address space */
+ #endif
+ #define HEAPINFO_BACKTRACE_DEPTH CONFIG_MM_BACKTRACE
+ 
++/* Upper bound accepted for the runtime skip value (g_mm_backtrace_skip).
++ * The skip count only has to cover the malloc wrapper chain, so anything
++ * beyond this is a typo rather than a real request.  Both the heapinfo
++ * command and the mminfo ioctl validate against it.
++ */
++#define HEAPINFO_BACKTRACE_SKIP_MAX 32
++
+ #define SIZEOF_MM_MALLOC_DEBUG_INFO (sizeof(pid_t) + sizeof(uint16_t))
+ 
+ /* Memory state values */
