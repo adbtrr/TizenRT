@@ -1,0 +1,503 @@
+From 131d668b247b3d8b6dc9b854d91a511b86e0d020 Mon Sep 17 00:00:00 2001
+From: adbtrr_work4_mq_assert <>
+Date: Fri, 4 Sep 2026 09:11:57 +0000
+Subject: [PATCH] os/kernel/pthread: add reproducer test for ASSERT in
+ pthread_create()
+
+os/kernel/pthread has exactly one always-compiled-in assertion; every other
+one in that directory is a DEBUGASSERT and so exists only under
+CONFIG_DEBUG.  The live one is in pthread_create():
+
+  #ifdef CONFIG_APP_BINARY_SEPARATION
+          ASSERT((sched_self()->flags & TCB_FLAG_TTYPE_MASK) != TCB_FLAG_TTYPE_KERNEL);
+  #endif
+
+Under app binary separation a pthread must belong to the task group of a
+user binary, so pthread_create() rejects a call made on behalf of a kernel
+thread.  It rejects it by panicking rather than by returning an error code,
+although the following lines of the same function return EBUSY and ENOMEM
+for other failures.
+
+A user space task cannot reach the assert: every thread it can spawn is
+TCB_FLAG_TTYPE_TASK or TCB_FLAG_TTYPE_PTHREAD, and only kernel_thread()
+passes TCB_FLAG_TTYPE_KERNEL to thread_create().  The test therefore drives
+it from inside the kernel through the OS API test driver:
+
+  os/drivers/os_api_test/kernel/test_pthread_assert.c
+    TESTIOC_PTHREAD_CREATE_FROM_KTHREAD spawns a kernel thread whose entry
+    calls pthread_create()
+
+  apps/examples/testcase/le_tc/kernel/tc_pthread_assert.c
+    issues that ioctl on the test driver fd
+
+Unlike the mqueue ASSERT(btcb), this one is not a race: the kernel thread
+reaches pthread_create() and the assert fires on the first call, every time.
+
+The test panics the board by design, so CONFIG_TC_KERNEL_PTHREAD_ASSERT
+defaults to n and is not selected by CONFIG_TC_KN_ALL.  It depends on
+APP_BINARY_SEPARATION because the assert does not exist without it; when the
+assert is compiled out the test reports that rather than claiming a pass.
+---
+ apps/examples/testcase/le_tc/kernel/Kconfig   |  20 ++
+ apps/examples/testcase/le_tc/kernel/Make.defs |   3 +
+ .../testcase/le_tc/kernel/kernel_tc_main.c    |   6 +
+ .../testcase/le_tc/kernel/tc_internal.h       |   1 +
+ .../testcase/le_tc/kernel/tc_pthread_assert.c | 125 +++++++++++++
+ os/drivers/os_api_test/kernel/Make.defs       |   4 +
+ .../os_api_test/kernel/test_pthread_assert.c  | 173 ++++++++++++++++++
+ os/drivers/os_api_test/os_api_test_drv.c      |   7 +-
+ os/drivers/os_api_test/os_api_test_proto.h    |   3 +
+ os/include/tinyara/os_api_test_drv.h          |   9 +
+ 10 files changed, 350 insertions(+), 1 deletion(-)
+ create mode 100644 apps/examples/testcase/le_tc/kernel/tc_pthread_assert.c
+ create mode 100644 os/drivers/os_api_test/kernel/test_pthread_assert.c
+
+diff --git a/apps/examples/testcase/le_tc/kernel/Kconfig b/apps/examples/testcase/le_tc/kernel/Kconfig
+index 9010c4df..ccbcf504 100644
+--- a/apps/examples/testcase/le_tc/kernel/Kconfig
++++ b/apps/examples/testcase/le_tc/kernel/Kconfig
+@@ -152,6 +152,26 @@ config TC_KERNEL_PTHREAD
+ 	default n
+ 	select MUTEX_TYPES
+ 
++config TC_KERNEL_PTHREAD_ASSERT
++	bool "Pthread ASSERT reproducer (destructive)"
++	default n
++	depends on APP_BINARY_SEPARATION
++	select DRIVERS_OS_API_TEST
++	---help---
++		Negative test case that provokes the ASSERT in pthread_create()
++		(os/kernel/pthread/pthread_create.c), the only always-compiled-in
++		assertion in os/kernel/pthread.
++
++		It asks the OS API test driver to spawn a kernel thread, which then
++		calls pthread_create().  sched_self()->flags then reports
++		TCB_FLAG_TTYPE_KERNEL, which is what the assert rejects.  A user space
++		task cannot reach it, because only kernel_thread() creates a thread of
++		that type.
++
++		The assert exists only when APP_BINARY_SEPARATION is enabled, hence the
++		dependency.  This test panics the board on purpose, so it is not
++		selected by CONFIG_TC_KN_ALL.
++
+ config TC_KERNEL_SCHED
+ 	bool "Sched"
+ 	default n
+diff --git a/apps/examples/testcase/le_tc/kernel/Make.defs b/apps/examples/testcase/le_tc/kernel/Make.defs
+index 288fa3a7..8b0bf69e 100644
+--- a/apps/examples/testcase/le_tc/kernel/Make.defs
++++ b/apps/examples/testcase/le_tc/kernel/Make.defs
+@@ -116,6 +116,9 @@ endif
+ ifeq ($(CONFIG_TC_KERNEL_MQUEUE),y)
+   CSRCS += tc_mqueue.c
+ endif
++ifeq ($(CONFIG_TC_KERNEL_PTHREAD_ASSERT),y)
++  CSRCS += tc_pthread_assert.c
++endif
+ ifeq ($(CONFIG_TC_KERNEL_PTHREAD),y)
+   CSRCS += tc_pthread.c
+ endif
+diff --git a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+index 9a4ca0f8..371c51bb 100644
+--- a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
++++ b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+@@ -198,6 +198,12 @@ int tc_kernel_main(int argc, char *argv[])
+ #ifdef CONFIG_TC_KERNEL_IRQ
+ 	irq_main();
+ #endif
++
++	/* Runs last: it is expected to panic the board on purpose. */
++
++#ifdef CONFIG_TC_KERNEL_PTHREAD_ASSERT
++	pthread_assert_main();
++#endif
+ #ifdef CONFIG_ITC_KERNEL_ENVIRON
+ 	itc_environ_main();
+ #endif
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_internal.h b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+index dd4612c2..edf47833 100644
+--- a/apps/examples/testcase/le_tc/kernel/tc_internal.h
++++ b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+@@ -80,6 +80,7 @@ int libc_unistd_main(void);
+ int libc_syslog_main(void);
+ int mqueue_main(void);
+ int pthread_main(void);
++int pthread_assert_main(void);
+ int roundrobin_main(void);
+ int sched_main(void);
+ int semaphore_main(void);
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_pthread_assert.c b/apps/examples/testcase/le_tc/kernel/tc_pthread_assert.c
+new file mode 100644
+index 00000000..77c01a67
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/tc_pthread_assert.c
+@@ -0,0 +1,125 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file tc_pthread_assert.c
++
++/// @brief Negative test case which provokes the ASSERT in pthread_create()
++///        at os/kernel/pthread/pthread_create.c.
++///
++/// Target
++/// ------
++/// os/kernel/pthread contains exactly one always-compiled-in ASSERT; every
++/// other assertion in that directory is a DEBUGASSERT, which only exists when
++/// CONFIG_DEBUG is set.  The one that is always live is:
++///
++///     #ifdef CONFIG_APP_BINARY_SEPARATION
++///             ASSERT((sched_self()->flags & TCB_FLAG_TTYPE_MASK) != TCB_FLAG_TTYPE_KERNEL);
++///     #endif
++///
++/// Under app binary separation a pthread has to belong to the task group of a
++/// user binary, so pthread_create() rejects a call made on behalf of a kernel
++/// thread.  It rejects it by panicking rather than by returning an error code,
++/// even though the very next lines of the same function return EBUSY and
++/// ENOMEM for other failures.
++///
++/// How the assert is reached
++/// -------------------------
++/// A user space task cannot trip this on its own.  Every thread it can spawn
++/// is TCB_FLAG_TTYPE_TASK (task_create) or TCB_FLAG_TTYPE_PTHREAD
++/// (pthread_create); only kernel_thread() passes TCB_FLAG_TTYPE_KERNEL to
++/// thread_create() (os/kernel/task/task_create.c).  So the test asks the OS
++/// API test driver to spawn a real kernel thread, and that thread calls
++/// pthread_create().
++///
++/// Unlike the mqueue ASSERT(btcb), this one is not a race: the kernel thread
++/// reaches pthread_create() and the assert fires on the first call, every
++/// time.
++///
++/// Expected result: the board panics with
++///     Assertion failed at file:pthread/pthread_create.c line: 261
++///
++/// Requires CONFIG_APP_BINARY_SEPARATION=y.  Without it the assert is not
++/// compiled at all, and this test reports that instead of claiming a pass.
++///
++/// This test is destructive by design.  It is default n in Kconfig and is not
++/// selected by CONFIG_TC_KN_ALL.
++
++/**************************************************************************
++* Included Files
++**************************************************************************/
++#include <tinyara/config.h>
++#include <stdio.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <tinyara/os_api_test_drv.h>
++#include "tc_internal.h"
++
++/**************************************************************************
++* Private Functions
++**************************************************************************/
++
++/**
++* @fn                   :tc_pthread_assert_create_from_kthread
++* @description          :Ask the OS API test driver to run pthread_create()
++*                        on a kernel thread, which trips the ASSERT in
++*                        pthread_create().
++* @return               :void
++*/
++static void tc_pthread_assert_create_from_kthread(void)
++{
++	int fd;
++	int ret;
++
++	printf("tc_pthread_assert: targeting ASSERT in pthread_create()"
++		" (os/kernel/pthread/pthread_create.c)\n");
++#ifdef CONFIG_APP_BINARY_SEPARATION
++	printf("tc_pthread_assert: spawning a kernel thread that calls"
++		" pthread_create(); the assert should be immediate\n");
++#else
++	printf("tc_pthread_assert: CONFIG_APP_BINARY_SEPARATION is disabled,"
++		" so the assert is not compiled into this build\n");
++#endif
++
++	fd = tc_get_drvfd();
++	TC_ASSERT_GEQ("tc_get_drvfd", fd, 0);
++
++	/* The kernel is expected to die inside this ioctl. */
++
++	ret = ioctl(fd, TESTIOC_PTHREAD_CREATE_FROM_KTHREAD, 0);
++
++	/* Reaching this point means pthread_create() returned to the kernel
++	 * thread instead of asserting, which happens when the assert is compiled
++	 * out.  Report it rather than claiming a pass.
++	 */
++
++	printf("tc_pthread_assert: NOT REPRODUCED, ioctl returned %d (errno %d)\n",
++		ret, ret < 0 ? errno : 0);
++	printf("tc_pthread_assert: rebuild with CONFIG_APP_BINARY_SEPARATION=y"
++		" so the assert exists\n");
++}
++
++/**************************************************************************
++* Public Functions
++**************************************************************************/
++
++int pthread_assert_main(void)
++{
++	tc_pthread_assert_create_from_kthread();
++
++	return 0;
++}
+diff --git a/os/drivers/os_api_test/kernel/Make.defs b/os/drivers/os_api_test/kernel/Make.defs
+index 226d2d18..367e8b5b 100644
+--- a/os/drivers/os_api_test/kernel/Make.defs
++++ b/os/drivers/os_api_test/kernel/Make.defs
+@@ -42,6 +42,10 @@ ifeq ($(CONFIG_EXAMPLES_STACK_PROTECTION),y)
+ CSRCS += test_kthread_stack_protection.c
+ endif
+ 
++ifeq ($(CONFIG_TC_KERNEL_PTHREAD_ASSERT),y)
++CSRCS += test_pthread_assert.c
++endif
++
+ CFLAGS += -I$(TOPDIR)/kernel
+ 
+ # Include OS API test driver support
+diff --git a/os/drivers/os_api_test/kernel/test_pthread_assert.c b/os/drivers/os_api_test/kernel/test_pthread_assert.c
+new file mode 100644
+index 00000000..b5604dad
+--- /dev/null
++++ b/os/drivers/os_api_test/kernel/test_pthread_assert.c
+@@ -0,0 +1,173 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/****************************************************************************
++ * os/drivers/os_api_test/kernel/test_pthread_assert.c
++ *
++ * Kernel side helper for the negative test case that provokes the ASSERT in
++ * pthread_create() at os/kernel/pthread/pthread_create.c:
++ *
++ *   #ifdef CONFIG_APP_BINARY_SEPARATION
++ *           ASSERT((sched_self()->flags & TCB_FLAG_TTYPE_MASK) != TCB_FLAG_TTYPE_KERNEL);
++ *   #endif
++ *
++ * Under app binary separation a pthread must belong to the task group of a
++ * user binary, so pthread_create() refuses to run on behalf of a kernel
++ * thread.  It refuses by panicking rather than by returning an error code.
++ *
++ * A user space task cannot trip that check by itself: every thread it can
++ * spawn is TCB_FLAG_TTYPE_TASK or TCB_FLAG_TTYPE_PTHREAD.  Only
++ * kernel_thread() produces TCB_FLAG_TTYPE_KERNEL (see
++ * thread_create(name, TCB_FLAG_TTYPE_KERNEL, ...) in
++ * os/kernel/task/task_create.c), which is why this half of the test lives
++ * behind the OS API test driver.
++ *
++ * Unlike a race, this is fully deterministic: the kernel thread reaches
++ * pthread_create() and the assert fires on the first call, every time.
++ *
++ ****************************************************************************/
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++
++#include <errno.h>
++#include <pthread.h>
++#include <semaphore.h>
++#include <debug.h>
++
++#include <tinyara/sched.h>
++#include <tinyara/kthread.h>
++#include <tinyara/os_api_test_drv.h>
++
++#include "os_api_test_proto.h"
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++#define PTHREAD_ASSERT_KTHREAD_NAME	"pthread_assert_kthread"
++#define PTHREAD_ASSERT_KTHREAD_STACK	2048
++
++/****************************************************************************
++ * Private Data
++ ****************************************************************************/
++
++static sem_t g_pthread_assert_sem;
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: pthread_assert_victim
++ *
++ * Description:
++ *   Body of the pthread that the kernel thread tries to create.  Control is
++ *   never expected to arrive here, because pthread_create() asserts before it
++ *   ever starts the new thread.
++ *
++ ****************************************************************************/
++
++static pthread_addr_t pthread_assert_victim(pthread_addr_t arg)
++{
++	return NULL;
++}
++
++/****************************************************************************
++ * Name: pthread_assert_kthread
++ *
++ * Description:
++ *   Runs as TCB_FLAG_TTYPE_KERNEL.  Calling pthread_create() from here makes
++ *   sched_self()->flags report TCB_FLAG_TTYPE_KERNEL, which is exactly the
++ *   condition the assert rejects.
++ *
++ ****************************************************************************/
++
++static int pthread_assert_kthread(int argc, char *argv[])
++{
++	pthread_t thread;
++	int ret;
++
++	lldbg("calling pthread_create() from a kernel thread, flags 0x%02x\n",
++		sched_self()->flags & TCB_FLAG_TTYPE_MASK);
++
++	/* The kernel is expected to die inside this call. */
++
++	ret = pthread_create(&thread, NULL, pthread_assert_victim, NULL);
++
++	/* Only reachable when the assert is compiled out, i.e. when
++	 * CONFIG_APP_BINARY_SEPARATION is disabled.  Say so instead of leaving a
++	 * silent pass, and clean up the thread that should never have been made.
++	 */
++
++	lldbg("pthread_create() returned %d without asserting;"
++		" CONFIG_APP_BINARY_SEPARATION is disabled in this build\n", ret);
++
++	if (ret == OK) {
++		pthread_join(thread, NULL);
++	}
++
++	(void)sem_post(&g_pthread_assert_sem);
++	return 0;
++}
++
++/****************************************************************************
++ * Name: create_kthread_for_pthread_assert_test
++ ****************************************************************************/
++
++static int create_kthread_for_pthread_assert_test(void)
++{
++	int pid;
++
++	sem_init(&g_pthread_assert_sem, 0, 0);
++
++	pid = kernel_thread(PTHREAD_ASSERT_KTHREAD_NAME, SCHED_PRIORITY_DEFAULT,
++			PTHREAD_ASSERT_KTHREAD_STACK, pthread_assert_kthread, NULL);
++	if (pid < 0) {
++		dbg("Failed to start %s\n", PTHREAD_ASSERT_KTHREAD_NAME);
++		sem_destroy(&g_pthread_assert_sem);
++		return -1;
++	}
++
++	/* Returns only when the assert was compiled out. */
++
++	sem_wait(&g_pthread_assert_sem);
++	sem_destroy(&g_pthread_assert_sem);
++
++	return 0;
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++int test_pthread_assert(int cmd, unsigned long arg)
++{
++	int ret = -EINVAL;
++
++	switch (cmd) {
++	case TESTIOC_PTHREAD_CREATE_FROM_KTHREAD:
++		ret = create_kthread_for_pthread_assert_test();
++		break;
++	}
++
++	return ret;
++}
+diff --git a/os/drivers/os_api_test/os_api_test_drv.c b/os/drivers/os_api_test/os_api_test_drv.c
+index fa1cdae2..a1af9c60 100644
+--- a/os/drivers/os_api_test/os_api_test_drv.c
++++ b/os/drivers/os_api_test/os_api_test_drv.c
+@@ -195,7 +195,12 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long
+ 	case TESTIOC_GET_FS_PARTNO:
+ 		ret = test_fs_get_devname();
+ 		break;
+-#endif		
++#endif
++#ifdef CONFIG_TC_KERNEL_PTHREAD_ASSERT
++	case TESTIOC_PTHREAD_CREATE_FROM_KTHREAD:
++		ret = test_pthread_assert(cmd, arg);
++		break;
++#endif
+ 	default:
+ 		vdbg("Unrecognized cmd: %d arg: %ld\n", cmd, arg);
+ 		break;
+diff --git a/os/drivers/os_api_test/os_api_test_proto.h b/os/drivers/os_api_test/os_api_test_proto.h
+index 28b60f2c..449b1511 100644
+--- a/os/drivers/os_api_test/os_api_test_proto.h
++++ b/os/drivers/os_api_test/os_api_test_proto.h
+@@ -40,4 +40,7 @@ int test_net_pbuf(int cmd, unsigned long arg);
+ #if defined(CONFIG_AUTOMOUNT_USERFS) && defined(CONFIG_EXAMPLES_TESTCASE_FILESYSTEM)
+ int test_fs_get_devname(void);
+ #endif
++#ifdef CONFIG_TC_KERNEL_PTHREAD_ASSERT
++int test_pthread_assert(int cmd, unsigned long arg);
++#endif
+ #endif
+diff --git a/os/include/tinyara/os_api_test_drv.h b/os/include/tinyara/os_api_test_drv.h
+index 59969b84..499c5291 100644
+--- a/os/include/tinyara/os_api_test_drv.h
++++ b/os/include/tinyara/os_api_test_drv.h
+@@ -87,6 +87,15 @@
+ #if defined(CONFIG_AUTOMOUNT_USERFS) && defined(CONFIG_EXAMPLES_TESTCASE_FILESYSTEM)
+ #define TESTIOC_GET_FS_PARTNO			_TESTIOC(24)
+ #endif
++/****************************************************************************
++ * TESTIOC_PTHREAD_CREATE_FROM_KTHREAD - Spawn a kernel thread that calls
++ *   pthread_create(), to provoke the ASSERT in
++ *   os/kernel/pthread/pthread_create.c.  Only a kernel thread can reach that
++ *   assert, so the call has to originate inside the kernel.
++ ****************************************************************************/
++#ifdef CONFIG_TC_KERNEL_PTHREAD_ASSERT
++#define TESTIOC_PTHREAD_CREATE_FROM_KTHREAD	_TESTIOC(25)
++#endif
+ 
+ #define OS_API_TEST_DRVPATH	"/dev/os_api_test"
+ 
