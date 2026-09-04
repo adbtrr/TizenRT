@@ -1,0 +1,509 @@
+From 6a50d57b0b838ca3c074ecf287cf1ad9a30b9247 Mon Sep 17 00:00:00 2001
+From: adbtrr_work4_mq_assert <>
+Date: Fri, 4 Sep 2026 07:02:14 +0000
+Subject: [PATCH] os/kernel/mqueue: add reproducer test for ASSERT(btcb) in
+ mq_doreceive()
+
+mq_doreceive() evaluates its "if (msgq->nwaitnotfull > 0)" guard outside
+the critical section that then searches g_waitingformqnotfull, and it is
+called by mq_receive()/mq_timedreceive() only after both
+leave_critical_section() and sched_unlock().  The guard therefore runs
+with interrupts and pre-emption enabled.
+
+A mq_timedsend() timeout expiring in the timer interrupt runs
+mq_sndtimeout() -> mq_waitirq(), which clears nwaitnotfull and unlinks the
+waiter.  When that lands inside the window, the search finds nothing and
+the always-compiled-in ASSERT(btcb) panics the kernel.
+
+Add a negative test case that drives exactly that ordering:
+
+  apps/examples/testcase/le_tc/kernel/tc_mqueue_assert.c
+    blocker thread - mq_timedsend() with a one tick deadline, so it parks
+                     in mq_waitsend() with nwaitnotfull == 1 and a
+                     watchdog armed
+    receiver       - tight mq_receive() loop crossing the guard once per
+                     iteration
+
+The test panics the board by design, so CONFIG_TC_KERNEL_MQUEUE_ASSERT
+defaults to n and is not selected by CONFIG_TC_KN_ALL.
+
+On stock sources the hit is statistical, typically a few seconds.
+CONFIG_MQ_ASSERT_RACE_WINDOW_US stretches the window with up_udelay() so
+it can be reproduced deterministically; it defaults to 0 and compiles away
+entirely, leaving production builds unchanged.
+
+The companion ASSERT(btcb) in mq_dosend() (mq_sndinternal.c) is not
+reachable this way: there the guard and the list walk share a single
+enter_critical_section(), so the invariant cannot be broken between them.
+---
+ apps/examples/testcase/le_tc/kernel/Kconfig   |  15 +
+ apps/examples/testcase/le_tc/kernel/Make.defs |   3 +
+ .../testcase/le_tc/kernel/kernel_tc_main.c    |   6 +
+ .../testcase/le_tc/kernel/tc_internal.h       |   1 +
+ .../testcase/le_tc/kernel/tc_mqueue_assert.c  | 328 ++++++++++++++++++
+ os/kernel/Kconfig                             |  19 +
+ os/kernel/mqueue/mq_rcvinternal.c             |  17 +
+ 7 files changed, 389 insertions(+)
+ create mode 100644 apps/examples/testcase/le_tc/kernel/tc_mqueue_assert.c
+
+diff --git a/apps/examples/testcase/le_tc/kernel/Kconfig b/apps/examples/testcase/le_tc/kernel/Kconfig
+index 9010c4df..57bebd4c 100644
+--- a/apps/examples/testcase/le_tc/kernel/Kconfig
++++ b/apps/examples/testcase/le_tc/kernel/Kconfig
+@@ -199,6 +199,21 @@ config TC_KERNEL_WORK_QUEUE
+ 	default n
+ 	depends on SCHED_WORKQUEUE
+ 
++config TC_KERNEL_MQUEUE_ASSERT
++	bool "Mqueue ASSERT reproducer (destructive)"
++	default n
++	depends on !DISABLE_MQUEUE
++	---help---
++		Negative test case that provokes ASSERT(btcb) in mq_doreceive()
++		(os/kernel/mqueue/mq_rcvinternal.c).  It races a mq_timedsend() timeout
++		expiring in the timer interrupt against the unprotected
++		"if (msgq->nwaitnotfull > 0)" guard in mq_doreceive().
++
++		This test panics the board on purpose, so it is not selected by
++		CONFIG_TC_KN_ALL.  On stock sources the hit is statistical and usually
++		takes a few seconds; set CONFIG_MQ_ASSERT_RACE_WINDOW_US to at least two
++		system tick periods to make it deterministic.
++
+ config TC_KERNEL_MEMORY_SAFETY
+ 	bool "Memory Safety"
+ 	default n
+diff --git a/apps/examples/testcase/le_tc/kernel/Make.defs b/apps/examples/testcase/le_tc/kernel/Make.defs
+index 288fa3a7..81687eea 100644
+--- a/apps/examples/testcase/le_tc/kernel/Make.defs
++++ b/apps/examples/testcase/le_tc/kernel/Make.defs
+@@ -116,6 +116,9 @@ endif
+ ifeq ($(CONFIG_TC_KERNEL_MQUEUE),y)
+   CSRCS += tc_mqueue.c
+ endif
++ifeq ($(CONFIG_TC_KERNEL_MQUEUE_ASSERT),y)
++  CSRCS += tc_mqueue_assert.c
++endif
+ ifeq ($(CONFIG_TC_KERNEL_PTHREAD),y)
+   CSRCS += tc_pthread.c
+ endif
+diff --git a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+index 9a4ca0f8..92f40f91 100644
+--- a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
++++ b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+@@ -198,6 +198,12 @@ int tc_kernel_main(int argc, char *argv[])
+ #ifdef CONFIG_TC_KERNEL_IRQ
+ 	irq_main();
+ #endif
++
++	/* Runs last: it is expected to panic the board on purpose. */
++
++#ifdef CONFIG_TC_KERNEL_MQUEUE_ASSERT
++	mqueue_assert_main();
++#endif
+ #ifdef CONFIG_ITC_KERNEL_ENVIRON
+ 	itc_environ_main();
+ #endif
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_internal.h b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+index dd4612c2..1ac78410 100644
+--- a/apps/examples/testcase/le_tc/kernel/tc_internal.h
++++ b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+@@ -79,6 +79,7 @@ int libc_timer_main(void);
+ int libc_unistd_main(void);
+ int libc_syslog_main(void);
+ int mqueue_main(void);
++int mqueue_assert_main(void);
+ int pthread_main(void);
+ int roundrobin_main(void);
+ int sched_main(void);
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_mqueue_assert.c b/apps/examples/testcase/le_tc/kernel/tc_mqueue_assert.c
+new file mode 100644
+index 00000000..eb2d19de
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/tc_mqueue_assert.c
+@@ -0,0 +1,328 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file tc_mqueue_assert.c
++
++/// @brief Negative test case which provokes the ASSERT(btcb) in mq_doreceive()
++///        at os/kernel/mqueue/mq_rcvinternal.c.
++///
++/// Background
++/// ----------
++/// mq_doreceive() wakes one task that is blocked waiting for the queue to
++/// become not-full:
++///
++///     msgq = mqdes->msgq;
++///     if (msgq->nwaitnotfull > 0) {                <-- guard, NOT protected
++///             saved_state = enter_critical_section();
++///             for (btcb = g_waitingformqnotfull.head;
++///                  btcb && btcb->msgwaitq != msgq; btcb = btcb->flink);
++///             ASSERT(btcb);                        <-- fires when btcb == NULL
++///
++/// The guard is evaluated *outside* the critical section, and mq_doreceive()
++/// itself is called by mq_receive()/mq_timedreceive() only after they have
++/// already executed leave_critical_section() and sched_unlock().  So the guard
++/// runs with both interrupts and pre-emption enabled.
++///
++/// If the single task counted by nwaitnotfull is removed from
++/// g_waitingformqnotfull between the guard and enter_critical_section(), the
++/// search finds nothing and the always-compiled-in ASSERT panics the kernel.
++/// The timer interrupt does exactly that for a blocked mq_timedsend():
++///
++///     wd_timer() -> mq_sndtimeout() -> mq_waitirq(wtcb, ETIMEDOUT)
++///          -> wtcb->msgwaitq = NULL; msgq->nwaitnotfull--; up_unblock_task()
++///
++/// Test structure
++/// --------------
++/// Two threads share a queue whose depth is one message:
++///
++///   blocker  (higher priority) : mq_timedsend() with a one tick deadline.
++///                                The queue is full, so it parks in
++///                                mq_waitsend() with nwaitnotfull == 1 and a
++///                                one tick watchdog armed.
++///   receiver (lower priority)  : tight mq_receive() loop.  Every iteration
++///                                walks the unprotected guard above while
++///                                nwaitnotfull == 1.
++///
++/// Every system tick that lands while the blocker is parked expires that
++/// watchdog from interrupt context.  Whenever such a tick lands inside the
++/// unprotected window, the kernel asserts.
++///
++/// Reproduction is therefore statistical on stock sources (typically a few
++/// seconds).  To make it deterministic, build with
++/// CONFIG_MQ_ASSERT_RACE_WINDOW_US set to at least two tick periods: that
++/// instrumentation stretches the unprotected window with up_udelay() so the
++/// timeout is guaranteed to land inside it.
++///
++/// Expected result: the board panics with
++///     Assertion failed at file:mqueue/mq_rcvinternal.c line: 314
++///
++/// This test is destructive by design.  It is default n in Kconfig and is not
++/// selected by CONFIG_TC_KN_ALL.
++
++/**************************************************************************
++* Included Files
++**************************************************************************/
++#include <tinyara/config.h>
++#include <stdio.h>
++#include <stdbool.h>
++#include <string.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <time.h>
++#include <mqueue.h>
++#include <pthread.h>
++#include <sched.h>
++#include <unistd.h>
++#include "tc_internal.h"
++
++/**************************************************************************
++* Private Definitions
++**************************************************************************/
++#define MQ_ASSERT_NAME		"mq_assert_tc"
++
++/* A depth of one keeps the queue permanently full while the blocker holds a
++ * pending send, which is what pins nwaitnotfull at exactly one.  Exactly one
++ * waiter is required: the ASSERT only fires when the search finds no match at
++ * all, so a second waiter would satisfy the loop and hide the defect.
++ */
++
++#define MQ_ASSERT_MAXMSG	1
++#define MQ_ASSERT_MSGSIZE	8
++#define MQ_ASSERT_MSG		"mqassert"
++
++#ifdef CONFIG_USEC_PER_TICK
++#define MQ_ASSERT_TICK_USEC	CONFIG_USEC_PER_TICK
++#else
++#define MQ_ASSERT_TICK_USEC	10000
++#endif
++
++/* Number of receive iterations to drive before giving up.  Each iteration
++ * crosses the unprotected window once, so this bounds the run rather than the
++ * number of races observed.
++ */
++
++#define MQ_ASSERT_ITERATIONS	2000000
++
++#define MQ_ASSERT_STACKSIZE	2048
++
++/**************************************************************************
++* Private Variables
++**************************************************************************/
++static volatile bool g_mqassert_run;
++static volatile unsigned int g_mqassert_timeouts;
++static volatile unsigned int g_mqassert_sends;
++
++/**************************************************************************
++* Private Functions
++**************************************************************************/
++
++/**
++* @fn                   :mqassert_deadline
++* @description          :Build an absolute deadline one system tick ahead, so
++*                        the watchdog armed by mq_timedsend() expires on the
++*                        very next timer interrupt.
++* @return               :void
++*/
++static void mqassert_deadline(struct timespec *abstime)
++{
++	clock_gettime(CLOCK_REALTIME, abstime);
++
++	abstime->tv_nsec += (long)MQ_ASSERT_TICK_USEC * 1000L;
++	while (abstime->tv_nsec >= 1000000000L) {
++		abstime->tv_nsec -= 1000000000L;
++		abstime->tv_sec++;
++	}
++}
++
++/**
++* @fn                   :mqassert_blocker
++* @description          :Keeps exactly one task parked in mq_waitsend() with a
++*                        one tick timeout armed.  Each expiry runs
++*                        mq_sndtimeout() -> mq_waitirq() from the timer ISR,
++*                        which is the event that empties g_waitingformqnotfull
++*                        behind mq_doreceive()'s back.
++* @return               :void *
++*/
++static void *mqassert_blocker(void *arg)
++{
++	mqd_t mqfd;
++	struct timespec abstime;
++	char buffer[MQ_ASSERT_MSGSIZE];
++	struct mq_attr attr;
++
++	attr.mq_maxmsg = MQ_ASSERT_MAXMSG;
++	attr.mq_msgsize = MQ_ASSERT_MSGSIZE;
++	attr.mq_flags = 0;
++
++	mqfd = mq_open(MQ_ASSERT_NAME, O_WRONLY | O_CREAT, 0666, &attr);
++	if (mqfd == (mqd_t)ERROR) {
++		printf("tc_mqueue_assert: blocker mq_open failed: %d\n", errno);
++		g_mqassert_run = false;
++		return NULL;
++	}
++
++	memcpy(buffer, MQ_ASSERT_MSG, MQ_ASSERT_MSGSIZE);
++
++	while (g_mqassert_run) {
++		mqassert_deadline(&abstime);
++
++		if (mq_timedsend(mqfd, buffer, MQ_ASSERT_MSGSIZE, 42, &abstime) < 0) {
++			/* ETIMEDOUT is the expected and wanted outcome: it means the
++			 * watchdog fired from interrupt context and cleared
++			 * nwaitnotfull while this thread sat in mq_waitsend().
++			 */
++
++			if (errno == ETIMEDOUT) {
++				g_mqassert_timeouts++;
++			}
++		} else {
++			g_mqassert_sends++;
++		}
++	}
++
++	mq_close(mqfd);
++	return NULL;
++}
++
++/**
++* @fn                   :mqassert_receiver
++* @description          :Drives mq_receive() in a tight loop.  Each successful
++*                        receive walks the unprotected
++*                        "if (msgq->nwaitnotfull > 0)" guard in mq_doreceive()
++*                        while the blocker thread is parked.
++* @return               :number of completed iterations
++*/
++static unsigned int mqassert_receiver(void)
++{
++	mqd_t mqfd;
++	char buffer[MQ_ASSERT_MSGSIZE];
++	struct mq_attr attr;
++	unsigned int iteration;
++
++	attr.mq_maxmsg = MQ_ASSERT_MAXMSG;
++	attr.mq_msgsize = MQ_ASSERT_MSGSIZE;
++	attr.mq_flags = 0;
++
++	mqfd = mq_open(MQ_ASSERT_NAME, O_RDONLY | O_CREAT, 0666, &attr);
++	if (mqfd == (mqd_t)ERROR) {
++		printf("tc_mqueue_assert: receiver mq_open failed: %d\n", errno);
++		return 0;
++	}
++
++	for (iteration = 0; iteration < MQ_ASSERT_ITERATIONS && g_mqassert_run; iteration++) {
++		/* The kernel is expected to die inside this call, in
++		 * mq_doreceive() -> ASSERT(btcb).
++		 */
++
++		if (mq_receive(mqfd, buffer, MQ_ASSERT_MSGSIZE, NULL) < 0) {
++			if (errno != EINTR) {
++				printf("tc_mqueue_assert: mq_receive failed: %d\n", errno);
++				break;
++			}
++		}
++	}
++
++	mq_close(mqfd);
++	return iteration;
++}
++
++/**
++* @fn                   :tc_mqueue_assert_mq_doreceive_btcb
++* @description          :Provoke ASSERT(btcb) in mq_doreceive().
++* @return               :void
++*/
++static void tc_mqueue_assert_mq_doreceive_btcb(void)
++{
++	pthread_t blocker;
++	pthread_attr_t attr;
++	struct sched_param param;
++	unsigned int iterations;
++	int ret;
++
++	printf("tc_mqueue_assert: targeting ASSERT(btcb) in mq_doreceive()"
++		" (os/kernel/mqueue/mq_rcvinternal.c)\n");
++#if defined(CONFIG_MQ_ASSERT_RACE_WINDOW_US) && CONFIG_MQ_ASSERT_RACE_WINDOW_US > 0
++	printf("tc_mqueue_assert: window instrumentation active (%d us),"
++		" the assert should be immediate\n", CONFIG_MQ_ASSERT_RACE_WINDOW_US);
++#else
++	printf("tc_mqueue_assert: stock kernel, racing the timer interrupt;"
++		" this can take a few seconds\n");
++#endif
++
++	g_mqassert_run = true;
++	g_mqassert_timeouts = 0;
++	g_mqassert_sends = 0;
++
++	ret = pthread_attr_init(&attr);
++	TC_ASSERT_EQ("pthread_attr_init", ret, OK);
++
++	ret = pthread_attr_setstacksize(&attr, MQ_ASSERT_STACKSIZE);
++	TC_ASSERT_EQ("pthread_attr_setstacksize", ret, OK);
++
++	/* The blocker must out-prioritise the receiver so that it is back inside
++	 * mq_waitsend() before the receiver reaches the guard again.  That keeps
++	 * nwaitnotfull pinned at one for every iteration.
++	 */
++
++	if (sched_getparam(0, &param) != OK) {
++		param.sched_priority = SCHED_PRIORITY_DEFAULT;
++	}
++	param.sched_priority++;
++
++	ret = pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
++	TC_ASSERT_EQ("pthread_attr_setinheritsched", ret, OK);
++
++	ret = pthread_attr_setschedparam(&attr, &param);
++	TC_ASSERT_EQ("pthread_attr_setschedparam", ret, OK);
++
++	ret = pthread_create(&blocker, &attr, mqassert_blocker, NULL);
++	TC_ASSERT_EQ("pthread_create", ret, OK);
++
++	/* Let the blocker reach mq_waitsend() before the first receive. */
++
++	usleep(2 * MQ_ASSERT_TICK_USEC);
++
++	iterations = mqassert_receiver();
++
++	g_mqassert_run = false;
++	pthread_join(blocker, NULL);
++	mq_unlink(MQ_ASSERT_NAME);
++
++	/* Reaching this point means the kernel survived, i.e. the race window was
++	 * never sampled by the timer interrupt.  The defect is still present; the
++	 * run was simply unlucky.  Report it rather than claiming a pass.
++	 */
++
++	printf("tc_mqueue_assert: NOT REPRODUCED after %u receives"
++		" (%u sends, %u timeouts)\n", iterations, g_mqassert_sends,
++		g_mqassert_timeouts);
++	printf("tc_mqueue_assert: rerun, or rebuild with"
++		" CONFIG_MQ_ASSERT_RACE_WINDOW_US >= %d for a deterministic hit\n",
++		2 * MQ_ASSERT_TICK_USEC);
++}
++
++/**************************************************************************
++* Public Functions
++**************************************************************************/
++
++int mqueue_assert_main(void)
++{
++	tc_mqueue_assert_mq_doreceive_btcb();
++
++	return 0;
++}
+diff --git a/os/kernel/Kconfig b/os/kernel/Kconfig
+index 04572371..cee04d53 100644
+--- a/os/kernel/Kconfig
++++ b/os/kernel/Kconfig
+@@ -1041,6 +1041,25 @@ config MQ_MAXMSGSIZE
+ 		Message structures are allocated with a fixed payload size given by this
+ 		setting (does not include other message structure overhead).
+ 
++config MQ_ASSERT_RACE_WINDOW_US
++	int "mq_doreceive() race window (microseconds, test only)"
++	default 0
++	---help---
++		TEST INSTRUMENTATION ONLY.  Leave this at 0 for any real build.
++
++		mq_doreceive() evaluates "if (msgq->nwaitnotfull > 0)" outside the
++		critical section that then searches g_waitingformqnotfull, and it runs
++		with interrupts and pre-emption enabled.  A mq_timedsend() timeout
++		expiring in the timer interrupt (mq_sndtimeout() -> mq_waitirq()) can
++		therefore unlink the only waiter inside that window, leaving the search
++		with nothing to find and tripping ASSERT(btcb).
++
++		Setting this to a non-zero value inserts an up_udelay() of that many
++		microseconds into the window so the race can be reproduced
++		deterministically, for example by CONFIG_TC_KERNEL_MQUEUE_ASSERT.  Use
++		at least two system tick periods.  A non-zero value slows every receive
++		that has a blocked sender and will crash the system, by design.
++
+ endmenu # POSIX Message Queue Options
+ 
+ menu "Stack size information"
+diff --git a/os/kernel/mqueue/mq_rcvinternal.c b/os/kernel/mqueue/mq_rcvinternal.c
+index e8e67f6c..f4bfeed6 100644
+--- a/os/kernel/mqueue/mq_rcvinternal.c
++++ b/os/kernel/mqueue/mq_rcvinternal.c
+@@ -297,6 +297,23 @@ ssize_t mq_doreceive(mqd_t mqdes, FAR struct mqueue_msg_s *mqmsg, FAR char *ubuf
+ 
+ 	msgq = mqdes->msgq;
+ 	if (msgq->nwaitnotfull > 0) {
++#if defined(CONFIG_MQ_ASSERT_RACE_WINDOW_US) && CONFIG_MQ_ASSERT_RACE_WINDOW_US > 0
++		/* TEST INSTRUMENTATION ONLY (CONFIG_MQ_ASSERT_RACE_WINDOW_US is 0 in
++		 * any real build, which compiles this away entirely).
++		 *
++		 * The guard above is evaluated outside the critical section below, and
++		 * mq_doreceive() is entered by mq_receive()/mq_timedreceive() only
++		 * after they have already called leave_critical_section() and
++		 * sched_unlock().  A mq_timedsend() timeout expiring in the timer
++		 * interrupt runs mq_sndtimeout() -> mq_waitirq(), which clears
++		 * nwaitnotfull and unlinks the waiter, so the search below can find
++		 * nothing and ASSERT(btcb) panics the kernel.
++		 *
++		 * Stretching the window makes that ordering reproducible on demand.
++		 */
++
++		up_udelay(CONFIG_MQ_ASSERT_RACE_WINDOW_US);
++#endif
+ 		/* Find the highest priority task that is waiting for
+ 		 * this queue to be not-full in g_waitingformqnotfull list.
+ 		 * This must be performed in a critical section because
