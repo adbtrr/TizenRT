@@ -1,60 +1,81 @@
-From 482e6ac4a04a0d5aca57e5a5f6e40417dc546f71 Mon Sep 17 00:00:00 2001
+From a3de7bb4fbf8c008d3606dd9dfe0731d5162ba83 Mon Sep 17 00:00:00 2001
 From: adbtrr_work8_fin_tc <adbtrr_work8_fin_tc@local>
-Date: Tue, 8 Sep 2026 06:17:04 +0000
+Date: Tue, 8 Sep 2026 06:41:13 +0000
 Subject: [PATCH 4/9] os/kernel/paging: Add ASSERT hitting test case for
- pg_miss
+ pg_worker
 
-pg_miss() blocks the faulting task and then signals the page fill worker
-thread to resolve the fault. If the faulting task were the worker itself
-nothing could ever service the fill, so pg_miss() guards against it with
-DEBUGASSERT(g_pgworker != ftcb->pid).
+pg_callback() hands the result of an asynchronous page fill to the page
+fill worker thread in g_fillresult, with g_pftcb naming the task the fill
+was for. A fill which completed with an error cannot be retried and the
+task blocked on it can never run again, so pg_worker() refuses to
+continue through ASSERT(g_fillresult == OK).
 
-Add a negative test case which points g_pgworker at the calling task and
-then calls pg_miss(), which is exactly the state the assertion defends
-against. g_pgworker is restored on the path taken when the assertion is
-compiled out.
+g_fillresult is file scope state of pg_worker.c, so add
+pg_worker_asserttest() next to it, built only when the test case is
+enabled. It presents a fill in progress which completed with -EIO and
+wakes the worker, which is the state the assertion refuses to continue
+from. The assertion is taken in the worker thread, so the kernel side
+helper waits a few work periods for the worker to run.
 
+ASSERT() carries no CONFIG_DEBUG dependency, so the test case works on a
+build with the debug features turned off. The DEBUGASSERT() in pg_miss()
+is not used here for that reason. The assertion only exists on the
+asynchronous fill path, so CONFIG_PAGING_BLOCKINGFILL must be disabled.
+
+ - os/kernel/paging/pg_worker.c : test only entry point for the fill
+   completion path.
+ - os/kernel/paging/paging.h : declaration of the entry point.
  - os/drivers/os_api_test/kernel/test_assert_paging.c : kernel side
    helper reached through the TESTIOC_ASSERT_PAGING ioctl.
  - apps/examples/testcase/le_tc/kernel/tc_assert_paging.c : user side
-   test case. A return from the ioctl is reported as a test case failure.
+   test case. A return from the ioctl is a test case failure.
 
 Controlled by CONFIG_TC_KERNEL_ASSERT_PAGING, default n, depends on
-CONFIG_PAGING and CONFIG_DEBUG. It crashes the board by design and must
-be enabled alone.
+CONFIG_PAGING and on the asynchronous fill path. It crashes the board by
+design and must be enabled alone.
 ---
- apps/examples/testcase/le_tc/kernel/Kconfig   |  14 +++
+ apps/examples/testcase/le_tc/kernel/Kconfig   |  22 ++++
  apps/examples/testcase/le_tc/kernel/Make.defs |   4 +
  .../testcase/le_tc/kernel/kernel_tc_main.c    |   4 +
- .../testcase/le_tc/kernel/tc_assert_paging.c  |  80 +++++++++++++
+ .../testcase/le_tc/kernel/tc_assert_paging.c  |  80 ++++++++++++
  .../testcase/le_tc/kernel/tc_internal.h       |   1 +
  os/drivers/os_api_test/kernel/Make.defs       |   4 +
- .../os_api_test/kernel/test_assert_paging.c   | 110 ++++++++++++++++++
+ .../os_api_test/kernel/test_assert_paging.c   | 120 ++++++++++++++++++
  os/drivers/os_api_test/os_api_test_drv.c      |   5 +
  os/drivers/os_api_test/os_api_test_proto.h    |   3 +
  os/include/tinyara/os_api_test_drv.h          |   3 +
- 10 files changed, 228 insertions(+)
+ os/kernel/paging/paging.h                     |   6 +
+ os/kernel/paging/pg_worker.c                  |  34 +++++
+ 12 files changed, 286 insertions(+)
  create mode 100644 apps/examples/testcase/le_tc/kernel/tc_assert_paging.c
  create mode 100644 os/drivers/os_api_test/kernel/test_assert_paging.c
 
 diff --git a/apps/examples/testcase/le_tc/kernel/Kconfig b/apps/examples/testcase/le_tc/kernel/Kconfig
-index 116b3761..1cc8fed0 100644
+index 87a3d6b0..8e0ea50c 100644
 --- a/apps/examples/testcase/le_tc/kernel/Kconfig
 +++ b/apps/examples/testcase/le_tc/kernel/Kconfig
-@@ -300,5 +300,19 @@ config TC_KERNEL_ASSERT_ENVIRON
+@@ -308,5 +308,27 @@ config TC_KERNEL_ASSERT_ENVIRON
  		This test case crashes the board on purpose, so enable it
  		alone and never together with the other ASSERT test cases.
  
 +config TC_KERNEL_ASSERT_PAGING
 +	bool "Paging module ASSERT test"
 +	default n
-+	depends on DEBUG
 +	depends on PAGING
++	depends on !PAGING_BLOCKINGFILL
 +	---help---
-+		Hit DEBUGASSERT(g_pgworker != ftcb->pid) in
-+		os/kernel/paging/pg_miss.c by reporting a page fault from the
-+		page fill worker thread, the one thread which is not allowed
-+		to take a page fault.
++		Hit ASSERT(g_fillresult == OK) in os/kernel/paging/pg_worker.c by
++		reporting a page fill completion which failed. A fill which
++		completed with an error cannot be retried and the task blocked on
++		it can never run again, so the page fill worker thread brings the
++		system down.
++
++		The assertion is an ASSERT(), so it is built in whether or not
++		CONFIG_DEBUG is enabled. It only exists on the asynchronous fill
++		path, which is why CONFIG_PAGING_BLOCKINGFILL must be disabled.
++
++		This test case crashes the board on purpose, so enable it
++		alone and never together with the other ASSERT test cases.
 +
 +		This test case crashes the board on purpose, so enable it
 +		alone and never together with the other ASSERT test cases.
@@ -93,7 +114,7 @@ index 3b07e5ea..2fad1103 100644
  
 diff --git a/apps/examples/testcase/le_tc/kernel/tc_assert_paging.c b/apps/examples/testcase/le_tc/kernel/tc_assert_paging.c
 new file mode 100644
-index 00000000..d2525c26
+index 00000000..e5eccef9
 --- /dev/null
 +++ b/apps/examples/testcase/le_tc/kernel/tc_assert_paging.c
 @@ -0,0 +1,80 @@
@@ -132,18 +153,18 @@ index 00000000..d2525c26
 +#include "tc_internal.h"
 +
 +/**
-+ * @fn                   :tc_assert_paging_pg_miss_from_pgworker
-+ * @brief                :Hit DEBUGASSERT(g_pgworker != ftcb->pid) of pg_miss()
-+ * @scenario             :Report a page fault from the page fill worker thread itself
-+ * Assertion under test  :os/kernel/paging/pg_miss.c
-+ *                       :DEBUGASSERT(g_pgworker != ftcb->pid);
++ * @fn                   :tc_assert_paging_pg_worker_failed_fill
++ * @brief                :Hit ASSERT(g_fillresult == OK) of pg_worker()
++ * @scenario             :Report a failed page fill completion to the page fill worker thread
++ * Assertion under test  :os/kernel/paging/pg_worker.c
++ *                       :ASSERT(g_fillresult == OK);
 + * Expected result       :The board asserts and this function never returns.
 + *                       :Returning from the ioctl means the ASSERT was not
 + *                       :hit and the test case fails.
 + * @return               :void
 + */
 +
-+static void tc_assert_paging_pg_miss_from_pgworker(void)
++static void tc_assert_paging_pg_worker_failed_fill(void)
 +{
 +	int fd;
 +	int ret_chk;
@@ -151,8 +172,8 @@ index 00000000..d2525c26
 +	fd = tc_get_drvfd();
 +	TC_ASSERT_GEQ("tc_get_drvfd", fd, 0);
 +
-+	printf("\n[TC_ASSERT_PAGING] Report a page fault from the page fill worker thread itself\n");
-+	printf("[TC_ASSERT_PAGING] Expecting an assertion at os/kernel/paging/pg_miss.c\n");
++	printf("\n[TC_ASSERT_PAGING] Report a failed page fill completion to the page fill worker thread\n");
++	printf("[TC_ASSERT_PAGING] Expecting an assertion at os/kernel/paging/pg_worker.c\n");
 +	printf("[TC_ASSERT_PAGING] The board is expected to crash dump and reboot now.\n");
 +
 +	/* The kernel side helper violates the precondition of the API under
@@ -163,17 +184,17 @@ index 00000000..d2525c26
 +
 +	printf("[TC_ASSERT_PAGING] ioctl returned %d, the ASSERT was not hit\n", ret_chk);
 +	if (ret_chk == -ENOSYS) {
-+		printf("[TC_ASSERT_PAGING] Enable CONFIG_DEBUG so that DEBUGASSERT() is built in\n");
++		printf("[TC_ASSERT_PAGING] CONFIG_PAGING without CONFIG_PAGING_BLOCKINGFILL is required\n");
 +	}
 +
-+	TC_ASSERT("pg_miss DEBUGASSERT(g_pgworker != ftcb->pid) was not hit", false);
++	TC_ASSERT("pg_worker ASSERT(g_fillresult == OK) was not hit", false);
 +
 +	TC_SUCCESS_RESULT();
 +}
 +
 +int paging_assert_main(void)
 +{
-+	tc_assert_paging_pg_miss_from_pgworker();
++	tc_assert_paging_pg_worker_failed_fill();
 +
 +	return 0;
 +}
@@ -206,10 +227,10 @@ index 64cc34e5..408d3976 100644
  # Include OS API test driver support
 diff --git a/os/drivers/os_api_test/kernel/test_assert_paging.c b/os/drivers/os_api_test/kernel/test_assert_paging.c
 new file mode 100644
-index 00000000..d1f75863
+index 00000000..7dbb8929
 --- /dev/null
 +++ b/os/drivers/os_api_test/kernel/test_assert_paging.c
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,120 @@
 +/****************************************************************************
 + *
 + * Copyright 2026 Samsung Electronics All Rights Reserved.
@@ -232,23 +253,26 @@ index 00000000..d1f75863
 + * Kernel side helper for the os/kernel/paging ASSERT test case.
 + *
 + * Target assertion:
-+ *   os/kernel/paging/pg_miss.c
-+ *     void pg_miss(void)
++ *   os/kernel/paging/pg_worker.c
++ *     int pg_worker(int argc, char *argv[])
 + *     {
-+ *             FAR struct tcb_s *ftcb = this_task();
 + *             ...
-+ *             DEBUGASSERT(g_pgworker != ftcb->pid);
++ *             if (g_fillresult != -EBUSY) {
++ *                     // Any value other than OK, brings the system down
++ *                     ASSERT(g_fillresult == OK);
 + *
-+ * The page fill worker thread is the only thread which can resolve a page
-+ * fault, so it must never take one itself. pg_miss() blocks the faulting
-+ * task and then signals the worker, which would deadlock the system if the
-+ * worker were the faulting task. The assertion catches that case.
++ * pg_callback() hands the result of an asynchronous page fill to the page
++ * fill worker thread in g_fillresult, with g_pftcb naming the task the fill
++ * was for. A fill which completed with an error cannot be retried and the
++ * blocked task can never run again, so the worker brings the system down.
 + *
-+ * The test case makes the calling task look like the page fill worker by
-+ * pointing g_pgworker at it, which is exactly the state the assertion
-+ * defends against.
++ * g_fillresult is file scope state of pg_worker.c, so the test is driven
++ * through pg_worker_asserttest() which is built into pg_worker.c only when
++ * this test case is enabled. The assertion is taken in the page fill worker
++ * thread, so the helper waits for the worker to run.
 + *
-+ * Requires CONFIG_PAGING and CONFIG_DEBUG.
++ * ASSERT() carries no CONFIG_DEBUG dependency, so this test case works on a
++ * build with the debug features turned off.
 + ****************************************************************************/
 +
 +/****************************************************************************
@@ -257,15 +281,25 @@ index 00000000..d1f75863
 +
 +#include <tinyara/config.h>
 +#include <sys/types.h>
++#include <unistd.h>
 +#include <debug.h>
 +#include <errno.h>
 +
 +#include <tinyara/os_api_test_drv.h>
 +#include <tinyara/sched.h>
-+#ifdef CONFIG_PAGING
++#if defined(CONFIG_PAGING) && !defined(CONFIG_PAGING_BLOCKINGFILL)
 +#include <tinyara/page.h>
 +#include "paging/paging.h"
 +#endif
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++/* How many page fill worker periods to wait for the worker to pick the
++ * failed fill completion up before giving up on the test case.
++ */
++
++#define ASSERT_PAGING_WAIT_PERIODS  4
 +
 +/****************************************************************************
 + * Public Functions
@@ -275,13 +309,12 @@ index 00000000..d1f75863
 + * Name: test_assert_paging
 + *
 + * Description:
-+ *   Make the caller the page fill worker thread and take a page fault so
-+ *   that DEBUGASSERT(g_pgworker != ftcb->pid) in os/kernel/paging/pg_miss.c
-+ *   is hit.
++ *   Report a failed page fill completion to the page fill worker thread so
++ *   that ASSERT(g_fillresult == OK) in os/kernel/paging/pg_worker.c is hit.
 + *
 + * Returned Value:
-+ *   This function does not return when the assertion is enabled.
-+ *   -ENOSYS is returned when the assertion is compiled out.
++ *   This function does not return once the page fill worker runs.
++ *   -ENOSYS is returned when the assertion is not built in.
 + *
 + ****************************************************************************/
 +
@@ -290,32 +323,30 @@ index 00000000..d1f75863
 +	(void)cmd;
 +	(void)arg;
 +
-+#if defined(CONFIG_PAGING) && defined(CONFIG_DEBUG)
-+	pid_t saved_pgworker;
++#if defined(CONFIG_PAGING) && !defined(CONFIG_PAGING_BLOCKINGFILL)
++	int i;
 +
-+	saved_pgworker = g_pgworker;
++	lldbg("Reporting a failed page fill completion to the worker thread\n");
 +
-+	lldbg("Reporting a page fault from the page fill worker thread\n");
-+
-+	/* Claim the identity of the page fill worker thread. pg_miss() is then
-+	 * called by the very thread which is supposed to service the fill.
++	/* ASSERT(g_fillresult == OK) in pg_worker() is hit once the page fill
++	 * worker thread runs the completion path.
 +	 */
 +
-+	g_pgworker = this_task()->pid;
++	pg_worker_asserttest();
 +
-+	/* DEBUGASSERT(g_pgworker != ftcb->pid) in pg_miss() is hit here. */
-+
-+	pg_miss();
-+
-+	/* Not reached while the assertion is built in. Restore the worker so
-+	 * that paging keeps working if it ever is.
++	/* The assertion is taken in the worker thread, so give the worker a few
++	 * of its work periods to run before reporting that nothing happened.
 +	 */
 +
-+	g_pgworker = saved_pgworker;
++	for (i = 0; i < ASSERT_PAGING_WAIT_PERIODS; i++) {
++		usleep(CONFIG_PAGING_WORKPERIOD);
++	}
++
++	lldbg("The page fill worker did not take the assertion\n");
 +
 +	return OK;
 +#else
-+	lldbg("CONFIG_PAGING and CONFIG_DEBUG are required\n");
++	lldbg("CONFIG_PAGING without CONFIG_PAGING_BLOCKINGFILL is required\n");
 +
 +	return -ENOSYS;
 +#endif
@@ -362,3 +393,65 @@ index 000f025a..f55d0e67 100644
  
  #define OS_API_TEST_DRVPATH	"/dev/os_api_test"
  
+diff --git a/os/kernel/paging/paging.h b/os/kernel/paging/paging.h
+index 9c4618b8..37a5c02a 100644
+--- a/os/kernel/paging/paging.h
++++ b/os/kernel/paging/paging.h
+@@ -117,6 +117,12 @@ extern pid_t g_pgworker;
+ 
+ extern FAR struct tcb_s *g_pftcb;
+ 
++#if defined(CONFIG_TC_KERNEL_ASSERT_PAGING) && !defined(CONFIG_PAGING_BLOCKINGFILL)
++/* Test only entry point of the os/kernel/paging ASSERT test case. */
++
++void pg_worker_asserttest(void);
++#endif
++
+ /****************************************************************************
+  * Public Function Prototypes
+  ****************************************************************************/
+diff --git a/os/kernel/paging/pg_worker.c b/os/kernel/paging/pg_worker.c
+index b694594f..dec439cd 100644
+--- a/os/kernel/paging/pg_worker.c
++++ b/os/kernel/paging/pg_worker.c
+@@ -503,6 +503,40 @@ static inline void pg_fillcomplete(void)
+ /****************************************************************************
+  * Public Functions
+  ****************************************************************************/
++
++#if defined(CONFIG_TC_KERNEL_ASSERT_PAGING) && !defined(CONFIG_PAGING_BLOCKINGFILL)
++/****************************************************************************
++ * Name: pg_worker_asserttest
++ *
++ * Description:
++ *   Test only entry point which reports a page fill completion that failed,
++ *   so that
++ *     ASSERT(g_fillresult == OK)
++ *   in pg_worker() is executed. A fill which completed with an error cannot
++ *   be retried and the task blocked on it can never run again, so this is
++ *   the state the assertion refuses to continue from.
++ *
++ *   The assertion is taken in the page fill worker thread, not in the
++ *   caller of this function.
++ *
++ ****************************************************************************/
++
++void pg_worker_asserttest(void)
++{
++	/* Present a fill which is in progress for the calling task ... */
++
++	g_pftcb = this_task();
++
++	/* ... and which completed with an error rather than with OK. */
++
++	g_fillresult = -EIO;
++
++	/* Wake the page fill worker so that it runs the completion path. */
++
++	kill(g_pgworker, SIGWORK);
++}
++#endif
++
+ /****************************************************************************
+  * Name: pg_worker
+  *

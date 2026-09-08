@@ -1,57 +1,69 @@
-From 44589c285421cbb9f54c8def0ddefa5ce88db329 Mon Sep 17 00:00:00 2001
+From 956a21a985434a2d3619c8a4c9401301ca536924 Mon Sep 17 00:00:00 2001
 From: adbtrr_work8_fin_tc <adbtrr_work8_fin_tc@local>
-Date: Tue, 8 Sep 2026 06:15:47 +0000
-Subject: [PATCH 2/9] os/kernel/irq: Add ASSERT hitting test case for the irq
- module
+Date: Tue, 8 Sep 2026 06:41:12 +0000
+Subject: [PATCH 2/9] os/kernel/irq: Add ASSERT hitting test case for
+ irq_unexpected_isr
 
-g_irq_spin_count[] in os/kernel/irq/irq_spinlock.c counts how deep
-spin_lock_irqsave(NULL) is nested on a CPU. spin_unlock_irqrestore()
-guards the decrement with DEBUGASSERT(0 < g_irq_spin_count[me]), so an
-unbalanced release drives the counter below zero and hits the assertion.
+irq_initialize() puts irq_unexpected_isr() in every vector slot, so it
+runs when an interrupt fires for a vector nobody attached a handler to.
+Nothing can service that interrupt and it would re-enter forever, so the
+handler masks interrupts and calls PANIC() to bring the system down.
 
-os/kernel/irq/irq_spinlock.c and os/kernel/irq/irq_csection.c hold every
-DEBUGASSERT of the module but are only built for CONFIG_SMP. On a single
-core build the test case falls back to irq_unexpected_isr(), which takes
-the unconditional PANIC() when an unregistered interrupt is dispatched.
+Add a negative test case which dispatches an interrupt with no handler
+attached, so that the unconditional assertion of the module is executed.
+
+PANIC() is built from ASSERT()/up_assert() and carries no CONFIG_DEBUG
+dependency, so the test case works on a build with the debug features
+turned off. The DEBUGASSERT() based checks of the module live in
+irq_spinlock.c and irq_csection.c, which are built only for CONFIG_SMP
+and fire only when CONFIG_DEBUG is enabled, so they are not used here.
 
  - os/drivers/os_api_test/kernel/test_assert_irq.c : kernel side helper
    reached through the TESTIOC_ASSERT_IRQ ioctl.
  - apps/examples/testcase/le_tc/kernel/tc_assert_irq.c : user side test
    case. A return from the ioctl is reported as a test case failure.
 
-Controlled by CONFIG_TC_KERNEL_ASSERT_IRQ, default n, depends on
-CONFIG_DEBUG. It crashes the board by design and must be enabled alone.
+Controlled by CONFIG_TC_KERNEL_ASSERT_IRQ, default n, with no CONFIG_DEBUG
+dependency. It crashes the board by design and must be enabled alone.
 ---
- apps/examples/testcase/le_tc/kernel/Kconfig   |  17 +++
- apps/examples/testcase/le_tc/kernel/Make.defs |   4 +
- .../testcase/le_tc/kernel/kernel_tc_main.c    |   4 +
- .../testcase/le_tc/kernel/tc_assert_irq.c     |  80 +++++++++++
- .../testcase/le_tc/kernel/tc_internal.h       |   1 +
- os/drivers/os_api_test/kernel/Make.defs       |   4 +
- .../os_api_test/kernel/test_assert_irq.c      | 125 ++++++++++++++++++
- os/drivers/os_api_test/os_api_test_drv.c      |   5 +
- os/drivers/os_api_test/os_api_test_proto.h    |   3 +
- os/include/tinyara/os_api_test_drv.h          |   3 +
- 10 files changed, 246 insertions(+)
+ apps/examples/testcase/le_tc/kernel/Kconfig   | 25 +++++
+ apps/examples/testcase/le_tc/kernel/Make.defs |  4 +
+ .../testcase/le_tc/kernel/kernel_tc_main.c    |  4 +
+ .../testcase/le_tc/kernel/tc_assert_irq.c     | 77 ++++++++++++++++
+ .../testcase/le_tc/kernel/tc_internal.h       |  1 +
+ os/drivers/os_api_test/kernel/Make.defs       |  4 +
+ .../os_api_test/kernel/test_assert_irq.c      | 91 +++++++++++++++++++
+ os/drivers/os_api_test/os_api_test_drv.c      |  5 +
+ os/drivers/os_api_test/os_api_test_proto.h    |  3 +
+ os/include/tinyara/os_api_test_drv.h          |  3 +
+ 10 files changed, 217 insertions(+)
  create mode 100644 apps/examples/testcase/le_tc/kernel/tc_assert_irq.c
  create mode 100644 os/drivers/os_api_test/kernel/test_assert_irq.c
 
 diff --git a/apps/examples/testcase/le_tc/kernel/Kconfig b/apps/examples/testcase/le_tc/kernel/Kconfig
-index 67df4d4f..a26cfd3f 100644
+index 67df4d4f..0061191a 100644
 --- a/apps/examples/testcase/le_tc/kernel/Kconfig
 +++ b/apps/examples/testcase/le_tc/kernel/Kconfig
-@@ -271,5 +271,22 @@ config TC_KERNEL_ASSERT_GROUP
+@@ -271,5 +271,30 @@ config TC_KERNEL_ASSERT_GROUP
  		This test case crashes the board on purpose, so enable it
  		alone and never together with the other ASSERT test cases.
  
 +config TC_KERNEL_ASSERT_IRQ
 +	bool "IRQ module ASSERT test"
 +	default n
-+	depends on DEBUG
 +	---help---
-+		On an SMP build, hit DEBUGASSERT(0 < g_irq_spin_count[me]) in
-+		os/kernel/irq/irq_spinlock.c by releasing the global IRQ
-+		spinlock without holding it.
++		Hit PANIC() in os/kernel/irq/irq_unexpectedisr.c by dispatching an
++		interrupt which has no handler attached. irq_initialize() puts
++		irq_unexpected_isr() in every vector slot, and nothing can service
++		such an interrupt, so the handler brings the system down.
++
++		PANIC() is built from ASSERT(), so it is built in whether or not
++		CONFIG_DEBUG is enabled. The DEBUGASSERT() based checks of the
++		module live in irq_spinlock.c and irq_csection.c, which are only
++		built for CONFIG_SMP, so they are not used here.
++
++		This test case crashes the board on purpose, so enable it
++		alone and never together with the other ASSERT test cases.
 +
 +		On a single core build, os/kernel/irq/irq_spinlock.c and
 +		os/kernel/irq/irq_csection.c are not built, so PANIC() in
@@ -95,10 +107,10 @@ index 53b67691..1dcbc2a4 100644
  
 diff --git a/apps/examples/testcase/le_tc/kernel/tc_assert_irq.c b/apps/examples/testcase/le_tc/kernel/tc_assert_irq.c
 new file mode 100644
-index 00000000..3cd74103
+index 00000000..e5e51b8f
 --- /dev/null
 +++ b/apps/examples/testcase/le_tc/kernel/tc_assert_irq.c
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,77 @@
 +/****************************************************************************
 + *
 + * Copyright 2026 Samsung Electronics All Rights Reserved.
@@ -134,18 +146,18 @@ index 00000000..3cd74103
 +#include "tc_internal.h"
 +
 +/**
-+ * @fn                   :tc_assert_irq_unbalanced_spin_unlock
-+ * @brief                :Hit the assertion of the irq module
-+ * @scenario             :Release the global IRQ spinlock without holding it (SMP), or dispatch an unregistered IRQ (non SMP)
-+ * Assertion under test  :os/kernel/irq/irq_spinlock.c or os/kernel/irq/irq_unexpectedisr.c
-+ *                       :DEBUGASSERT(0 < g_irq_spin_count[me]); / PANIC();
++ * @fn                   :tc_assert_irq_unexpected_isr
++ * @brief                :Hit PANIC() of irq_unexpected_isr()
++ * @scenario             :Dispatch an interrupt which has no handler attached
++ * Assertion under test  :os/kernel/irq/irq_unexpectedisr.c
++ *                       :PANIC();
 + * Expected result       :The board asserts and this function never returns.
 + *                       :Returning from the ioctl means the ASSERT was not
 + *                       :hit and the test case fails.
 + * @return               :void
 + */
 +
-+static void tc_assert_irq_unbalanced_spin_unlock(void)
++static void tc_assert_irq_unexpected_isr(void)
 +{
 +	int fd;
 +	int ret_chk;
@@ -153,8 +165,8 @@ index 00000000..3cd74103
 +	fd = tc_get_drvfd();
 +	TC_ASSERT_GEQ("tc_get_drvfd", fd, 0);
 +
-+	printf("\n[TC_ASSERT_IRQ] Release the global IRQ spinlock without holding it (SMP), or dispatch an unregistered IRQ (non SMP)\n");
-+	printf("[TC_ASSERT_IRQ] Expecting an assertion at os/kernel/irq/irq_spinlock.c or os/kernel/irq/irq_unexpectedisr.c\n");
++	printf("\n[TC_ASSERT_IRQ] Dispatch an interrupt which has no handler attached\n");
++	printf("[TC_ASSERT_IRQ] Expecting an assertion at os/kernel/irq/irq_unexpectedisr.c\n");
 +	printf("[TC_ASSERT_IRQ] The board is expected to crash dump and reboot now.\n");
 +
 +	/* The kernel side helper violates the precondition of the API under
@@ -164,18 +176,15 @@ index 00000000..3cd74103
 +	ret_chk = ioctl(fd, TESTIOC_ASSERT_IRQ, 0);
 +
 +	printf("[TC_ASSERT_IRQ] ioctl returned %d, the ASSERT was not hit\n", ret_chk);
-+	if (ret_chk == -ENOSYS) {
-+		printf("[TC_ASSERT_IRQ] Enable CONFIG_DEBUG so that DEBUGASSERT() is built in\n");
-+	}
 +
-+	TC_ASSERT("irq module assertion was not hit", false);
++	TC_ASSERT("irq_unexpected_isr PANIC() was not hit", false);
 +
 +	TC_SUCCESS_RESULT();
 +}
 +
 +int irq_assert_main(void)
 +{
-+	tc_assert_irq_unbalanced_spin_unlock();
++	tc_assert_irq_unexpected_isr();
 +
 +	return 0;
 +}
@@ -208,10 +217,10 @@ index 197ce7c8..488d41dd 100644
  # Include OS API test driver support
 diff --git a/os/drivers/os_api_test/kernel/test_assert_irq.c b/os/drivers/os_api_test/kernel/test_assert_irq.c
 new file mode 100644
-index 00000000..c20a2e94
+index 00000000..72dc6210
 --- /dev/null
 +++ b/os/drivers/os_api_test/kernel/test_assert_irq.c
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,91 @@
 +/****************************************************************************
 + *
 + * Copyright 2026 Samsung Electronics All Rights Reserved.
@@ -233,29 +242,24 @@ index 00000000..c20a2e94
 +/****************************************************************************
 + * Kernel side helper for the os/kernel/irq ASSERT test case.
 + *
-+ * Target assertion, SMP builds:
-+ *   os/kernel/irq/irq_spinlock.c
-+ *     void spin_unlock_irqrestore(spinlock_t *lock, irqstate_t flags)
-+ *     {
-+ *             int me = this_cpu();
-+ *
-+ *             if (NULL == lock) {
-+ *                     DEBUGASSERT(0 < g_irq_spin_count[me]);
-+ *
-+ *   g_irq_spin_count[] tracks the nesting depth of spin_lock_irqsave(NULL).
-+ *   Releasing the global IRQ spinlock without holding it drives the counter
-+ *   below zero, which the assertion catches.
-+ *
-+ * Target assertion, non SMP builds:
++ * Target assertion:
 + *   os/kernel/irq/irq_unexpectedisr.c
 + *     int irq_unexpected_isr(int irq, FAR void *context, FAR void *arg)
 + *     {
-+ *             ...
++ *             (void)irqsave();
++ *             lldbg("irq: %d\n", irq);
 + *             PANIC();
 + *
-+ *   irq_spinlock.c and irq_csection.c are only built for CONFIG_SMP, so on a
-+ *   single core build the unconditional assertion taken when an unregistered
-+ *   IRQ is dispatched is the reachable assertion of the module.
++ * irq_unexpected_isr() is what irq_initialize() puts in every vector slot,
++ * so it runs when an interrupt fires for a vector nobody attached a handler
++ * to. Nothing can service that interrupt and it would re-enter forever, so
++ * the handler masks interrupts and brings the system down unconditionally.
++ *
++ * PANIC() is built from ASSERT()/up_assert() and carries no CONFIG_DEBUG
++ * dependency, so this test case works on a build with the debug features
++ * turned off. The DEBUGASSERT() based checks of the module live in
++ * irq_spinlock.c and irq_csection.c, which are only built for CONFIG_SMP
++ * and only fire when CONFIG_DEBUG is enabled, so they are not used here.
 + ****************************************************************************/
 +
 +/****************************************************************************
@@ -269,17 +273,14 @@ index 00000000..c20a2e94
 +
 +#include <tinyara/irq.h>
 +#include <tinyara/os_api_test_drv.h>
-+#ifdef CONFIG_SMP
-+#include <tinyara/spinlock.h>
-+#endif
 +
 +#include "irq/irq.h"
 +
 +/****************************************************************************
 + * Pre-processor Definitions
 + ****************************************************************************/
-+/* An IRQ number which is never attached, used only to reach the unexpected
-+ * interrupt handler directly.
++/* The last IRQ number of the vector table. The test case never attaches a
++ * handler to it, so the unexpected interrupt handler is still installed.
 + */
 +
 +#define ASSERT_IRQ_UNEXPECTED_IRQ  (NR_IRQS - 1)
@@ -292,13 +293,11 @@ index 00000000..c20a2e94
 + * Name: test_assert_irq
 + *
 + * Description:
-+ *   Violate the spin_unlock_irqrestore() precondition on SMP builds, or
-+ *   dispatch an unregistered interrupt on single core builds, so that the
-+ *   assertion of os/kernel/irq is hit.
++ *   Dispatch an interrupt which has no handler attached so that PANIC() in
++ *   os/kernel/irq/irq_unexpectedisr.c is hit.
 + *
 + * Returned Value:
-+ *   This function does not return when the assertion is enabled.
-+ *   -ENOSYS is returned when the assertion is compiled out.
++ *   This function does not return.
 + *
 + ****************************************************************************/
 +
@@ -307,35 +306,11 @@ index 00000000..c20a2e94
 +	(void)cmd;
 +	(void)arg;
 +
-+#ifdef CONFIG_SMP
-+#ifdef CONFIG_DEBUG
-+	irqstate_t flags;
-+
-+	lldbg("Releasing the global IRQ spinlock without holding it\n");
-+
-+	/* The caller does not hold the global IRQ spinlock, so the nesting
-+	 * counter of this CPU is zero and DEBUGASSERT(0 < g_irq_spin_count[me])
-+	 * in spin_unlock_irqrestore() is hit here.
-+	 */
-+
-+	flags = irqsave();
-+	spin_unlock_irqrestore(NULL, flags);
-+
-+	irqrestore(flags);
-+
-+	return OK;
-+#else
-+	lldbg("CONFIG_DEBUG is required for DEBUGASSERT()\n");
-+
-+	return -ENOSYS;
-+#endif
-+#else
-+	lldbg("Dispatching an unregistered IRQ %d\n", ASSERT_IRQ_UNEXPECTED_IRQ);
++	lldbg("Dispatching the unregistered IRQ %d\n", ASSERT_IRQ_UNEXPECTED_IRQ);
 +
 +	/* PANIC() in irq_unexpected_isr() is hit here. */
 +
 +	return irq_unexpected_isr(ASSERT_IRQ_UNEXPECTED_IRQ, NULL, NULL);
-+#endif
 +}
 diff --git a/os/drivers/os_api_test/os_api_test_drv.c b/os/drivers/os_api_test/os_api_test_drv.c
 index 3f42461e..5ee2a639 100644

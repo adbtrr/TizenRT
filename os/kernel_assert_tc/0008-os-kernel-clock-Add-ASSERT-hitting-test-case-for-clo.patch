@@ -1,4 +1,4 @@
-From 2c5853529e24ad07cfbacfebdf20ffcdec14efd4 Mon Sep 17 00:00:00 2001
+From 7fc1375ac1bcfb8d48992bfe29daeaf4eb7e7819 Mon Sep 17 00:00:00 2001
 From: adbtrr_work8_fin_tc <adbtrr_work8_fin_tc@local>
 Date: Tue, 8 Sep 2026 06:21:16 +0000
 Subject: [PATCH 8/9] os/kernel/clock: Add ASSERT hitting test case for
@@ -40,10 +40,10 @@ enabled alone.
  create mode 100644 os/drivers/os_api_test/kernel/test_assert_clock.c
 
 diff --git a/apps/examples/testcase/le_tc/kernel/Kconfig b/apps/examples/testcase/le_tc/kernel/Kconfig
-index df80ee1c..11ffff4e 100644
+index 3be2d4e6..acd842d2 100644
 --- a/apps/examples/testcase/le_tc/kernel/Kconfig
 +++ b/apps/examples/testcase/le_tc/kernel/Kconfig
-@@ -368,5 +368,22 @@ config TC_KERNEL_ASSERT_DEBUG
+@@ -384,5 +384,22 @@ config TC_KERNEL_ASSERT_DEBUG
  		This test case crashes the board on purpose, so enable it
  		alone and never together with the other ASSERT test cases.
  

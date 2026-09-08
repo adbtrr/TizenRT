@@ -8,29 +8,56 @@ assertion and the board takes the crash dump path.
 | Patch | Module | Assertion hit | Kconfig |
 | ----- | ------ | ------------- | ------- |
 | 0001 | `os/kernel/group` | `group_foreachchild.c` `DEBUGASSERT(group)` | `TC_KERNEL_ASSERT_GROUP` |
-| 0002 | `os/kernel/irq` | `irq_spinlock.c` `DEBUGASSERT(0 < g_irq_spin_count[me])`, or `irq_unexpectedisr.c` `PANIC()` on a single core build | `TC_KERNEL_ASSERT_IRQ` |
+| 0002 | `os/kernel/irq` | `irq_unexpectedisr.c` `PANIC()` | `TC_KERNEL_ASSERT_IRQ` |
 | 0003 | `os/kernel/environ` | `env_release.c` `DEBUGASSERT(group)` | `TC_KERNEL_ASSERT_ENVIRON` |
-| 0004 | `os/kernel/paging` | `pg_miss.c` `DEBUGASSERT(g_pgworker != ftcb->pid)` | `TC_KERNEL_ASSERT_PAGING` |
+| 0004 | `os/kernel/paging` | `pg_worker.c` `ASSERT(g_fillresult == OK)` | `TC_KERNEL_ASSERT_PAGING` |
 | 0005 | `os/kernel/binary_manager` | `binary_manager_recovery.c` `ASSERT(sem != NULL && sem->semcount < 0)` | `TC_KERNEL_ASSERT_BINARY_MANAGER` |
 | 0006 | `os/kernel/init` | `os_bringup.c` `ASSERT(pid > 0)` | `TC_KERNEL_ASSERT_INIT` |
 | 0007 | `os/kernel/debug` | `mem_leak_checker.c` `ASSERT(ctcb != NULL)` | `TC_KERNEL_ASSERT_DEBUG` |
 | 0008 | `os/kernel/clock` | `clock_systimespec.c` `DEBUGASSERT(ts->tv_sec >= g_basetime.tv_sec)` | `TC_KERNEL_ASSERT_CLOCK` |
 | 0009 | `os/kernel/log_dump` | `log_dump.c` `ASSERT(log_dump_tail)` | `TC_KERNEL_ASSERT_LOG_DUMP` |
 
+## ASSERT/PANIC versus DEBUGASSERT
+
+`DEBUGASSERT()` expands to nothing when `CONFIG_DEBUG` is disabled
+(`os/include/assert.h`), while `ASSERT()` and `PANIC()` are always built in.
+Six of the nine test cases therefore fire on a build with the debug features
+turned off:
+
+| Always built in | Assertion used |
+| --------------- | -------------- |
+| 0002 irq | `PANIC()` |
+| 0004 paging | `ASSERT()` |
+| 0005 binary_manager | `ASSERT()` |
+| 0006 init | `ASSERT()` |
+| 0007 debug | `ASSERT()` |
+| 0009 log_dump | `ASSERT()` |
+
+The remaining three, 0001 group, 0003 environ and 0008 clock, still need
+`CONFIG_DEBUG`. That is not a choice made by the test cases: `os/kernel/group`,
+`os/kernel/environ` and `os/kernel/clock` contain no `ASSERT()`, `PANIC()` or
+`VERIFY()` at all, every check in them is a `DEBUGASSERT()`, so there is no
+always built in assertion in those modules to hit. Making those test cases
+work without `CONFIG_DEBUG` would mean promoting the module's `DEBUGASSERT()`
+to `ASSERT()`, which changes what the kernel does in a release build and is
+deliberately left out of these patches.
+
 ## How the test cases are built
 
-Seven of the nine assertions are reached from a running system. The trigger
+Six of the nine assertions are reached from a running system. The trigger
 lives on the kernel side in `os/drivers/os_api_test/kernel/test_assert_*.c`
 and is reached through a new ioctl of the existing `/dev/os_api_test` driver,
 the same path the kernel test cases already use for kernel only APIs. The
 user side test case is a normal `le_tc/kernel` test case which issues that
 ioctl and reports a failure if the ioctl ever returns.
 
-Two assertions cannot be reached that way and are handled differently.
+Three assertions cannot be reached that way and are handled differently.
 
-* `os/kernel/binary_manager` and `os/kernel/log_dump` guard state which only
-  a `static` function touches. Each patch adds a test only entry point next
-  to that function, built in only when the test case is enabled.
+* `os/kernel/paging`, `os/kernel/binary_manager` and `os/kernel/log_dump`
+  guard state which only a `static` function touches. Each patch adds a test
+  only entry point next to that function, built in only when the test case is
+  enabled. The paging assertion is taken in the page fill worker thread, so
+  its helper wakes the worker and then waits a few work periods for it.
 * Every function of `os/kernel/init` is `static inline` and runs only from
   `os_start()`, so its assertion can only be hit while the board is coming
   up. The patch injects the failure at the call site: the application main
@@ -50,11 +77,11 @@ Enable **exactly one** test case, because each of them ends the boot:
         -> Kernel TestCase Example
           -> [*] Group module ASSERT test
 
-`CONFIG_DEBUG` is required for the `DEBUGASSERT()` based test cases (0001,
-0002, 0003, 0004, 0008); the others use `ASSERT()`, which is always built in.
-The remaining dependencies are declared in the Kconfig entries:
-`PAGING` for 0004, `BINMGR_RECOVERY` for 0005, a flat build for 0006,
-`MEM_LEAK_CHECKER` for 0007, `RTC_HIRES` for 0008 and `LOG_DUMP` for 0009.
+`CONFIG_DEBUG` is required only for the `DEBUGASSERT()` based test cases
+0001, 0003 and 0008. The remaining dependencies are declared in the Kconfig
+entries: `PAGING` and `!PAGING_BLOCKINGFILL` for 0004, `BINMGR_RECOVERY` for
+0005, a flat build for 0006, `MEM_LEAK_CHECKER` for 0007, `RTC_HIRES` for
+0008 and `LOG_DUMP` for 0009.
 
 Build, flash and run `kernel_tc`. The expected result is an assertion with
 the file and line of the target assertion in the crash dump. The user side
@@ -105,3 +132,13 @@ addressed by these patches.
    turns a recoverable condition into a board reset. The failure should be
    reported and retried instead. The `leave_critical_section(flags)` after
    the enclosing `while (1)` in the same function is unreachable.
+
+5. `os/kernel/paging/pg_worker.c`
+
+        #ifdef CONFIG_PAGING_TIMEOUT_TICKS
+        status clock_t g_starttime;
+        #endif
+
+   `status` is not a keyword or a macro, so the file does not compile when
+   `CONFIG_PAGING_TIMEOUT_TICKS` is enabled. It reads as a typo for `static`.
+   The test case in 0004 does not touch `g_starttime` for that reason.

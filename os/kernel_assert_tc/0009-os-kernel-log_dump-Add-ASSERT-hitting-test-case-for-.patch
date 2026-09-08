@@ -1,4 +1,4 @@
-From 0ca51d550c598a0320c9551eda7d39376dae596a Mon Sep 17 00:00:00 2001
+From b2f98a6a81d12e3355531535c493f344ebd3ba37 Mon Sep 17 00:00:00 2001
 From: adbtrr_work8_fin_tc <adbtrr_work8_fin_tc@local>
 Date: Tue, 8 Sep 2026 06:22:29 +0000
 Subject: [PATCH 9/9] os/kernel/log_dump: Add ASSERT hitting test case for
@@ -45,10 +45,10 @@ required. It crashes the board by design and must be enabled alone.
  create mode 100644 os/drivers/os_api_test/kernel/test_assert_log_dump.c
 
 diff --git a/apps/examples/testcase/le_tc/kernel/Kconfig b/apps/examples/testcase/le_tc/kernel/Kconfig
-index 11ffff4e..64b0742f 100644
+index acd842d2..90518eed 100644
 --- a/apps/examples/testcase/le_tc/kernel/Kconfig
 +++ b/apps/examples/testcase/le_tc/kernel/Kconfig
-@@ -385,5 +385,22 @@ config TC_KERNEL_ASSERT_CLOCK
+@@ -401,5 +401,22 @@ config TC_KERNEL_ASSERT_CLOCK
  		This test case crashes the board on purpose, so enable it
  		alone and never together with the other ASSERT test cases.
  

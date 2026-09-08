@@ -1,4 +1,4 @@
-From 1fa30ba3e560566f66c441390685634ee57d7c75 Mon Sep 17 00:00:00 2001
+From 227e01c4b7254a7b628c76dc89c18380bf0a3ceb Mon Sep 17 00:00:00 2001
 From: adbtrr_work8_fin_tc <adbtrr_work8_fin_tc@local>
 Date: Tue, 8 Sep 2026 06:16:23 +0000
 Subject: [PATCH 3/9] os/kernel/environ: Add ASSERT hitting test case for
@@ -36,10 +36,10 @@ by design and must be enabled alone.
  create mode 100644 os/drivers/os_api_test/kernel/test_assert_environ.c
 
 diff --git a/apps/examples/testcase/le_tc/kernel/Kconfig b/apps/examples/testcase/le_tc/kernel/Kconfig
-index a26cfd3f..116b3761 100644
+index 0061191a..87a3d6b0 100644
 --- a/apps/examples/testcase/le_tc/kernel/Kconfig
 +++ b/apps/examples/testcase/le_tc/kernel/Kconfig
-@@ -288,5 +288,17 @@ config TC_KERNEL_ASSERT_IRQ
+@@ -296,5 +296,17 @@ config TC_KERNEL_ASSERT_IRQ
  		This test case crashes the board on purpose, so enable it
  		alone and never together with the other ASSERT test cases.
  

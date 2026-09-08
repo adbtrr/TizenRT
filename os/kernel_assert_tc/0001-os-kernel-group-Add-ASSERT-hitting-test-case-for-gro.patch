@@ -1,4 +1,4 @@
-From 2a90365d6dcdcc0fb4722a390c2aba912266cd69 Mon Sep 17 00:00:00 2001
+From 8987a8db790fbd9d0f2557a875225779c677c129 Mon Sep 17 00:00:00 2001
 From: adbtrr_work8_fin_tc <adbtrr_work8_fin_tc@local>
 Date: Tue, 8 Sep 2026 06:14:39 +0000
 Subject: [PATCH 1/9] os/kernel/group: Add ASSERT hitting test case for

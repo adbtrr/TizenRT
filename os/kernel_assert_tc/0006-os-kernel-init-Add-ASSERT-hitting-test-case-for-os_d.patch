@@ -1,4 +1,4 @@
-From e250e4cb12400a81cae28a3c273166e62266d12f Mon Sep 17 00:00:00 2001
+From 47face3ba3d714a3a6de17401c3b56ef20de7594 Mon Sep 17 00:00:00 2001
 From: adbtrr_work8_fin_tc <adbtrr_work8_fin_tc@local>
 Date: Tue, 8 Sep 2026 06:19:22 +0000
 Subject: [PATCH 6/9] os/kernel/init: Add ASSERT hitting test case for
@@ -36,10 +36,10 @@ design and must be enabled alone.
  create mode 100644 apps/examples/testcase/le_tc/kernel/tc_assert_init.c
 
 diff --git a/apps/examples/testcase/le_tc/kernel/Kconfig b/apps/examples/testcase/le_tc/kernel/Kconfig
-index 5ef96578..0e244819 100644
+index d77ccd57..2056824c 100644
 --- a/apps/examples/testcase/le_tc/kernel/Kconfig
 +++ b/apps/examples/testcase/le_tc/kernel/Kconfig
-@@ -330,5 +330,26 @@ config TC_KERNEL_ASSERT_BINARY_MANAGER
+@@ -346,5 +346,26 @@ config TC_KERNEL_ASSERT_BINARY_MANAGER
  		This test case crashes the board on purpose, so enable it
  		alone and never together with the other ASSERT test cases.
  

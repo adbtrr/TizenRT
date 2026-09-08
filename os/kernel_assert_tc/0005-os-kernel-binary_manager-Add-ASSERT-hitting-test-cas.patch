@@ -1,4 +1,4 @@
-From cf17346fde2b81ab64cbccd243b92c98be9b3863 Mon Sep 17 00:00:00 2001
+From ff154eb7bd97a1312117707214c70514d671fd73 Mon Sep 17 00:00:00 2001
 From: adbtrr_work8_fin_tc <adbtrr_work8_fin_tc@local>
 Date: Tue, 8 Sep 2026 06:18:25 +0000
 Subject: [PATCH 5/9] os/kernel/binary_manager: Add ASSERT hitting test case
@@ -44,10 +44,10 @@ is not required. It crashes the board by design and must be enabled alone.
  create mode 100644 os/drivers/os_api_test/kernel/test_assert_binary_manager.c
 
 diff --git a/apps/examples/testcase/le_tc/kernel/Kconfig b/apps/examples/testcase/le_tc/kernel/Kconfig
-index 1cc8fed0..5ef96578 100644
+index 8e0ea50c..d77ccd57 100644
 --- a/apps/examples/testcase/le_tc/kernel/Kconfig
 +++ b/apps/examples/testcase/le_tc/kernel/Kconfig
-@@ -314,5 +314,21 @@ config TC_KERNEL_ASSERT_PAGING
+@@ -330,5 +330,21 @@ config TC_KERNEL_ASSERT_PAGING
  		This test case crashes the board on purpose, so enable it
  		alone and never together with the other ASSERT test cases.
  

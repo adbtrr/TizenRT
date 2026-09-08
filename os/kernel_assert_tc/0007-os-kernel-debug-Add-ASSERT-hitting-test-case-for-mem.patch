@@ -1,4 +1,4 @@
-From 148bcb95626fc7bc6b3d17caeb2214015560b360 Mon Sep 17 00:00:00 2001
+From c81558d5ea368b236af20e82be015f176023ef11 Mon Sep 17 00:00:00 2001
 From: adbtrr_work8_fin_tc <adbtrr_work8_fin_tc@local>
 Date: Tue, 8 Sep 2026 06:20:15 +0000
 Subject: [PATCH 7/9] os/kernel/debug: Add ASSERT hitting test case for
@@ -39,10 +39,10 @@ is not required. It crashes the board by design and must be enabled alone.
  create mode 100644 os/drivers/os_api_test/kernel/test_assert_debug.c
 
 diff --git a/apps/examples/testcase/le_tc/kernel/Kconfig b/apps/examples/testcase/le_tc/kernel/Kconfig
-index 0e244819..df80ee1c 100644
+index 2056824c..3be2d4e6 100644
 --- a/apps/examples/testcase/le_tc/kernel/Kconfig
 +++ b/apps/examples/testcase/le_tc/kernel/Kconfig
-@@ -351,5 +351,22 @@ config TC_KERNEL_ASSERT_INIT
+@@ -367,5 +367,22 @@ config TC_KERNEL_ASSERT_INIT
  		This test case crashes the board on purpose, so enable it
  		alone and never together with the other ASSERT test cases.
  
