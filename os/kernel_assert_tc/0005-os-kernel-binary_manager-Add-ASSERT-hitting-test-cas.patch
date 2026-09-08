@@ -1,0 +1,415 @@
+From cf17346fde2b81ab64cbccd243b92c98be9b3863 Mon Sep 17 00:00:00 2001
+From: adbtrr_work8_fin_tc <adbtrr_work8_fin_tc@local>
+Date: Tue, 8 Sep 2026 06:18:25 +0000
+Subject: [PATCH 5/9] os/kernel/binary_manager: Add ASSERT hitting test case
+ for recover_tcb
+
+While recovering a faulted binary, binary_manager_recover_tcb() releases
+every resource its threads were blocked on. A thread parked in
+TSTATE_WAIT_SEM always carries a valid waitsem whose count went negative
+when it blocked, so the function guards the release with
+ASSERT(sem != NULL && sem->semcount < 0).
+
+binary_manager_recover_tcb() is static, so add
+binary_manager_recover_tcb_asserttest() next to it, built only when the
+test case is enabled. It drives the recovery with a thread that reports
+TSTATE_WAIT_SEM while carrying no wait semaphore, which is the corrupted
+bookkeeping the assertion is there to catch.
+
+ - os/kernel/binary_manager/binary_manager_recovery.c : test only entry
+   point for the static recovery helper.
+ - os/drivers/os_api_test/kernel/test_assert_binary_manager.c : kernel
+   side helper reached through the TESTIOC_ASSERT_BINARY_MANAGER ioctl.
+ - apps/examples/testcase/le_tc/kernel/tc_assert_binary_manager.c : user
+   side test case. A return from the ioctl is a test case failure.
+
+Controlled by CONFIG_TC_KERNEL_ASSERT_BINARY_MANAGER, default n, depends
+on CONFIG_BINMGR_RECOVERY. The assertion is an ASSERT(), so CONFIG_DEBUG
+is not required. It crashes the board by design and must be enabled alone.
+---
+ apps/examples/testcase/le_tc/kernel/Kconfig   | 16 ++++
+ apps/examples/testcase/le_tc/kernel/Make.defs |  4 +
+ .../testcase/le_tc/kernel/kernel_tc_main.c    |  4 +
+ .../le_tc/kernel/tc_assert_binary_manager.c   | 80 ++++++++++++++++
+ .../testcase/le_tc/kernel/tc_internal.h       |  1 +
+ os/drivers/os_api_test/kernel/Make.defs       |  4 +
+ .../kernel/test_assert_binary_manager.c       | 96 +++++++++++++++++++
+ os/drivers/os_api_test/os_api_test_drv.c      |  5 +
+ os/drivers/os_api_test/os_api_test_proto.h    |  3 +
+ os/include/tinyara/os_api_test_drv.h          |  3 +
+ .../binary_manager/binary_manager_internal.h  |  3 +
+ .../binary_manager/binary_manager_recovery.c  | 32 +++++++
+ 12 files changed, 251 insertions(+)
+ create mode 100644 apps/examples/testcase/le_tc/kernel/tc_assert_binary_manager.c
+ create mode 100644 os/drivers/os_api_test/kernel/test_assert_binary_manager.c
+
+diff --git a/apps/examples/testcase/le_tc/kernel/Kconfig b/apps/examples/testcase/le_tc/kernel/Kconfig
+index 1cc8fed0..5ef96578 100644
+--- a/apps/examples/testcase/le_tc/kernel/Kconfig
++++ b/apps/examples/testcase/le_tc/kernel/Kconfig
+@@ -314,5 +314,21 @@ config TC_KERNEL_ASSERT_PAGING
+ 		This test case crashes the board on purpose, so enable it
+ 		alone and never together with the other ASSERT test cases.
+ 
++config TC_KERNEL_ASSERT_BINARY_MANAGER
++	bool "Binary manager module ASSERT test"
++	default n
++	depends on BINMGR_RECOVERY
++	---help---
++		Hit ASSERT(sem != NULL && sem->semcount < 0) in
++		os/kernel/binary_manager/binary_manager_recovery.c by recovering
++		a thread which claims to be blocked on a semaphore but carries
++		no wait semaphore.
++
++		The assertion is an ASSERT(), so it is built in whether or not
++		CONFIG_DEBUG is enabled.
++
++		This test case crashes the board on purpose, so enable it
++		alone and never together with the other ASSERT test cases.
++
+ endif #EXAMPLES_TESTCASE_KERNEL
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/Make.defs b/apps/examples/testcase/le_tc/kernel/Make.defs
+index bd7fb8c2..8f345228 100644
+--- a/apps/examples/testcase/le_tc/kernel/Make.defs
++++ b/apps/examples/testcase/le_tc/kernel/Make.defs
+@@ -198,6 +198,10 @@ ifeq ($(CONFIG_TC_KERNEL_ASSERT_PAGING),y)
+   CSRCS += tc_assert_paging.c
+ endif
+ 
++ifeq ($(CONFIG_TC_KERNEL_ASSERT_BINARY_MANAGER),y)
++  CSRCS += tc_assert_binary_manager.c
++endif
++
+ DEPPATH += --dep-path le_tc/kernel
+ VPATH += :le_tc/kernel
+ endif
+diff --git a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+index 2fad1103..b356d33f 100644
+--- a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
++++ b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+@@ -242,6 +242,10 @@ int tc_kernel_main(int argc, char *argv[])
+ 	paging_assert_main();
+ #endif
+ 
++#ifdef CONFIG_TC_KERNEL_ASSERT_BINARY_MANAGER
++	binary_manager_assert_main();
++#endif
++
+ 	close(g_tc_fd);
+ 	g_tc_fd = -1;
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_assert_binary_manager.c b/apps/examples/testcase/le_tc/kernel/tc_assert_binary_manager.c
+new file mode 100644
+index 00000000..a2deaf47
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/tc_assert_binary_manager.c
+@@ -0,0 +1,80 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file tc_assert_binary_manager.c
++
++/// @brief Negative test case which hits the ASSERT of os/kernel/binary_manager
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++#include <stdio.h>
++#include <stdbool.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <tinyara/os_api_test_drv.h>
++#include "tc_internal.h"
++
++/**
++ * @fn                   :tc_assert_binary_manager_recover_tcb_null_waitsem
++ * @brief                :Hit ASSERT(sem != NULL && sem->semcount < 0) of binary_manager_recover_tcb()
++ * @scenario             :Recover a thread in TSTATE_WAIT_SEM which carries no wait semaphore
++ * Assertion under test  :os/kernel/binary_manager/binary_manager_recovery.c
++ *                       :ASSERT(sem != NULL && sem->semcount < 0);
++ * Expected result       :The board asserts and this function never returns.
++ *                       :Returning from the ioctl means the ASSERT was not
++ *                       :hit and the test case fails.
++ * @return               :void
++ */
++
++static void tc_assert_binary_manager_recover_tcb_null_waitsem(void)
++{
++	int fd;
++	int ret_chk;
++
++	fd = tc_get_drvfd();
++	TC_ASSERT_GEQ("tc_get_drvfd", fd, 0);
++
++	printf("\n[TC_ASSERT_BINARY_MANAGER] Recover a thread in TSTATE_WAIT_SEM which carries no wait semaphore\n");
++	printf("[TC_ASSERT_BINARY_MANAGER] Expecting an assertion at os/kernel/binary_manager/binary_manager_recovery.c\n");
++	printf("[TC_ASSERT_BINARY_MANAGER] The board is expected to crash dump and reboot now.\n");
++
++	/* The kernel side helper violates the precondition of the API under
++	 * test.  Control is not expected to come back from this ioctl.
++	 */
++
++	ret_chk = ioctl(fd, TESTIOC_ASSERT_BINARY_MANAGER, 0);
++
++	printf("[TC_ASSERT_BINARY_MANAGER] ioctl returned %d, the ASSERT was not hit\n", ret_chk);
++	if (ret_chk == -ENOSYS) {
++		printf("[TC_ASSERT_BINARY_MANAGER] Enable CONFIG_DEBUG so that DEBUGASSERT() is built in\n");
++	}
++
++	TC_ASSERT("binary_manager_recover_tcb ASSERT was not hit", false);
++
++	TC_SUCCESS_RESULT();
++}
++
++int binary_manager_assert_main(void)
++{
++	tc_assert_binary_manager_recover_tcb_null_waitsem();
++
++	return 0;
++}
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_internal.h b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+index 9f87192e..fd7cec34 100644
+--- a/apps/examples/testcase/le_tc/kernel/tc_internal.h
++++ b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+@@ -104,6 +104,7 @@ int group_assert_main(void);
+ int irq_assert_main(void);
+ int environ_assert_main(void);
+ int paging_assert_main(void);
++int binary_manager_assert_main(void);
+ int tc_get_drvfd(void);
+ 
+ #endif /* __EXAMPLES_TESTCASE_KERNEL_TC_INTERNAL_H */
+diff --git a/os/drivers/os_api_test/kernel/Make.defs b/os/drivers/os_api_test/kernel/Make.defs
+index 408d3976..2cf4397c 100644
+--- a/os/drivers/os_api_test/kernel/Make.defs
++++ b/os/drivers/os_api_test/kernel/Make.defs
+@@ -58,6 +58,10 @@ ifeq ($(CONFIG_TC_KERNEL_ASSERT_PAGING),y)
+ CSRCS += test_assert_paging.c
+ endif
+ 
++ifeq ($(CONFIG_TC_KERNEL_ASSERT_BINARY_MANAGER),y)
++CSRCS += test_assert_binary_manager.c
++endif
++
+ CFLAGS += -I$(TOPDIR)/kernel
+ 
+ # Include OS API test driver support
+diff --git a/os/drivers/os_api_test/kernel/test_assert_binary_manager.c b/os/drivers/os_api_test/kernel/test_assert_binary_manager.c
+new file mode 100644
+index 00000000..7efd4f5f
+--- /dev/null
++++ b/os/drivers/os_api_test/kernel/test_assert_binary_manager.c
+@@ -0,0 +1,96 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/****************************************************************************
++ * Kernel side helper for the os/kernel/binary_manager ASSERT test case.
++ *
++ * Target assertion:
++ *   os/kernel/binary_manager/binary_manager_recovery.c
++ *     static void binary_manager_recover_tcb(struct tcb_s *tcb)
++ *     {
++ *             ...
++ *             if (state == TSTATE_WAIT_SEM) {
++ *                     sem = tcb->waitsem;
++ *                     ASSERT(sem != NULL && sem->semcount < 0);
++ *
++ * While recovering a faulted binary the binary manager releases every
++ * resource its threads were blocked on. A thread parked in TSTATE_WAIT_SEM
++ * always carries a valid waitsem whose count went negative when it blocked,
++ * so a NULL waitsem or a non negative count means the thread bookkeeping is
++ * corrupted and recovery cannot continue.
++ *
++ * binary_manager_recover_tcb() is static, so the test is driven through
++ * binary_manager_recover_tcb_asserttest() which is built into
++ * binary_manager_recovery.c only when this test case is enabled.
++ ****************************************************************************/
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++#include <sys/types.h>
++#include <debug.h>
++#include <errno.h>
++
++#include <tinyara/os_api_test_drv.h>
++#include <tinyara/sched.h>
++#ifdef CONFIG_BINMGR_RECOVERY
++#include "binary_manager/binary_manager_internal.h"
++#endif
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: test_assert_binary_manager
++ *
++ * Description:
++ *   Recover a thread which claims to be blocked on a semaphore but carries
++ *   no wait semaphore, so that
++ *   ASSERT(sem != NULL && sem->semcount < 0) in
++ *   os/kernel/binary_manager/binary_manager_recovery.c is hit.
++ *
++ * Returned Value:
++ *   This function does not return when the test case is built in.
++ *   -ENOSYS is returned otherwise.
++ *
++ ****************************************************************************/
++
++int test_assert_binary_manager(int cmd, unsigned long arg)
++{
++	(void)cmd;
++	(void)arg;
++
++#ifdef CONFIG_BINMGR_RECOVERY
++	lldbg("Recovering a thread blocked on a NULL semaphore\n");
++
++	/* ASSERT(sem != NULL && sem->semcount < 0) in
++	 * binary_manager_recover_tcb() is hit here.
++	 */
++
++	binary_manager_recover_tcb_asserttest();
++
++	return OK;
++#else
++	lldbg("CONFIG_BINMGR_RECOVERY is required\n");
++
++	return -ENOSYS;
++#endif
++}
+diff --git a/os/drivers/os_api_test/os_api_test_drv.c b/os/drivers/os_api_test/os_api_test_drv.c
+index b4f6186d..3574bed1 100644
+--- a/os/drivers/os_api_test/os_api_test_drv.c
++++ b/os/drivers/os_api_test/os_api_test_drv.c
+@@ -215,6 +215,11 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long
+ 	case TESTIOC_ASSERT_PAGING:
+ 		ret = test_assert_paging(cmd, arg);
+ 		break;
++#endif
++#ifdef CONFIG_TC_KERNEL_ASSERT_BINARY_MANAGER
++	case TESTIOC_ASSERT_BINARY_MANAGER:
++		ret = test_assert_binary_manager(cmd, arg);
++		break;
+ #endif
+ 	default:
+ 		vdbg("Unrecognized cmd: %d arg: %ld\n", cmd, arg);
+diff --git a/os/drivers/os_api_test/os_api_test_proto.h b/os/drivers/os_api_test/os_api_test_proto.h
+index d0a8ffdc..7f956444 100644
+--- a/os/drivers/os_api_test/os_api_test_proto.h
++++ b/os/drivers/os_api_test/os_api_test_proto.h
+@@ -52,4 +52,7 @@ int test_assert_environ(int cmd, unsigned long arg);
+ #ifdef CONFIG_TC_KERNEL_ASSERT_PAGING
+ int test_assert_paging(int cmd, unsigned long arg);
+ #endif
++#ifdef CONFIG_TC_KERNEL_ASSERT_BINARY_MANAGER
++int test_assert_binary_manager(int cmd, unsigned long arg);
++#endif
+ #endif
+diff --git a/os/include/tinyara/os_api_test_drv.h b/os/include/tinyara/os_api_test_drv.h
+index f55d0e67..bd925bff 100644
+--- a/os/include/tinyara/os_api_test_drv.h
++++ b/os/include/tinyara/os_api_test_drv.h
+@@ -108,6 +108,9 @@
+ #ifdef CONFIG_TC_KERNEL_ASSERT_PAGING
+ #define TESTIOC_ASSERT_PAGING                  _TESTIOC(28)
+ #endif
++#ifdef CONFIG_TC_KERNEL_ASSERT_BINARY_MANAGER
++#define TESTIOC_ASSERT_BINARY_MANAGER          _TESTIOC(29)
++#endif
+ 
+ #define OS_API_TEST_DRVPATH	"/dev/os_api_test"
+ 
+diff --git a/os/kernel/binary_manager/binary_manager_internal.h b/os/kernel/binary_manager/binary_manager_internal.h
+index b21a83af..33a4ca56 100644
+--- a/os/kernel/binary_manager/binary_manager_internal.h
++++ b/os/kernel/binary_manager/binary_manager_internal.h
+@@ -315,6 +315,9 @@ binmgr_uinfo_t *binary_manager_get_udata(uint32_t bin_idx);
+  ****************************************************************************/
+ void binary_manager_recovery(int pid);
+ void binary_manager_deactivate_rtthreads(int bin_idx);
++#ifdef CONFIG_TC_KERNEL_ASSERT_BINARY_MANAGER
++void binary_manager_recover_tcb_asserttest(void);
++#endif
+ void binary_manager_set_faultmsg_sender(pid_t pid);
+ int binary_manager_faultmsg_sender(int argc, char *argv[]);
+ mqd_t binary_manager_get_mqfd(void);
+diff --git a/os/kernel/binary_manager/binary_manager_recovery.c b/os/kernel/binary_manager/binary_manager_recovery.c
+index 7c8f969e..2436c3be 100644
+--- a/os/kernel/binary_manager/binary_manager_recovery.c
++++ b/os/kernel/binary_manager/binary_manager_recovery.c
+@@ -107,6 +107,38 @@ static void binary_manager_recover_tcb(struct tcb_s *tcb)
+ 	}
+ }
+ 
++#ifdef CONFIG_TC_KERNEL_ASSERT_BINARY_MANAGER
++/****************************************************************************
++ * Name: binary_manager_recover_tcb_asserttest
++ *
++ * Description:
++ *	 Test only entry point which drives binary_manager_recover_tcb() with a
++ *	 thread that claims to be blocked on a semaphore but carries no wait
++ *	 semaphore, so that
++ *	   ASSERT(sem != NULL && sem->semcount < 0)
++ *	 is executed. A thread in TSTATE_WAIT_SEM always holds a valid waitsem
++ *	 whose count went negative when it blocked, so this is the corrupted
++ *	 state the assertion is there to catch.
++ *
++ *	 This function does not return.
++ *
++ ****************************************************************************/
++void binary_manager_recover_tcb_asserttest(void)
++{
++	struct tcb_s tcb;
++
++	memset(&tcb, 0, sizeof(struct tcb_s));
++
++	/* Blocked on a semaphore, but with no semaphore to be released. */
++
++	tcb.task_state = TSTATE_WAIT_SEM;
++	tcb.waitsem = NULL;
++	tcb.waitdog = NULL;
++
++	binary_manager_recover_tcb(&tcb);
++}
++#endif
++
+ /****************************************************************************
+  * Name: binary_manager_deactivate_binary
+  *

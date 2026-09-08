@@ -1,0 +1,359 @@
+From 2a90365d6dcdcc0fb4722a390c2aba912266cd69 Mon Sep 17 00:00:00 2001
+From: adbtrr_work8_fin_tc <adbtrr_work8_fin_tc@local>
+Date: Tue, 8 Sep 2026 06:14:39 +0000
+Subject: [PATCH 1/9] os/kernel/group: Add ASSERT hitting test case for
+ group_foreachchild
+
+group_foreachchild() dereferences the "group" argument right after
+DEBUGASSERT(group), so a NULL group is a caller contract violation.
+
+Add a negative test case which calls group_foreachchild() with a NULL
+task group from kernel context so that the assertion in
+os/kernel/group/group_foreachchild.c is executed.
+
+ - os/drivers/os_api_test/kernel/test_assert_group.c : kernel side
+   helper reached through the TESTIOC_ASSERT_GROUP ioctl.
+ - apps/examples/testcase/le_tc/kernel/tc_assert_group.c : user side
+   test case. The ioctl is not expected to return, so a return from it
+   is reported as a test case failure.
+
+The test case is controlled by CONFIG_TC_KERNEL_ASSERT_GROUP which
+defaults to n and depends on CONFIG_DEBUG, because DEBUGASSERT() is
+compiled out when CONFIG_DEBUG is disabled. It crashes the board by
+design and must be enabled alone.
+---
+ apps/examples/testcase/le_tc/kernel/Kconfig   |  11 ++
+ apps/examples/testcase/le_tc/kernel/Make.defs |   4 +
+ .../testcase/le_tc/kernel/kernel_tc_main.c    |   4 +
+ .../testcase/le_tc/kernel/tc_assert_group.c   |  80 ++++++++++++++
+ .../testcase/le_tc/kernel/tc_internal.h       |   1 +
+ os/drivers/os_api_test/kernel/Make.defs       |   4 +
+ .../os_api_test/kernel/test_assert_group.c    | 100 ++++++++++++++++++
+ os/drivers/os_api_test/os_api_test_drv.c      |   5 +
+ os/drivers/os_api_test/os_api_test_proto.h    |   3 +
+ os/include/tinyara/os_api_test_drv.h          |  12 +++
+ 10 files changed, 224 insertions(+)
+ create mode 100644 apps/examples/testcase/le_tc/kernel/tc_assert_group.c
+ create mode 100644 os/drivers/os_api_test/kernel/test_assert_group.c
+
+diff --git a/apps/examples/testcase/le_tc/kernel/Kconfig b/apps/examples/testcase/le_tc/kernel/Kconfig
+index 9010c4df..67df4d4f 100644
+--- a/apps/examples/testcase/le_tc/kernel/Kconfig
++++ b/apps/examples/testcase/le_tc/kernel/Kconfig
+@@ -260,5 +260,16 @@ config ITC_KERN_PTHREAD_LOOP_SIZE
+ endif
+ 
+ 
++config TC_KERNEL_ASSERT_GROUP
++	bool "Group module ASSERT test"
++	default n
++	depends on DEBUG
++	---help---
++		Hit DEBUGASSERT(group) in os/kernel/group/group_foreachchild.c
++		by calling group_foreachchild() with a NULL task group.
++
++		This test case crashes the board on purpose, so enable it
++		alone and never together with the other ASSERT test cases.
++
+ endif #EXAMPLES_TESTCASE_KERNEL
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/Make.defs b/apps/examples/testcase/le_tc/kernel/Make.defs
+index 288fa3a7..73f3226b 100644
+--- a/apps/examples/testcase/le_tc/kernel/Make.defs
++++ b/apps/examples/testcase/le_tc/kernel/Make.defs
+@@ -182,6 +182,10 @@ endif
+ 
+ # Include kernel build support
+ 
++ifeq ($(CONFIG_TC_KERNEL_ASSERT_GROUP),y)
++  CSRCS += tc_assert_group.c
++endif
++
+ DEPPATH += --dep-path le_tc/kernel
+ VPATH += :le_tc/kernel
+ endif
+diff --git a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+index 9a4ca0f8..53b67691 100644
+--- a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
++++ b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+@@ -226,6 +226,10 @@ int tc_kernel_main(int argc, char *argv[])
+ 	itc_pthread_main();
+ #endif
+ 
++#ifdef CONFIG_TC_KERNEL_ASSERT_GROUP
++	group_assert_main();
++#endif
++
+ 	close(g_tc_fd);
+ 	g_tc_fd = -1;
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_assert_group.c b/apps/examples/testcase/le_tc/kernel/tc_assert_group.c
+new file mode 100644
+index 00000000..207ab518
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/tc_assert_group.c
+@@ -0,0 +1,80 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file tc_assert_group.c
++
++/// @brief Negative test case which hits the ASSERT of os/kernel/group
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++#include <stdio.h>
++#include <stdbool.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <tinyara/os_api_test_drv.h>
++#include "tc_internal.h"
++
++/**
++ * @fn                   :tc_assert_group_foreachchild_null_group
++ * @brief                :Hit DEBUGASSERT(group) of group_foreachchild()
++ * @scenario             :Call group_foreachchild() with a NULL task group
++ * Assertion under test  :os/kernel/group/group_foreachchild.c
++ *                       :DEBUGASSERT(group);
++ * Expected result       :The board asserts and this function never returns.
++ *                       :Returning from the ioctl means the ASSERT was not
++ *                       :hit and the test case fails.
++ * @return               :void
++ */
++
++static void tc_assert_group_foreachchild_null_group(void)
++{
++	int fd;
++	int ret_chk;
++
++	fd = tc_get_drvfd();
++	TC_ASSERT_GEQ("tc_get_drvfd", fd, 0);
++
++	printf("\n[TC_ASSERT_GROUP] Call group_foreachchild() with a NULL task group\n");
++	printf("[TC_ASSERT_GROUP] Expecting an assertion at os/kernel/group/group_foreachchild.c\n");
++	printf("[TC_ASSERT_GROUP] The board is expected to crash dump and reboot now.\n");
++
++	/* The kernel side helper violates the precondition of the API under
++	 * test.  Control is not expected to come back from this ioctl.
++	 */
++
++	ret_chk = ioctl(fd, TESTIOC_ASSERT_GROUP, 0);
++
++	printf("[TC_ASSERT_GROUP] ioctl returned %d, the ASSERT was not hit\n", ret_chk);
++	if (ret_chk == -ENOSYS) {
++		printf("[TC_ASSERT_GROUP] Enable CONFIG_DEBUG so that DEBUGASSERT() is built in\n");
++	}
++
++	TC_ASSERT("group_foreachchild DEBUGASSERT(group) was not hit", false);
++
++	TC_SUCCESS_RESULT();
++}
++
++int group_assert_main(void)
++{
++	tc_assert_group_foreachchild_null_group();
++
++	return 0;
++}
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_internal.h b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+index dd4612c2..3ae7ee0c 100644
+--- a/apps/examples/testcase/le_tc/kernel/tc_internal.h
++++ b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+@@ -100,6 +100,7 @@ int itc_semaphore_main(void);
+ int itc_sched_main(void);
+ int itc_timer_main(void);
+ int itc_pthread_main(void);
++int group_assert_main(void);
+ int tc_get_drvfd(void);
+ 
+ #endif /* __EXAMPLES_TESTCASE_KERNEL_TC_INTERNAL_H */
+diff --git a/os/drivers/os_api_test/kernel/Make.defs b/os/drivers/os_api_test/kernel/Make.defs
+index 226d2d18..197ce7c8 100644
+--- a/os/drivers/os_api_test/kernel/Make.defs
++++ b/os/drivers/os_api_test/kernel/Make.defs
+@@ -42,6 +42,10 @@ ifeq ($(CONFIG_EXAMPLES_STACK_PROTECTION),y)
+ CSRCS += test_kthread_stack_protection.c
+ endif
+ 
++ifeq ($(CONFIG_TC_KERNEL_ASSERT_GROUP),y)
++CSRCS += test_assert_group.c
++endif
++
+ CFLAGS += -I$(TOPDIR)/kernel
+ 
+ # Include OS API test driver support
+diff --git a/os/drivers/os_api_test/kernel/test_assert_group.c b/os/drivers/os_api_test/kernel/test_assert_group.c
+new file mode 100644
+index 00000000..ac4ec723
+--- /dev/null
++++ b/os/drivers/os_api_test/kernel/test_assert_group.c
+@@ -0,0 +1,100 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/****************************************************************************
++ * Kernel side helper for the os/kernel/group ASSERT test case.
++ *
++ * Target assertion:
++ *   os/kernel/group/group_foreachchild.c
++ *     int group_foreachchild(FAR struct task_group_s *group, ...)
++ *     {
++ *             ...
++ *             DEBUGASSERT(group);
++ *
++ * group_foreachchild() dereferences "group" unconditionally right after the
++ * assertion, so a NULL group is a caller contract violation.  Passing NULL
++ * from kernel context reproduces the assertion deterministically.
++ *
++ * Requires CONFIG_DEBUG, otherwise DEBUGASSERT() compiles away and the test
++ * is skipped with -ENOSYS.
++ ****************************************************************************/
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++#include <sys/types.h>
++#include <debug.h>
++#include <errno.h>
++
++#include <tinyara/os_api_test_drv.h>
++#include <tinyara/sched.h>
++
++#include "group/group.h"
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++#if defined(HAVE_GROUP_MEMBERS) && defined(CONFIG_DEBUG)
++/* Handler is never reached, the assertion fires before the member loop. */
++
++static int assert_group_foreach_handler(pid_t pid, FAR void *arg)
++{
++	(void)pid;
++	(void)arg;
++
++	return 0;
++}
++#endif
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: test_assert_group
++ *
++ * Description:
++ *   Violate the group_foreachchild() precondition so that
++ *   DEBUGASSERT(group) in os/kernel/group/group_foreachchild.c is hit.
++ *
++ * Returned Value:
++ *   This function does not return when the assertion is enabled.
++ *   -ENOSYS is returned when the assertion is compiled out.
++ *
++ ****************************************************************************/
++
++int test_assert_group(int cmd, unsigned long arg)
++{
++	(void)cmd;
++	(void)arg;
++
++#if defined(HAVE_GROUP_MEMBERS) && defined(CONFIG_DEBUG)
++	lldbg("Calling group_foreachchild() with a NULL group\n");
++
++	/* DEBUGASSERT(group) in group_foreachchild() is hit here. */
++
++	return group_foreachchild(NULL, assert_group_foreach_handler, NULL);
++#else
++	lldbg("CONFIG_DEBUG and group members support are required\n");
++
++	return -ENOSYS;
++#endif
++}
+diff --git a/os/drivers/os_api_test/os_api_test_drv.c b/os/drivers/os_api_test/os_api_test_drv.c
+index fa1cdae2..3f42461e 100644
+--- a/os/drivers/os_api_test/os_api_test_drv.c
++++ b/os/drivers/os_api_test/os_api_test_drv.c
+@@ -196,6 +196,11 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long
+ 		ret = test_fs_get_devname();
+ 		break;
+ #endif		
++#ifdef CONFIG_TC_KERNEL_ASSERT_GROUP
++	case TESTIOC_ASSERT_GROUP:
++		ret = test_assert_group(cmd, arg);
++		break;
++#endif
+ 	default:
+ 		vdbg("Unrecognized cmd: %d arg: %ld\n", cmd, arg);
+ 		break;
+diff --git a/os/drivers/os_api_test/os_api_test_proto.h b/os/drivers/os_api_test/os_api_test_proto.h
+index 28b60f2c..083b1b46 100644
+--- a/os/drivers/os_api_test/os_api_test_proto.h
++++ b/os/drivers/os_api_test/os_api_test_proto.h
+@@ -40,4 +40,7 @@ int test_net_pbuf(int cmd, unsigned long arg);
+ #if defined(CONFIG_AUTOMOUNT_USERFS) && defined(CONFIG_EXAMPLES_TESTCASE_FILESYSTEM)
+ int test_fs_get_devname(void);
+ #endif
++#ifdef CONFIG_TC_KERNEL_ASSERT_GROUP
++int test_assert_group(int cmd, unsigned long arg);
++#endif
+ #endif
+diff --git a/os/include/tinyara/os_api_test_drv.h b/os/include/tinyara/os_api_test_drv.h
+index 59969b84..f2f83c26 100644
+--- a/os/include/tinyara/os_api_test_drv.h
++++ b/os/include/tinyara/os_api_test_drv.h
+@@ -88,6 +88,18 @@
+ #define TESTIOC_GET_FS_PARTNO			_TESTIOC(24)
+ #endif
+ 
++/* Kernel module ASSERT test commands.
++ *
++ * Each command deliberately violates the precondition of one kernel API so
++ * that the ASSERT()/DEBUGASSERT() guarding that precondition is executed.
++ * The board asserts and reboots when the command succeeds, so exactly one
++ * of these test cases may be enabled in a build.
++ */
++
++#ifdef CONFIG_TC_KERNEL_ASSERT_GROUP
++#define TESTIOC_ASSERT_GROUP                   _TESTIOC(25)
++#endif
++
+ #define OS_API_TEST_DRVPATH	"/dev/os_api_test"
+ 
+ /****************************************************************************

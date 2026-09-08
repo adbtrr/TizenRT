@@ -1,0 +1,365 @@
+From 148bcb95626fc7bc6b3d17caeb2214015560b360 Mon Sep 17 00:00:00 2001
+From: adbtrr_work8_fin_tc <adbtrr_work8_fin_tc@local>
+Date: Tue, 8 Sep 2026 06:20:15 +0000
+Subject: [PATCH 7/9] os/kernel/debug: Add ASSERT hitting test case for
+ mem_leak_checker
+
+heap_check() has to know the stack of the thread running the leak check
+so that it can leave that region out of the scan, otherwise the checker
+finds its own working references and reports them as owners. It looks
+the stack up with sched_gettcb(checker_pid) and rejects a pid with no
+TCB behind it through ASSERT(ctcb != NULL).
+
+run_all_mem_leak_checker() takes the checker pid from its caller and
+hands it down unvalidated, so add a negative test case which runs the
+leak checker on behalf of a pid which is not running. sched_gettcb()
+rejects every negative pid, so -1 can never resolve to a live thread.
+
+ - os/drivers/os_api_test/kernel/test_assert_debug.c : kernel side
+   helper reached through the TESTIOC_ASSERT_DEBUG ioctl.
+ - apps/examples/testcase/le_tc/kernel/tc_assert_debug.c : user side
+   test case. A return from the ioctl is reported as a test case failure.
+
+Controlled by CONFIG_TC_KERNEL_ASSERT_DEBUG, default n, depends on
+CONFIG_MEM_LEAK_CHECKER. The assertion is an ASSERT(), so CONFIG_DEBUG
+is not required. It crashes the board by design and must be enabled alone.
+---
+ apps/examples/testcase/le_tc/kernel/Kconfig   |  17 +++
+ apps/examples/testcase/le_tc/kernel/Make.defs |   4 +
+ .../testcase/le_tc/kernel/kernel_tc_main.c    |   4 +
+ .../testcase/le_tc/kernel/tc_assert_debug.c   |  80 +++++++++++++
+ .../testcase/le_tc/kernel/tc_internal.h       |   1 +
+ os/drivers/os_api_test/kernel/Make.defs       |   4 +
+ .../os_api_test/kernel/test_assert_debug.c    | 107 ++++++++++++++++++
+ os/drivers/os_api_test/os_api_test_drv.c      |   5 +
+ os/drivers/os_api_test/os_api_test_proto.h    |   3 +
+ os/include/tinyara/os_api_test_drv.h          |   3 +
+ 10 files changed, 228 insertions(+)
+ create mode 100644 apps/examples/testcase/le_tc/kernel/tc_assert_debug.c
+ create mode 100644 os/drivers/os_api_test/kernel/test_assert_debug.c
+
+diff --git a/apps/examples/testcase/le_tc/kernel/Kconfig b/apps/examples/testcase/le_tc/kernel/Kconfig
+index 0e244819..df80ee1c 100644
+--- a/apps/examples/testcase/le_tc/kernel/Kconfig
++++ b/apps/examples/testcase/le_tc/kernel/Kconfig
+@@ -351,5 +351,22 @@ config TC_KERNEL_ASSERT_INIT
+ 		This test case crashes the board on purpose, so enable it
+ 		alone and never together with the other ASSERT test cases.
+ 
++config TC_KERNEL_ASSERT_DEBUG
++	bool "Debug module ASSERT test"
++	default n
++	depends on MEM_LEAK_CHECKER
++	---help---
++		Hit ASSERT(ctcb != NULL) in os/kernel/debug/mem_leak_checker.c
++		by running run_all_mem_leak_checker() for a pid which is not
++		running. heap_check() needs the stack of the checker thread so
++		that it can leave it out of the scan, and rejects a pid with no
++		TCB behind it.
++
++		The assertion is an ASSERT(), so it is built in whether or not
++		CONFIG_DEBUG is enabled.
++
++		This test case crashes the board on purpose, so enable it
++		alone and never together with the other ASSERT test cases.
++
+ endif #EXAMPLES_TESTCASE_KERNEL
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/Make.defs b/apps/examples/testcase/le_tc/kernel/Make.defs
+index 75dc0a81..8369cec9 100644
+--- a/apps/examples/testcase/le_tc/kernel/Make.defs
++++ b/apps/examples/testcase/le_tc/kernel/Make.defs
+@@ -206,6 +206,10 @@ ifeq ($(CONFIG_TC_KERNEL_ASSERT_INIT),y)
+   CSRCS += tc_assert_init.c
+ endif
+ 
++ifeq ($(CONFIG_TC_KERNEL_ASSERT_DEBUG),y)
++  CSRCS += tc_assert_debug.c
++endif
++
+ DEPPATH += --dep-path le_tc/kernel
+ VPATH += :le_tc/kernel
+ endif
+diff --git a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+index e81632bd..9adec868 100644
+--- a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
++++ b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+@@ -250,6 +250,10 @@ int tc_kernel_main(int argc, char *argv[])
+ 	init_assert_main();
+ #endif
+ 
++#ifdef CONFIG_TC_KERNEL_ASSERT_DEBUG
++	debug_assert_main();
++#endif
++
+ 	close(g_tc_fd);
+ 	g_tc_fd = -1;
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_assert_debug.c b/apps/examples/testcase/le_tc/kernel/tc_assert_debug.c
+new file mode 100644
+index 00000000..f9677d16
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/tc_assert_debug.c
+@@ -0,0 +1,80 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file tc_assert_debug.c
++
++/// @brief Negative test case which hits the ASSERT of os/kernel/debug
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++#include <stdio.h>
++#include <stdbool.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <tinyara/os_api_test_drv.h>
++#include "tc_internal.h"
++
++/**
++ * @fn                   :tc_assert_debug_mem_leak_checker_invalid_pid
++ * @brief                :Hit ASSERT(ctcb != NULL) of heap_check()
++ * @scenario             :Run the memory leak checker on behalf of a pid which is not running
++ * Assertion under test  :os/kernel/debug/mem_leak_checker.c
++ *                       :ASSERT(ctcb != NULL);
++ * Expected result       :The board asserts and this function never returns.
++ *                       :Returning from the ioctl means the ASSERT was not
++ *                       :hit and the test case fails.
++ * @return               :void
++ */
++
++static void tc_assert_debug_mem_leak_checker_invalid_pid(void)
++{
++	int fd;
++	int ret_chk;
++
++	fd = tc_get_drvfd();
++	TC_ASSERT_GEQ("tc_get_drvfd", fd, 0);
++
++	printf("\n[TC_ASSERT_DEBUG] Run the memory leak checker on behalf of a pid which is not running\n");
++	printf("[TC_ASSERT_DEBUG] Expecting an assertion at os/kernel/debug/mem_leak_checker.c\n");
++	printf("[TC_ASSERT_DEBUG] The board is expected to crash dump and reboot now.\n");
++
++	/* The kernel side helper violates the precondition of the API under
++	 * test.  Control is not expected to come back from this ioctl.
++	 */
++
++	ret_chk = ioctl(fd, TESTIOC_ASSERT_DEBUG, 0);
++
++	printf("[TC_ASSERT_DEBUG] ioctl returned %d, the ASSERT was not hit\n", ret_chk);
++	if (ret_chk == -ENOSYS) {
++		printf("[TC_ASSERT_DEBUG] Enable CONFIG_DEBUG so that DEBUGASSERT() is built in\n");
++	}
++
++	TC_ASSERT("mem_leak_checker ASSERT(ctcb != NULL) was not hit", false);
++
++	TC_SUCCESS_RESULT();
++}
++
++int debug_assert_main(void)
++{
++	tc_assert_debug_mem_leak_checker_invalid_pid();
++
++	return 0;
++}
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_internal.h b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+index 6c80b4cd..c1d72eeb 100644
+--- a/apps/examples/testcase/le_tc/kernel/tc_internal.h
++++ b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+@@ -106,6 +106,7 @@ int environ_assert_main(void);
+ int paging_assert_main(void);
+ int binary_manager_assert_main(void);
+ int init_assert_main(void);
++int debug_assert_main(void);
+ int tc_get_drvfd(void);
+ 
+ #endif /* __EXAMPLES_TESTCASE_KERNEL_TC_INTERNAL_H */
+diff --git a/os/drivers/os_api_test/kernel/Make.defs b/os/drivers/os_api_test/kernel/Make.defs
+index 2cf4397c..e8faeee6 100644
+--- a/os/drivers/os_api_test/kernel/Make.defs
++++ b/os/drivers/os_api_test/kernel/Make.defs
+@@ -62,6 +62,10 @@ ifeq ($(CONFIG_TC_KERNEL_ASSERT_BINARY_MANAGER),y)
+ CSRCS += test_assert_binary_manager.c
+ endif
+ 
++ifeq ($(CONFIG_TC_KERNEL_ASSERT_DEBUG),y)
++CSRCS += test_assert_debug.c
++endif
++
+ CFLAGS += -I$(TOPDIR)/kernel
+ 
+ # Include OS API test driver support
+diff --git a/os/drivers/os_api_test/kernel/test_assert_debug.c b/os/drivers/os_api_test/kernel/test_assert_debug.c
+new file mode 100644
+index 00000000..541383b5
+--- /dev/null
++++ b/os/drivers/os_api_test/kernel/test_assert_debug.c
+@@ -0,0 +1,107 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/****************************************************************************
++ * Kernel side helper for the os/kernel/debug ASSERT test case.
++ *
++ * Target assertion:
++ *   os/kernel/debug/mem_leak_checker.c
++ *     static void heap_check(struct mm_heap_s *heap, int checker_pid, ...)
++ *     {
++ *             ...
++ *             struct tcb_s *ctcb = sched_gettcb(checker_pid);
++ *             ASSERT(ctcb != NULL);
++ *             exclude_top = ctcb->adj_stack_ptr;
++ *
++ * heap_check() has to know the stack of the thread running the leak check
++ * so that it can leave that stack out of the scan, otherwise the checker
++ * would find its own working references and report them as owners. A
++ * checker_pid with no TCB behind it leaves that region unknown, so the
++ * assertion rejects it.
++ *
++ * run_all_mem_leak_checker() takes the checker pid from its caller and
++ * hands it down to heap_check() unvalidated, so passing a pid which is not
++ * running reproduces the assertion.
++ ****************************************************************************/
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++#include <sys/types.h>
++#include <debug.h>
++#include <errno.h>
++
++#include <tinyara/mm/mm.h>
++#include <tinyara/os_api_test_drv.h>
++#include <tinyara/sched.h>
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++/* sched_gettcb() rejects every negative pid, so this value can never
++ * resolve to a running thread.
++ */
++
++#define ASSERT_DEBUG_INVALID_PID  (-1)
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: test_assert_debug
++ *
++ * Description:
++ *   Run the memory leak checker on behalf of a thread which does not exist
++ *   so that ASSERT(ctcb != NULL) in os/kernel/debug/mem_leak_checker.c is
++ *   hit.
++ *
++ * Returned Value:
++ *   This function does not return when the leak checker reaches the heap
++ *   scan. -ENOSYS is returned when the leak checker is not built in.
++ *
++ ****************************************************************************/
++
++int test_assert_debug(int cmd, unsigned long arg)
++{
++	(void)cmd;
++	(void)arg;
++
++#ifdef CONFIG_MEM_LEAK_CHECKER
++	int ret;
++
++	lldbg("Running the memory leak checker for a pid which is not running\n");
++
++	/* ASSERT(ctcb != NULL) in heap_check() is hit here. A return value
++	 * means the checker gave up before the heap scan, for example because
++	 * the hash table could not be allocated.
++	 */
++
++	ret = run_all_mem_leak_checker(ASSERT_DEBUG_INVALID_PID);
++
++	lldbg("Leak checker returned %d before reaching the heap scan\n", ret);
++
++	return ret;
++#else
++	lldbg("CONFIG_MEM_LEAK_CHECKER is required\n");
++
++	return -ENOSYS;
++#endif
++}
+diff --git a/os/drivers/os_api_test/os_api_test_drv.c b/os/drivers/os_api_test/os_api_test_drv.c
+index 3574bed1..2095c132 100644
+--- a/os/drivers/os_api_test/os_api_test_drv.c
++++ b/os/drivers/os_api_test/os_api_test_drv.c
+@@ -220,6 +220,11 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long
+ 	case TESTIOC_ASSERT_BINARY_MANAGER:
+ 		ret = test_assert_binary_manager(cmd, arg);
+ 		break;
++#endif
++#ifdef CONFIG_TC_KERNEL_ASSERT_DEBUG
++	case TESTIOC_ASSERT_DEBUG:
++		ret = test_assert_debug(cmd, arg);
++		break;
+ #endif
+ 	default:
+ 		vdbg("Unrecognized cmd: %d arg: %ld\n", cmd, arg);
+diff --git a/os/drivers/os_api_test/os_api_test_proto.h b/os/drivers/os_api_test/os_api_test_proto.h
+index 7f956444..f20faa7d 100644
+--- a/os/drivers/os_api_test/os_api_test_proto.h
++++ b/os/drivers/os_api_test/os_api_test_proto.h
+@@ -55,4 +55,7 @@ int test_assert_paging(int cmd, unsigned long arg);
+ #ifdef CONFIG_TC_KERNEL_ASSERT_BINARY_MANAGER
+ int test_assert_binary_manager(int cmd, unsigned long arg);
+ #endif
++#ifdef CONFIG_TC_KERNEL_ASSERT_DEBUG
++int test_assert_debug(int cmd, unsigned long arg);
++#endif
+ #endif
+diff --git a/os/include/tinyara/os_api_test_drv.h b/os/include/tinyara/os_api_test_drv.h
+index bd925bff..122fdfc0 100644
+--- a/os/include/tinyara/os_api_test_drv.h
++++ b/os/include/tinyara/os_api_test_drv.h
+@@ -111,6 +111,9 @@
+ #ifdef CONFIG_TC_KERNEL_ASSERT_BINARY_MANAGER
+ #define TESTIOC_ASSERT_BINARY_MANAGER          _TESTIOC(29)
+ #endif
++#ifdef CONFIG_TC_KERNEL_ASSERT_DEBUG
++#define TESTIOC_ASSERT_DEBUG                   _TESTIOC(30)
++#endif
+ 
+ #define OS_API_TEST_DRVPATH	"/dev/os_api_test"
+ 

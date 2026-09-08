@@ -1,0 +1,218 @@
+From e250e4cb12400a81cae28a3c273166e62266d12f Mon Sep 17 00:00:00 2001
+From: adbtrr_work8_fin_tc <adbtrr_work8_fin_tc@local>
+Date: Tue, 8 Sep 2026 06:19:22 +0000
+Subject: [PATCH 6/9] os/kernel/init: Add ASSERT hitting test case for
+ os_do_appstart
+
+os_do_appstart() creates the application main task as the last step of
+board bring up and closes with ASSERT(pid > 0), because a board that
+cannot start user space has nothing left to run.
+
+Every function of os/kernel/init is static inline and reachable only
+from os_start(), so the assertion cannot be driven from a running
+system. Add the fault injection at the call site instead: when the test
+case is enabled the appmain task is asked for a stack which no target
+can allocate, task_create() fails and the assertion is executed while
+the board is coming up.
+
+ - os/kernel/init/os_bringup.c : test only stack size for the appmain
+   task_create().
+ - apps/examples/testcase/le_tc/kernel/tc_assert_init.c : user side test
+   case. It is started by the very task whose creation must fail, so
+   running at all is reported as a test case failure.
+
+Controlled by CONFIG_TC_KERNEL_ASSERT_INIT, default n, depends on a flat
+build because only that path creates appmain here. The assertion is an
+ASSERT(), so CONFIG_DEBUG is not required. It crashes the board by
+design and must be enabled alone.
+---
+ apps/examples/testcase/le_tc/kernel/Kconfig   | 21 ++++++
+ apps/examples/testcase/le_tc/kernel/Make.defs |  4 ++
+ .../testcase/le_tc/kernel/kernel_tc_main.c    |  4 ++
+ .../testcase/le_tc/kernel/tc_assert_init.c    | 64 +++++++++++++++++++
+ .../testcase/le_tc/kernel/tc_internal.h       |  1 +
+ os/kernel/init/os_bringup.c                   | 18 ++++++
+ 6 files changed, 112 insertions(+)
+ create mode 100644 apps/examples/testcase/le_tc/kernel/tc_assert_init.c
+
+diff --git a/apps/examples/testcase/le_tc/kernel/Kconfig b/apps/examples/testcase/le_tc/kernel/Kconfig
+index 5ef96578..0e244819 100644
+--- a/apps/examples/testcase/le_tc/kernel/Kconfig
++++ b/apps/examples/testcase/le_tc/kernel/Kconfig
+@@ -330,5 +330,26 @@ config TC_KERNEL_ASSERT_BINARY_MANAGER
+ 		This test case crashes the board on purpose, so enable it
+ 		alone and never together with the other ASSERT test cases.
+ 
++config TC_KERNEL_ASSERT_INIT
++	bool "Init module ASSERT test"
++	default n
++	depends on !APP_BINARY_SEPARATION
++	---help---
++		Hit ASSERT(pid > 0) in os/kernel/init/os_bringup.c by asking
++		the application main task for a stack which cannot be
++		allocated, so that task_create() fails while the board is
++		being brought up.
++
++		The assertion is taken before any user space code runs, so the
++		board never reaches the test case application. The user side
++		test case only reports a failure for the case where the board
++		did boot, which means the assertion was not hit.
++
++		The assertion is an ASSERT(), so it is built in whether or not
++		CONFIG_DEBUG is enabled.
++
++		This test case crashes the board on purpose, so enable it
++		alone and never together with the other ASSERT test cases.
++
+ endif #EXAMPLES_TESTCASE_KERNEL
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/Make.defs b/apps/examples/testcase/le_tc/kernel/Make.defs
+index 8f345228..75dc0a81 100644
+--- a/apps/examples/testcase/le_tc/kernel/Make.defs
++++ b/apps/examples/testcase/le_tc/kernel/Make.defs
+@@ -202,6 +202,10 @@ ifeq ($(CONFIG_TC_KERNEL_ASSERT_BINARY_MANAGER),y)
+   CSRCS += tc_assert_binary_manager.c
+ endif
+ 
++ifeq ($(CONFIG_TC_KERNEL_ASSERT_INIT),y)
++  CSRCS += tc_assert_init.c
++endif
++
+ DEPPATH += --dep-path le_tc/kernel
+ VPATH += :le_tc/kernel
+ endif
+diff --git a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+index b356d33f..e81632bd 100644
+--- a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
++++ b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+@@ -246,6 +246,10 @@ int tc_kernel_main(int argc, char *argv[])
+ 	binary_manager_assert_main();
+ #endif
+ 
++#ifdef CONFIG_TC_KERNEL_ASSERT_INIT
++	init_assert_main();
++#endif
++
+ 	close(g_tc_fd);
+ 	g_tc_fd = -1;
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_assert_init.c b/apps/examples/testcase/le_tc/kernel/tc_assert_init.c
+new file mode 100644
+index 00000000..cd5fc6f9
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/tc_assert_init.c
+@@ -0,0 +1,64 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file tc_assert_init.c
++
++/// @brief Negative test case which hits the ASSERT of os/kernel/init
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++#include <stdio.h>
++#include <stdbool.h>
++#include "tc_internal.h"
++
++/**
++ * @fn                   :tc_assert_init_appmain_create_fail
++ * @brief                :Hit ASSERT(pid > 0) of os_do_appstart()
++ * @scenario             :Ask the application main task for a stack which
++ *                       :cannot be allocated so that task_create() fails
++ *                       :while the board is being brought up
++ * Assertion under test  :os/kernel/init/os_bringup.c
++ *                       :ASSERT(pid > 0);
++ * Expected result       :The board asserts inside os_do_appstart() before
++ *                       :the application main task ever runs. The kernel
++ *                       :test case application is started by that very
++ *                       :task, so reaching this function at all means the
++ *                       :ASSERT was not hit and the test case fails.
++ * @return               :void
++ */
++
++static void tc_assert_init_appmain_create_fail(void)
++{
++	printf("\n[TC_ASSERT_INIT] Expecting an assertion at os/kernel/init/os_bringup.c\n");
++	printf("[TC_ASSERT_INIT] os_do_appstart() must assert before appmain runs\n");
++	printf("[TC_ASSERT_INIT] This test case is running, so appmain was created\n");
++
++	TC_ASSERT("os_do_appstart ASSERT(pid > 0) was not hit", false);
++
++	TC_SUCCESS_RESULT();
++}
++
++int init_assert_main(void)
++{
++	tc_assert_init_appmain_create_fail();
++
++	return 0;
++}
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_internal.h b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+index fd7cec34..6c80b4cd 100644
+--- a/apps/examples/testcase/le_tc/kernel/tc_internal.h
++++ b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+@@ -105,6 +105,7 @@ int irq_assert_main(void);
+ int environ_assert_main(void);
+ int paging_assert_main(void);
+ int binary_manager_assert_main(void);
++int init_assert_main(void);
+ int tc_get_drvfd(void);
+ 
+ #endif /* __EXAMPLES_TESTCASE_KERNEL_TC_INTERNAL_H */
+diff --git a/os/kernel/init/os_bringup.c b/os/kernel/init/os_bringup.c
+index b13ca5d1..2476544b 100644
+--- a/os/kernel/init/os_bringup.c
++++ b/os/kernel/init/os_bringup.c
+@@ -124,6 +124,15 @@
+ #define PRI_USER_MAIN (SCHED_PRIORITY_DEFAULT)
+ #define PRI_PREAPP (PRI_USER_MAIN + 1)
+ 
++#ifdef CONFIG_TC_KERNEL_ASSERT_INIT
++/* Stack size which no target can satisfy. The os/kernel/init ASSERT test
++ * case uses it to make the appmain task_create() fail so that the
++ * ASSERT(pid > 0) at the end of os_do_appstart() is executed.
++ */
++
++#define TC_ASSERT_INIT_STACKSIZE  0x40000000
++#endif
++
+ /* Configuration */
+ 
+ #if defined(CONFIG_INIT_NONE)
+@@ -383,8 +392,17 @@ static inline void os_do_appstart(void)
+ 	svdbg("Starting application main task\n");
+ 
+ #if defined(CONFIG_USER_ENTRYPOINT)
++#ifdef CONFIG_TC_KERNEL_ASSERT_INIT
++	/* ASSERT test case for os/kernel/init. The application main task is
++	 * asked for a stack which cannot be allocated, so task_create() fails
++	 * and the ASSERT(pid > 0) below is hit during board bring up.
++	 */
++
++	pid = task_create("appmain", PRI_USER_MAIN, TC_ASSERT_INIT_STACKSIZE, (main_t)CONFIG_USER_ENTRYPOINT, (FAR char *const *)NULL);
++#else
+ 	pid = task_create("appmain", PRI_USER_MAIN, CONFIG_USERMAIN_STACKSIZE, (main_t)CONFIG_USER_ENTRYPOINT, (FAR char *const *)NULL);
+ #endif
++#endif
+ #endif // !CONFIG_APP_BINARY_SEPARATION
+ 
+ 	ASSERT(pid > 0);

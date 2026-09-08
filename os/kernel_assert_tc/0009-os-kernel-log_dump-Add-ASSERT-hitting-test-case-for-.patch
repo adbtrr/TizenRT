@@ -1,0 +1,424 @@
+From 0ca51d550c598a0320c9551eda7d39376dae596a Mon Sep 17 00:00:00 2001
+From: adbtrr_work8_fin_tc <adbtrr_work8_fin_tc@local>
+Date: Tue, 8 Sep 2026 06:22:29 +0000
+Subject: [PATCH 9/9] os/kernel/log_dump: Add ASSERT hitting test case for
+ log_dump_tobuffer
+
+log_dump_tobuffer() appends a compressed character to the tail chunk of
+the log dump queue. log_dump_init() always leaves one chunk queued and
+log_dump_mem_check() never drops the last one, so the queue is never
+empty while the log dump runs. ASSERT(log_dump_tail) catches the
+corrupted case before the NULL chunk is written to.
+
+log_dump_tobuffer() is static and works on file scope state, so add
+log_dump_tobuffer_asserttest() next to it, built only when the test case
+is enabled. It releases every queued chunk and then appends one
+character to the tail which is no longer there.
+
+ - os/kernel/log_dump/log_dump.c : test only entry point for the static
+   buffer append path.
+ - os/include/tinyara/log_dump/log_dump.h : declaration of the entry
+   point.
+ - os/drivers/os_api_test/kernel/test_assert_log_dump.c : kernel side
+   helper reached through the TESTIOC_ASSERT_LOG_DUMP ioctl.
+ - apps/examples/testcase/le_tc/kernel/tc_assert_log_dump.c : user side
+   test case. A return from the ioctl is a test case failure.
+
+Controlled by CONFIG_TC_KERNEL_ASSERT_LOG_DUMP, default n, depends on
+CONFIG_LOG_DUMP. The assertion is an ASSERT(), so CONFIG_DEBUG is not
+required. It crashes the board by design and must be enabled alone.
+---
+ apps/examples/testcase/le_tc/kernel/Kconfig   | 17 ++++
+ apps/examples/testcase/le_tc/kernel/Make.defs |  4 +
+ .../testcase/le_tc/kernel/kernel_tc_main.c    |  4 +
+ .../le_tc/kernel/tc_assert_log_dump.c         | 80 ++++++++++++++++
+ .../testcase/le_tc/kernel/tc_internal.h       |  1 +
+ os/drivers/os_api_test/kernel/Make.defs       |  4 +
+ .../os_api_test/kernel/test_assert_log_dump.c | 93 +++++++++++++++++++
+ os/drivers/os_api_test/os_api_test_drv.c      |  5 +
+ os/drivers/os_api_test/os_api_test_proto.h    |  3 +
+ os/include/tinyara/log_dump/log_dump.h        |  4 +
+ os/include/tinyara/os_api_test_drv.h          |  3 +
+ os/kernel/log_dump/log_dump.c                 | 44 +++++++++
+ 12 files changed, 262 insertions(+)
+ create mode 100644 apps/examples/testcase/le_tc/kernel/tc_assert_log_dump.c
+ create mode 100644 os/drivers/os_api_test/kernel/test_assert_log_dump.c
+
+diff --git a/apps/examples/testcase/le_tc/kernel/Kconfig b/apps/examples/testcase/le_tc/kernel/Kconfig
+index 11ffff4e..64b0742f 100644
+--- a/apps/examples/testcase/le_tc/kernel/Kconfig
++++ b/apps/examples/testcase/le_tc/kernel/Kconfig
+@@ -385,5 +385,22 @@ config TC_KERNEL_ASSERT_CLOCK
+ 		This test case crashes the board on purpose, so enable it
+ 		alone and never together with the other ASSERT test cases.
+ 
++config TC_KERNEL_ASSERT_LOG_DUMP
++	bool "Log dump module ASSERT test"
++	default n
++	depends on LOG_DUMP
++	---help---
++		Hit ASSERT(log_dump_tail) in os/kernel/log_dump/log_dump.c by
++		appending a compressed log character while the chunk queue is
++		empty. log_dump_init() always leaves one chunk queued and
++		log_dump_mem_check() never drops the last one, so an empty
++		queue means the chunk bookkeeping is corrupted.
++
++		The assertion is an ASSERT(), so it is built in whether or not
++		CONFIG_DEBUG is enabled.
++
++		This test case crashes the board on purpose, so enable it
++		alone and never together with the other ASSERT test cases.
++
+ endif #EXAMPLES_TESTCASE_KERNEL
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/Make.defs b/apps/examples/testcase/le_tc/kernel/Make.defs
+index 9e2ed43f..236e3ab1 100644
+--- a/apps/examples/testcase/le_tc/kernel/Make.defs
++++ b/apps/examples/testcase/le_tc/kernel/Make.defs
+@@ -214,6 +214,10 @@ ifeq ($(CONFIG_TC_KERNEL_ASSERT_CLOCK),y)
+   CSRCS += tc_assert_clock.c
+ endif
+ 
++ifeq ($(CONFIG_TC_KERNEL_ASSERT_LOG_DUMP),y)
++  CSRCS += tc_assert_log_dump.c
++endif
++
+ DEPPATH += --dep-path le_tc/kernel
+ VPATH += :le_tc/kernel
+ endif
+diff --git a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+index 6c0f4c9c..1ef387b4 100644
+--- a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
++++ b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+@@ -258,6 +258,10 @@ int tc_kernel_main(int argc, char *argv[])
+ 	clock_assert_main();
+ #endif
+ 
++#ifdef CONFIG_TC_KERNEL_ASSERT_LOG_DUMP
++	log_dump_assert_main();
++#endif
++
+ 	close(g_tc_fd);
+ 	g_tc_fd = -1;
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_assert_log_dump.c b/apps/examples/testcase/le_tc/kernel/tc_assert_log_dump.c
+new file mode 100644
+index 00000000..90b63e73
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/tc_assert_log_dump.c
+@@ -0,0 +1,80 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file tc_assert_log_dump.c
++
++/// @brief Negative test case which hits the ASSERT of os/kernel/log_dump
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++#include <stdio.h>
++#include <stdbool.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <tinyara/os_api_test_drv.h>
++#include "tc_internal.h"
++
++/**
++ * @fn                   :tc_assert_log_dump_tobuffer_empty_chunk_queue
++ * @brief                :Hit ASSERT(log_dump_tail) of log_dump_tobuffer()
++ * @scenario             :Append a compressed log character while the chunk queue is empty
++ * Assertion under test  :os/kernel/log_dump/log_dump.c
++ *                       :ASSERT(log_dump_tail);
++ * Expected result       :The board asserts and this function never returns.
++ *                       :Returning from the ioctl means the ASSERT was not
++ *                       :hit and the test case fails.
++ * @return               :void
++ */
++
++static void tc_assert_log_dump_tobuffer_empty_chunk_queue(void)
++{
++	int fd;
++	int ret_chk;
++
++	fd = tc_get_drvfd();
++	TC_ASSERT_GEQ("tc_get_drvfd", fd, 0);
++
++	printf("\n[TC_ASSERT_LOG_DUMP] Append a compressed log character while the chunk queue is empty\n");
++	printf("[TC_ASSERT_LOG_DUMP] Expecting an assertion at os/kernel/log_dump/log_dump.c\n");
++	printf("[TC_ASSERT_LOG_DUMP] The board is expected to crash dump and reboot now.\n");
++
++	/* The kernel side helper violates the precondition of the API under
++	 * test.  Control is not expected to come back from this ioctl.
++	 */
++
++	ret_chk = ioctl(fd, TESTIOC_ASSERT_LOG_DUMP, 0);
++
++	printf("[TC_ASSERT_LOG_DUMP] ioctl returned %d, the ASSERT was not hit\n", ret_chk);
++	if (ret_chk == -ENOSYS) {
++		printf("[TC_ASSERT_LOG_DUMP] Enable CONFIG_DEBUG so that DEBUGASSERT() is built in\n");
++	}
++
++	TC_ASSERT("log_dump_tobuffer ASSERT(log_dump_tail) was not hit", false);
++
++	TC_SUCCESS_RESULT();
++}
++
++int log_dump_assert_main(void)
++{
++	tc_assert_log_dump_tobuffer_empty_chunk_queue();
++
++	return 0;
++}
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_internal.h b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+index 910a673f..b12473e3 100644
+--- a/apps/examples/testcase/le_tc/kernel/tc_internal.h
++++ b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+@@ -108,6 +108,7 @@ int binary_manager_assert_main(void);
+ int init_assert_main(void);
+ int debug_assert_main(void);
+ int clock_assert_main(void);
++int log_dump_assert_main(void);
+ int tc_get_drvfd(void);
+ 
+ #endif /* __EXAMPLES_TESTCASE_KERNEL_TC_INTERNAL_H */
+diff --git a/os/drivers/os_api_test/kernel/Make.defs b/os/drivers/os_api_test/kernel/Make.defs
+index c0422bc9..5188bbeb 100644
+--- a/os/drivers/os_api_test/kernel/Make.defs
++++ b/os/drivers/os_api_test/kernel/Make.defs
+@@ -70,6 +70,10 @@ ifeq ($(CONFIG_TC_KERNEL_ASSERT_CLOCK),y)
+ CSRCS += test_assert_clock.c
+ endif
+ 
++ifeq ($(CONFIG_TC_KERNEL_ASSERT_LOG_DUMP),y)
++CSRCS += test_assert_log_dump.c
++endif
++
+ CFLAGS += -I$(TOPDIR)/kernel
+ 
+ # Include OS API test driver support
+diff --git a/os/drivers/os_api_test/kernel/test_assert_log_dump.c b/os/drivers/os_api_test/kernel/test_assert_log_dump.c
+new file mode 100644
+index 00000000..b69dd7ae
+--- /dev/null
++++ b/os/drivers/os_api_test/kernel/test_assert_log_dump.c
+@@ -0,0 +1,93 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/****************************************************************************
++ * Kernel side helper for the os/kernel/log_dump ASSERT test case.
++ *
++ * Target assertion:
++ *   os/kernel/log_dump/log_dump.c
++ *     static int log_dump_tobuffer(char ch, size_t *free_size)
++ *     {
++ *             ...
++ *             } else {  // there is place in tail
++ *                     struct log_dump_chunk_s *log_dump_tail =
++ *                             (struct log_dump_chunk_s *)sq_tail(&log_dump_chunks);
++ *                     ASSERT(log_dump_tail);
++ *                     log_dump_tail->arr[compress_curbytes] = ch;
++ *
++ * log_dump_init() always leaves one chunk on the queue and
++ * log_dump_mem_check() never drops the last one, so the queue is never
++ * empty while the log dump is running. An empty queue on this path means
++ * the chunk bookkeeping is corrupted and the compressed character has
++ * nowhere to go, which the assertion catches before the NULL dereference.
++ *
++ * log_dump_tobuffer() is static and works on file scope state, so the test
++ * is driven through log_dump_tobuffer_asserttest() which is built into
++ * log_dump.c only when this test case is enabled.
++ ****************************************************************************/
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++#include <sys/types.h>
++#include <debug.h>
++#include <errno.h>
++
++#include <tinyara/os_api_test_drv.h>
++#ifdef CONFIG_LOG_DUMP
++#include <tinyara/log_dump/log_dump.h>
++#endif
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: test_assert_log_dump
++ *
++ * Description:
++ *   Append a compressed character while the chunk queue is empty so that
++ *   ASSERT(log_dump_tail) in os/kernel/log_dump/log_dump.c is hit.
++ *
++ * Returned Value:
++ *   This function does not return when the test case is built in.
++ *   -ENOSYS is returned otherwise.
++ *
++ ****************************************************************************/
++
++int test_assert_log_dump(int cmd, unsigned long arg)
++{
++	(void)cmd;
++	(void)arg;
++
++#ifdef CONFIG_LOG_DUMP
++	lldbg("Saving a log character with no chunk queued\n");
++
++	/* ASSERT(log_dump_tail) in log_dump_tobuffer() is hit here. */
++
++	log_dump_tobuffer_asserttest();
++
++	return OK;
++#else
++	lldbg("CONFIG_LOG_DUMP is required\n");
++
++	return -ENOSYS;
++#endif
++}
+diff --git a/os/drivers/os_api_test/os_api_test_drv.c b/os/drivers/os_api_test/os_api_test_drv.c
+index 9328cc4e..27bf0224 100644
+--- a/os/drivers/os_api_test/os_api_test_drv.c
++++ b/os/drivers/os_api_test/os_api_test_drv.c
+@@ -230,6 +230,11 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long
+ 	case TESTIOC_ASSERT_CLOCK:
+ 		ret = test_assert_clock(cmd, arg);
+ 		break;
++#endif
++#ifdef CONFIG_TC_KERNEL_ASSERT_LOG_DUMP
++	case TESTIOC_ASSERT_LOG_DUMP:
++		ret = test_assert_log_dump(cmd, arg);
++		break;
+ #endif
+ 	default:
+ 		vdbg("Unrecognized cmd: %d arg: %ld\n", cmd, arg);
+diff --git a/os/drivers/os_api_test/os_api_test_proto.h b/os/drivers/os_api_test/os_api_test_proto.h
+index 15e80dc8..9db64d17 100644
+--- a/os/drivers/os_api_test/os_api_test_proto.h
++++ b/os/drivers/os_api_test/os_api_test_proto.h
+@@ -61,4 +61,7 @@ int test_assert_debug(int cmd, unsigned long arg);
+ #ifdef CONFIG_TC_KERNEL_ASSERT_CLOCK
+ int test_assert_clock(int cmd, unsigned long arg);
+ #endif
++#ifdef CONFIG_TC_KERNEL_ASSERT_LOG_DUMP
++int test_assert_log_dump(int cmd, unsigned long arg);
++#endif
+ #endif
+diff --git a/os/include/tinyara/log_dump/log_dump.h b/os/include/tinyara/log_dump/log_dump.h
+index e41e6d87..529c5a7d 100644
+--- a/os/include/tinyara/log_dump/log_dump.h
++++ b/os/include/tinyara/log_dump/log_dump.h
+@@ -48,3 +48,7 @@
+ #define GET_LOGDUMP_SIZE(fd)        	write(fd, LOGDUMP_GET_SIZE, strlen(LOGDUMP_GET_SIZE) + 1)
+ #define READ_LOGDUMP(fd, buf, bufsize)	read(fd, buf, bufsize)
+ #define CLOSE_LOGDUMP(fd)		close(fd)
++
++#ifdef CONFIG_TC_KERNEL_ASSERT_LOG_DUMP
++void log_dump_tobuffer_asserttest(void);
++#endif
+diff --git a/os/include/tinyara/os_api_test_drv.h b/os/include/tinyara/os_api_test_drv.h
+index 843f4818..ff8f3faa 100644
+--- a/os/include/tinyara/os_api_test_drv.h
++++ b/os/include/tinyara/os_api_test_drv.h
+@@ -117,6 +117,9 @@
+ #ifdef CONFIG_TC_KERNEL_ASSERT_CLOCK
+ #define TESTIOC_ASSERT_CLOCK                   _TESTIOC(31)
+ #endif
++#ifdef CONFIG_TC_KERNEL_ASSERT_LOG_DUMP
++#define TESTIOC_ASSERT_LOG_DUMP                _TESTIOC(32)
++#endif
+ 
+ #define OS_API_TEST_DRVPATH	"/dev/os_api_test"
+ 
+diff --git a/os/kernel/log_dump/log_dump.c b/os/kernel/log_dump/log_dump.c
+index 1cf0fecd..521bcc6a 100644
+--- a/os/kernel/log_dump/log_dump.c
++++ b/os/kernel/log_dump/log_dump.c
+@@ -389,6 +389,50 @@ static int log_dump_tobuffer(char ch, size_t *free_size)
+ 	return LOG_DUMP_OK;
+ }
+ 
++#ifdef CONFIG_TC_KERNEL_ASSERT_LOG_DUMP
++/****************************************************************************
++ * Name: log_dump_tobuffer_asserttest
++ *
++ * Description:
++ *	 Test only entry point which drives log_dump_tobuffer() with an empty
++ *	 chunk queue while the tail chunk is still reported as having room, so
++ *	 that
++ *	   ASSERT(log_dump_tail)
++ *	 is executed. log_dump_init() always keeps at least one chunk queued
++ *	 and log_dump_mem_check() never drops the last one, so an empty queue
++ *	 means the chunk bookkeeping is corrupted and the character has nowhere
++ *	 to go.
++ *
++ *	 This function does not return.
++ *
++ ****************************************************************************/
++void log_dump_tobuffer_asserttest(void)
++{
++	struct log_dump_chunk_s *node;
++	size_t free_size = 0;
++
++	/* Release every queued chunk, leaving sq_tail() with nothing to
++	 * return.
++	 */
++
++	while ((node = (struct log_dump_chunk_s *)sq_remfirst(&log_dump_chunks)) != NULL) {
++		kmm_free(node);
++	}
++
++	log_dump_size = 0;
++	log_dump_chunk_node_cnt = 0;
++	compress_rdptr = 0;
++
++	/* A partially filled tail sends log_dump_tobuffer() down the path
++	 * which appends to the tail chunk.
++	 */
++
++	compress_curbytes = 1;
++
++	(void)log_dump_tobuffer('A', &free_size);
++}
++#endif
++
+ static int compress_full_bufs(void)
+ {
+ 	int ret = 0;

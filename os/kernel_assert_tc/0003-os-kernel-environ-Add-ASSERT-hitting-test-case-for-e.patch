@@ -1,0 +1,337 @@
+From 1fa30ba3e560566f66c441390685634ee57d7c75 Mon Sep 17 00:00:00 2001
+From: adbtrr_work8_fin_tc <adbtrr_work8_fin_tc@local>
+Date: Tue, 8 Sep 2026 06:16:23 +0000
+Subject: [PATCH 3/9] os/kernel/environ: Add ASSERT hitting test case for
+ env_release
+
+env_release() is called from group_leave() when the last member of a
+task group exits. It dereferences the "group" argument right after
+DEBUGASSERT(group), so a NULL group is a caller contract violation.
+
+Add a negative test case which calls env_release() with a NULL task
+group from kernel context so that the assertion in
+os/kernel/environ/env_release.c is executed.
+
+ - os/drivers/os_api_test/kernel/test_assert_environ.c : kernel side
+   helper reached through the TESTIOC_ASSERT_ENVIRON ioctl.
+ - apps/examples/testcase/le_tc/kernel/tc_assert_environ.c : user side
+   test case. A return from the ioctl is reported as a test case failure.
+
+Controlled by CONFIG_TC_KERNEL_ASSERT_ENVIRON, default n, depends on
+CONFIG_DEBUG and on environment variable support. It crashes the board
+by design and must be enabled alone.
+---
+ apps/examples/testcase/le_tc/kernel/Kconfig   | 12 +++
+ apps/examples/testcase/le_tc/kernel/Make.defs |  4 +
+ .../testcase/le_tc/kernel/kernel_tc_main.c    |  4 +
+ .../testcase/le_tc/kernel/tc_assert_environ.c | 80 +++++++++++++++++
+ .../testcase/le_tc/kernel/tc_internal.h       |  1 +
+ os/drivers/os_api_test/kernel/Make.defs       |  4 +
+ .../os_api_test/kernel/test_assert_environ.c  | 87 +++++++++++++++++++
+ os/drivers/os_api_test/os_api_test_drv.c      |  5 ++
+ os/drivers/os_api_test/os_api_test_proto.h    |  3 +
+ os/include/tinyara/os_api_test_drv.h          |  3 +
+ 10 files changed, 203 insertions(+)
+ create mode 100644 apps/examples/testcase/le_tc/kernel/tc_assert_environ.c
+ create mode 100644 os/drivers/os_api_test/kernel/test_assert_environ.c
+
+diff --git a/apps/examples/testcase/le_tc/kernel/Kconfig b/apps/examples/testcase/le_tc/kernel/Kconfig
+index a26cfd3f..116b3761 100644
+--- a/apps/examples/testcase/le_tc/kernel/Kconfig
++++ b/apps/examples/testcase/le_tc/kernel/Kconfig
+@@ -288,5 +288,17 @@ config TC_KERNEL_ASSERT_IRQ
+ 		This test case crashes the board on purpose, so enable it
+ 		alone and never together with the other ASSERT test cases.
+ 
++config TC_KERNEL_ASSERT_ENVIRON
++	bool "Environ module ASSERT test"
++	default n
++	depends on DEBUG
++	depends on !DISABLE_ENVIRON
++	---help---
++		Hit DEBUGASSERT(group) in os/kernel/environ/env_release.c by
++		calling env_release() with a NULL task group.
++
++		This test case crashes the board on purpose, so enable it
++		alone and never together with the other ASSERT test cases.
++
+ endif #EXAMPLES_TESTCASE_KERNEL
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/Make.defs b/apps/examples/testcase/le_tc/kernel/Make.defs
+index 55f4dc61..b12592a8 100644
+--- a/apps/examples/testcase/le_tc/kernel/Make.defs
++++ b/apps/examples/testcase/le_tc/kernel/Make.defs
+@@ -190,6 +190,10 @@ ifeq ($(CONFIG_TC_KERNEL_ASSERT_IRQ),y)
+   CSRCS += tc_assert_irq.c
+ endif
+ 
++ifeq ($(CONFIG_TC_KERNEL_ASSERT_ENVIRON),y)
++  CSRCS += tc_assert_environ.c
++endif
++
+ DEPPATH += --dep-path le_tc/kernel
+ VPATH += :le_tc/kernel
+ endif
+diff --git a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+index 1dcbc2a4..3b07e5ea 100644
+--- a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
++++ b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+@@ -234,6 +234,10 @@ int tc_kernel_main(int argc, char *argv[])
+ 	irq_assert_main();
+ #endif
+ 
++#ifdef CONFIG_TC_KERNEL_ASSERT_ENVIRON
++	environ_assert_main();
++#endif
++
+ 	close(g_tc_fd);
+ 	g_tc_fd = -1;
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_assert_environ.c b/apps/examples/testcase/le_tc/kernel/tc_assert_environ.c
+new file mode 100644
+index 00000000..05022f14
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/tc_assert_environ.c
+@@ -0,0 +1,80 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file tc_assert_environ.c
++
++/// @brief Negative test case which hits the ASSERT of os/kernel/environ
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++#include <stdio.h>
++#include <stdbool.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <tinyara/os_api_test_drv.h>
++#include "tc_internal.h"
++
++/**
++ * @fn                   :tc_assert_environ_env_release_null_group
++ * @brief                :Hit DEBUGASSERT(group) of env_release()
++ * @scenario             :Call env_release() with a NULL task group
++ * Assertion under test  :os/kernel/environ/env_release.c
++ *                       :DEBUGASSERT(group);
++ * Expected result       :The board asserts and this function never returns.
++ *                       :Returning from the ioctl means the ASSERT was not
++ *                       :hit and the test case fails.
++ * @return               :void
++ */
++
++static void tc_assert_environ_env_release_null_group(void)
++{
++	int fd;
++	int ret_chk;
++
++	fd = tc_get_drvfd();
++	TC_ASSERT_GEQ("tc_get_drvfd", fd, 0);
++
++	printf("\n[TC_ASSERT_ENVIRON] Call env_release() with a NULL task group\n");
++	printf("[TC_ASSERT_ENVIRON] Expecting an assertion at os/kernel/environ/env_release.c\n");
++	printf("[TC_ASSERT_ENVIRON] The board is expected to crash dump and reboot now.\n");
++
++	/* The kernel side helper violates the precondition of the API under
++	 * test.  Control is not expected to come back from this ioctl.
++	 */
++
++	ret_chk = ioctl(fd, TESTIOC_ASSERT_ENVIRON, 0);
++
++	printf("[TC_ASSERT_ENVIRON] ioctl returned %d, the ASSERT was not hit\n", ret_chk);
++	if (ret_chk == -ENOSYS) {
++		printf("[TC_ASSERT_ENVIRON] Enable CONFIG_DEBUG so that DEBUGASSERT() is built in\n");
++	}
++
++	TC_ASSERT("env_release DEBUGASSERT(group) was not hit", false);
++
++	TC_SUCCESS_RESULT();
++}
++
++int environ_assert_main(void)
++{
++	tc_assert_environ_env_release_null_group();
++
++	return 0;
++}
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_internal.h b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+index 7143c6bb..5beda1ee 100644
+--- a/apps/examples/testcase/le_tc/kernel/tc_internal.h
++++ b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+@@ -102,6 +102,7 @@ int itc_timer_main(void);
+ int itc_pthread_main(void);
+ int group_assert_main(void);
+ int irq_assert_main(void);
++int environ_assert_main(void);
+ int tc_get_drvfd(void);
+ 
+ #endif /* __EXAMPLES_TESTCASE_KERNEL_TC_INTERNAL_H */
+diff --git a/os/drivers/os_api_test/kernel/Make.defs b/os/drivers/os_api_test/kernel/Make.defs
+index 488d41dd..64cc34e5 100644
+--- a/os/drivers/os_api_test/kernel/Make.defs
++++ b/os/drivers/os_api_test/kernel/Make.defs
+@@ -50,6 +50,10 @@ ifeq ($(CONFIG_TC_KERNEL_ASSERT_IRQ),y)
+ CSRCS += test_assert_irq.c
+ endif
+ 
++ifeq ($(CONFIG_TC_KERNEL_ASSERT_ENVIRON),y)
++CSRCS += test_assert_environ.c
++endif
++
+ CFLAGS += -I$(TOPDIR)/kernel
+ 
+ # Include OS API test driver support
+diff --git a/os/drivers/os_api_test/kernel/test_assert_environ.c b/os/drivers/os_api_test/kernel/test_assert_environ.c
+new file mode 100644
+index 00000000..63ffddf7
+--- /dev/null
++++ b/os/drivers/os_api_test/kernel/test_assert_environ.c
+@@ -0,0 +1,87 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/****************************************************************************
++ * Kernel side helper for the os/kernel/environ ASSERT test case.
++ *
++ * Target assertion:
++ *   os/kernel/environ/env_release.c
++ *     void env_release(FAR struct task_group_s *group)
++ *     {
++ *             DEBUGASSERT(group);
++ *
++ *             if (group->tg_envp) {
++ *
++ * env_release() is called from group_leave() when the last member of a task
++ * group exits and it dereferences "group" straight after the assertion, so a
++ * NULL group is a caller contract violation.
++ *
++ * Requires CONFIG_DEBUG, otherwise DEBUGASSERT() compiles away and the test
++ * is skipped with -ENOSYS.
++ ****************************************************************************/
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++#include <sys/types.h>
++#include <debug.h>
++#include <errno.h>
++
++#include <tinyara/os_api_test_drv.h>
++#include <tinyara/sched.h>
++
++#include "environ/environ.h"
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: test_assert_environ
++ *
++ * Description:
++ *   Violate the env_release() precondition so that DEBUGASSERT(group) in
++ *   os/kernel/environ/env_release.c is hit.
++ *
++ * Returned Value:
++ *   This function does not return when the assertion is enabled.
++ *   -ENOSYS is returned when the assertion is compiled out.
++ *
++ ****************************************************************************/
++
++int test_assert_environ(int cmd, unsigned long arg)
++{
++	(void)cmd;
++	(void)arg;
++
++#if !defined(CONFIG_DISABLE_ENVIRON) && defined(CONFIG_DEBUG)
++	lldbg("Calling env_release() with a NULL task group\n");
++
++	/* DEBUGASSERT(group) in env_release() is hit here. */
++
++	env_release(NULL);
++
++	return OK;
++#else
++	lldbg("CONFIG_DEBUG and environment variable support are required\n");
++
++	return -ENOSYS;
++#endif
++}
+diff --git a/os/drivers/os_api_test/os_api_test_drv.c b/os/drivers/os_api_test/os_api_test_drv.c
+index 5ee2a639..69406e46 100644
+--- a/os/drivers/os_api_test/os_api_test_drv.c
++++ b/os/drivers/os_api_test/os_api_test_drv.c
+@@ -205,6 +205,11 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long
+ 	case TESTIOC_ASSERT_IRQ:
+ 		ret = test_assert_irq(cmd, arg);
+ 		break;
++#endif
++#ifdef CONFIG_TC_KERNEL_ASSERT_ENVIRON
++	case TESTIOC_ASSERT_ENVIRON:
++		ret = test_assert_environ(cmd, arg);
++		break;
+ #endif
+ 	default:
+ 		vdbg("Unrecognized cmd: %d arg: %ld\n", cmd, arg);
+diff --git a/os/drivers/os_api_test/os_api_test_proto.h b/os/drivers/os_api_test/os_api_test_proto.h
+index 5b85ad5a..1a6850a3 100644
+--- a/os/drivers/os_api_test/os_api_test_proto.h
++++ b/os/drivers/os_api_test/os_api_test_proto.h
+@@ -46,4 +46,7 @@ int test_assert_group(int cmd, unsigned long arg);
+ #ifdef CONFIG_TC_KERNEL_ASSERT_IRQ
+ int test_assert_irq(int cmd, unsigned long arg);
+ #endif
++#ifdef CONFIG_TC_KERNEL_ASSERT_ENVIRON
++int test_assert_environ(int cmd, unsigned long arg);
++#endif
+ #endif
+diff --git a/os/include/tinyara/os_api_test_drv.h b/os/include/tinyara/os_api_test_drv.h
+index c1dc4f93..000f025a 100644
+--- a/os/include/tinyara/os_api_test_drv.h
++++ b/os/include/tinyara/os_api_test_drv.h
+@@ -102,6 +102,9 @@
+ #ifdef CONFIG_TC_KERNEL_ASSERT_IRQ
+ #define TESTIOC_ASSERT_IRQ                     _TESTIOC(26)
+ #endif
++#ifdef CONFIG_TC_KERNEL_ASSERT_ENVIRON
++#define TESTIOC_ASSERT_ENVIRON                 _TESTIOC(27)
++#endif
+ 
+ #define OS_API_TEST_DRVPATH	"/dev/os_api_test"
+ 

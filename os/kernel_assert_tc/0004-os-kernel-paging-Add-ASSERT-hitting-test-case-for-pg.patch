@@ -1,0 +1,364 @@
+From 482e6ac4a04a0d5aca57e5a5f6e40417dc546f71 Mon Sep 17 00:00:00 2001
+From: adbtrr_work8_fin_tc <adbtrr_work8_fin_tc@local>
+Date: Tue, 8 Sep 2026 06:17:04 +0000
+Subject: [PATCH 4/9] os/kernel/paging: Add ASSERT hitting test case for
+ pg_miss
+
+pg_miss() blocks the faulting task and then signals the page fill worker
+thread to resolve the fault. If the faulting task were the worker itself
+nothing could ever service the fill, so pg_miss() guards against it with
+DEBUGASSERT(g_pgworker != ftcb->pid).
+
+Add a negative test case which points g_pgworker at the calling task and
+then calls pg_miss(), which is exactly the state the assertion defends
+against. g_pgworker is restored on the path taken when the assertion is
+compiled out.
+
+ - os/drivers/os_api_test/kernel/test_assert_paging.c : kernel side
+   helper reached through the TESTIOC_ASSERT_PAGING ioctl.
+ - apps/examples/testcase/le_tc/kernel/tc_assert_paging.c : user side
+   test case. A return from the ioctl is reported as a test case failure.
+
+Controlled by CONFIG_TC_KERNEL_ASSERT_PAGING, default n, depends on
+CONFIG_PAGING and CONFIG_DEBUG. It crashes the board by design and must
+be enabled alone.
+---
+ apps/examples/testcase/le_tc/kernel/Kconfig   |  14 +++
+ apps/examples/testcase/le_tc/kernel/Make.defs |   4 +
+ .../testcase/le_tc/kernel/kernel_tc_main.c    |   4 +
+ .../testcase/le_tc/kernel/tc_assert_paging.c  |  80 +++++++++++++
+ .../testcase/le_tc/kernel/tc_internal.h       |   1 +
+ os/drivers/os_api_test/kernel/Make.defs       |   4 +
+ .../os_api_test/kernel/test_assert_paging.c   | 110 ++++++++++++++++++
+ os/drivers/os_api_test/os_api_test_drv.c      |   5 +
+ os/drivers/os_api_test/os_api_test_proto.h    |   3 +
+ os/include/tinyara/os_api_test_drv.h          |   3 +
+ 10 files changed, 228 insertions(+)
+ create mode 100644 apps/examples/testcase/le_tc/kernel/tc_assert_paging.c
+ create mode 100644 os/drivers/os_api_test/kernel/test_assert_paging.c
+
+diff --git a/apps/examples/testcase/le_tc/kernel/Kconfig b/apps/examples/testcase/le_tc/kernel/Kconfig
+index 116b3761..1cc8fed0 100644
+--- a/apps/examples/testcase/le_tc/kernel/Kconfig
++++ b/apps/examples/testcase/le_tc/kernel/Kconfig
+@@ -300,5 +300,19 @@ config TC_KERNEL_ASSERT_ENVIRON
+ 		This test case crashes the board on purpose, so enable it
+ 		alone and never together with the other ASSERT test cases.
+ 
++config TC_KERNEL_ASSERT_PAGING
++	bool "Paging module ASSERT test"
++	default n
++	depends on DEBUG
++	depends on PAGING
++	---help---
++		Hit DEBUGASSERT(g_pgworker != ftcb->pid) in
++		os/kernel/paging/pg_miss.c by reporting a page fault from the
++		page fill worker thread, the one thread which is not allowed
++		to take a page fault.
++
++		This test case crashes the board on purpose, so enable it
++		alone and never together with the other ASSERT test cases.
++
+ endif #EXAMPLES_TESTCASE_KERNEL
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/Make.defs b/apps/examples/testcase/le_tc/kernel/Make.defs
+index b12592a8..bd7fb8c2 100644
+--- a/apps/examples/testcase/le_tc/kernel/Make.defs
++++ b/apps/examples/testcase/le_tc/kernel/Make.defs
+@@ -194,6 +194,10 @@ ifeq ($(CONFIG_TC_KERNEL_ASSERT_ENVIRON),y)
+   CSRCS += tc_assert_environ.c
+ endif
+ 
++ifeq ($(CONFIG_TC_KERNEL_ASSERT_PAGING),y)
++  CSRCS += tc_assert_paging.c
++endif
++
+ DEPPATH += --dep-path le_tc/kernel
+ VPATH += :le_tc/kernel
+ endif
+diff --git a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+index 3b07e5ea..2fad1103 100644
+--- a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
++++ b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+@@ -238,6 +238,10 @@ int tc_kernel_main(int argc, char *argv[])
+ 	environ_assert_main();
+ #endif
+ 
++#ifdef CONFIG_TC_KERNEL_ASSERT_PAGING
++	paging_assert_main();
++#endif
++
+ 	close(g_tc_fd);
+ 	g_tc_fd = -1;
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_assert_paging.c b/apps/examples/testcase/le_tc/kernel/tc_assert_paging.c
+new file mode 100644
+index 00000000..d2525c26
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/tc_assert_paging.c
+@@ -0,0 +1,80 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file tc_assert_paging.c
++
++/// @brief Negative test case which hits the ASSERT of os/kernel/paging
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++#include <stdio.h>
++#include <stdbool.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <tinyara/os_api_test_drv.h>
++#include "tc_internal.h"
++
++/**
++ * @fn                   :tc_assert_paging_pg_miss_from_pgworker
++ * @brief                :Hit DEBUGASSERT(g_pgworker != ftcb->pid) of pg_miss()
++ * @scenario             :Report a page fault from the page fill worker thread itself
++ * Assertion under test  :os/kernel/paging/pg_miss.c
++ *                       :DEBUGASSERT(g_pgworker != ftcb->pid);
++ * Expected result       :The board asserts and this function never returns.
++ *                       :Returning from the ioctl means the ASSERT was not
++ *                       :hit and the test case fails.
++ * @return               :void
++ */
++
++static void tc_assert_paging_pg_miss_from_pgworker(void)
++{
++	int fd;
++	int ret_chk;
++
++	fd = tc_get_drvfd();
++	TC_ASSERT_GEQ("tc_get_drvfd", fd, 0);
++
++	printf("\n[TC_ASSERT_PAGING] Report a page fault from the page fill worker thread itself\n");
++	printf("[TC_ASSERT_PAGING] Expecting an assertion at os/kernel/paging/pg_miss.c\n");
++	printf("[TC_ASSERT_PAGING] The board is expected to crash dump and reboot now.\n");
++
++	/* The kernel side helper violates the precondition of the API under
++	 * test.  Control is not expected to come back from this ioctl.
++	 */
++
++	ret_chk = ioctl(fd, TESTIOC_ASSERT_PAGING, 0);
++
++	printf("[TC_ASSERT_PAGING] ioctl returned %d, the ASSERT was not hit\n", ret_chk);
++	if (ret_chk == -ENOSYS) {
++		printf("[TC_ASSERT_PAGING] Enable CONFIG_DEBUG so that DEBUGASSERT() is built in\n");
++	}
++
++	TC_ASSERT("pg_miss DEBUGASSERT(g_pgworker != ftcb->pid) was not hit", false);
++
++	TC_SUCCESS_RESULT();
++}
++
++int paging_assert_main(void)
++{
++	tc_assert_paging_pg_miss_from_pgworker();
++
++	return 0;
++}
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_internal.h b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+index 5beda1ee..9f87192e 100644
+--- a/apps/examples/testcase/le_tc/kernel/tc_internal.h
++++ b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+@@ -103,6 +103,7 @@ int itc_pthread_main(void);
+ int group_assert_main(void);
+ int irq_assert_main(void);
+ int environ_assert_main(void);
++int paging_assert_main(void);
+ int tc_get_drvfd(void);
+ 
+ #endif /* __EXAMPLES_TESTCASE_KERNEL_TC_INTERNAL_H */
+diff --git a/os/drivers/os_api_test/kernel/Make.defs b/os/drivers/os_api_test/kernel/Make.defs
+index 64cc34e5..408d3976 100644
+--- a/os/drivers/os_api_test/kernel/Make.defs
++++ b/os/drivers/os_api_test/kernel/Make.defs
+@@ -54,6 +54,10 @@ ifeq ($(CONFIG_TC_KERNEL_ASSERT_ENVIRON),y)
+ CSRCS += test_assert_environ.c
+ endif
+ 
++ifeq ($(CONFIG_TC_KERNEL_ASSERT_PAGING),y)
++CSRCS += test_assert_paging.c
++endif
++
+ CFLAGS += -I$(TOPDIR)/kernel
+ 
+ # Include OS API test driver support
+diff --git a/os/drivers/os_api_test/kernel/test_assert_paging.c b/os/drivers/os_api_test/kernel/test_assert_paging.c
+new file mode 100644
+index 00000000..d1f75863
+--- /dev/null
++++ b/os/drivers/os_api_test/kernel/test_assert_paging.c
+@@ -0,0 +1,110 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/****************************************************************************
++ * Kernel side helper for the os/kernel/paging ASSERT test case.
++ *
++ * Target assertion:
++ *   os/kernel/paging/pg_miss.c
++ *     void pg_miss(void)
++ *     {
++ *             FAR struct tcb_s *ftcb = this_task();
++ *             ...
++ *             DEBUGASSERT(g_pgworker != ftcb->pid);
++ *
++ * The page fill worker thread is the only thread which can resolve a page
++ * fault, so it must never take one itself. pg_miss() blocks the faulting
++ * task and then signals the worker, which would deadlock the system if the
++ * worker were the faulting task. The assertion catches that case.
++ *
++ * The test case makes the calling task look like the page fill worker by
++ * pointing g_pgworker at it, which is exactly the state the assertion
++ * defends against.
++ *
++ * Requires CONFIG_PAGING and CONFIG_DEBUG.
++ ****************************************************************************/
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++#include <sys/types.h>
++#include <debug.h>
++#include <errno.h>
++
++#include <tinyara/os_api_test_drv.h>
++#include <tinyara/sched.h>
++#ifdef CONFIG_PAGING
++#include <tinyara/page.h>
++#include "paging/paging.h"
++#endif
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: test_assert_paging
++ *
++ * Description:
++ *   Make the caller the page fill worker thread and take a page fault so
++ *   that DEBUGASSERT(g_pgworker != ftcb->pid) in os/kernel/paging/pg_miss.c
++ *   is hit.
++ *
++ * Returned Value:
++ *   This function does not return when the assertion is enabled.
++ *   -ENOSYS is returned when the assertion is compiled out.
++ *
++ ****************************************************************************/
++
++int test_assert_paging(int cmd, unsigned long arg)
++{
++	(void)cmd;
++	(void)arg;
++
++#if defined(CONFIG_PAGING) && defined(CONFIG_DEBUG)
++	pid_t saved_pgworker;
++
++	saved_pgworker = g_pgworker;
++
++	lldbg("Reporting a page fault from the page fill worker thread\n");
++
++	/* Claim the identity of the page fill worker thread. pg_miss() is then
++	 * called by the very thread which is supposed to service the fill.
++	 */
++
++	g_pgworker = this_task()->pid;
++
++	/* DEBUGASSERT(g_pgworker != ftcb->pid) in pg_miss() is hit here. */
++
++	pg_miss();
++
++	/* Not reached while the assertion is built in. Restore the worker so
++	 * that paging keeps working if it ever is.
++	 */
++
++	g_pgworker = saved_pgworker;
++
++	return OK;
++#else
++	lldbg("CONFIG_PAGING and CONFIG_DEBUG are required\n");
++
++	return -ENOSYS;
++#endif
++}
+diff --git a/os/drivers/os_api_test/os_api_test_drv.c b/os/drivers/os_api_test/os_api_test_drv.c
+index 69406e46..b4f6186d 100644
+--- a/os/drivers/os_api_test/os_api_test_drv.c
++++ b/os/drivers/os_api_test/os_api_test_drv.c
+@@ -210,6 +210,11 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long
+ 	case TESTIOC_ASSERT_ENVIRON:
+ 		ret = test_assert_environ(cmd, arg);
+ 		break;
++#endif
++#ifdef CONFIG_TC_KERNEL_ASSERT_PAGING
++	case TESTIOC_ASSERT_PAGING:
++		ret = test_assert_paging(cmd, arg);
++		break;
+ #endif
+ 	default:
+ 		vdbg("Unrecognized cmd: %d arg: %ld\n", cmd, arg);
+diff --git a/os/drivers/os_api_test/os_api_test_proto.h b/os/drivers/os_api_test/os_api_test_proto.h
+index 1a6850a3..d0a8ffdc 100644
+--- a/os/drivers/os_api_test/os_api_test_proto.h
++++ b/os/drivers/os_api_test/os_api_test_proto.h
+@@ -49,4 +49,7 @@ int test_assert_irq(int cmd, unsigned long arg);
+ #ifdef CONFIG_TC_KERNEL_ASSERT_ENVIRON
+ int test_assert_environ(int cmd, unsigned long arg);
+ #endif
++#ifdef CONFIG_TC_KERNEL_ASSERT_PAGING
++int test_assert_paging(int cmd, unsigned long arg);
++#endif
+ #endif
+diff --git a/os/include/tinyara/os_api_test_drv.h b/os/include/tinyara/os_api_test_drv.h
+index 000f025a..f55d0e67 100644
+--- a/os/include/tinyara/os_api_test_drv.h
++++ b/os/include/tinyara/os_api_test_drv.h
+@@ -105,6 +105,9 @@
+ #ifdef CONFIG_TC_KERNEL_ASSERT_ENVIRON
+ #define TESTIOC_ASSERT_ENVIRON                 _TESTIOC(27)
+ #endif
++#ifdef CONFIG_TC_KERNEL_ASSERT_PAGING
++#define TESTIOC_ASSERT_PAGING                  _TESTIOC(28)
++#endif
+ 
+ #define OS_API_TEST_DRVPATH	"/dev/os_api_test"
+ 

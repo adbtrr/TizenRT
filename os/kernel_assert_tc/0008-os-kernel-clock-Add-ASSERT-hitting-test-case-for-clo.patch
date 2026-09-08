@@ -1,0 +1,386 @@
+From 2c5853529e24ad07cfbacfebdf20ffcdec14efd4 Mon Sep 17 00:00:00 2001
+From: adbtrr_work8_fin_tc <adbtrr_work8_fin_tc@local>
+Date: Tue, 8 Sep 2026 06:21:16 +0000
+Subject: [PATCH 8/9] os/kernel/clock: Add ASSERT hitting test case for
+ clock_systimespec
+
+clock_systimespec() turns the wall clock time reported by a high
+resolution RTC into the time since power up by subtracting g_basetime,
+the wall clock time the system booted at. A base time which sits in the
+future of the RTC would make that difference negative, so the subtraction
+is guarded by DEBUGASSERT(ts->tv_sec >= g_basetime.tv_sec).
+
+Add a negative test case which moves g_basetime one year ahead of the
+RTC and then reads the time since power up, which is the inconsistent
+state the assertion is there to catch. g_basetime is restored on the
+path taken when the assertion is compiled out.
+
+ - os/drivers/os_api_test/kernel/test_assert_clock.c : kernel side
+   helper reached through the TESTIOC_ASSERT_CLOCK ioctl.
+ - apps/examples/testcase/le_tc/kernel/tc_assert_clock.c : user side
+   test case. A return from the ioctl is reported as a test case failure.
+
+Controlled by CONFIG_TC_KERNEL_ASSERT_CLOCK, default n, depends on
+CONFIG_RTC_HIRES and CONFIG_DEBUG. The helper reports -EAGAIN when the
+RTC is not running yet. It crashes the board by design and must be
+enabled alone.
+---
+ apps/examples/testcase/le_tc/kernel/Kconfig   |  17 +++
+ apps/examples/testcase/le_tc/kernel/Make.defs |   4 +
+ .../testcase/le_tc/kernel/kernel_tc_main.c    |   4 +
+ .../testcase/le_tc/kernel/tc_assert_clock.c   |  80 +++++++++++
+ .../testcase/le_tc/kernel/tc_internal.h       |   1 +
+ os/drivers/os_api_test/kernel/Make.defs       |   4 +
+ .../os_api_test/kernel/test_assert_clock.c    | 127 ++++++++++++++++++
+ os/drivers/os_api_test/os_api_test_drv.c      |   5 +
+ os/drivers/os_api_test/os_api_test_proto.h    |   3 +
+ os/include/tinyara/os_api_test_drv.h          |   3 +
+ 10 files changed, 248 insertions(+)
+ create mode 100644 apps/examples/testcase/le_tc/kernel/tc_assert_clock.c
+ create mode 100644 os/drivers/os_api_test/kernel/test_assert_clock.c
+
+diff --git a/apps/examples/testcase/le_tc/kernel/Kconfig b/apps/examples/testcase/le_tc/kernel/Kconfig
+index df80ee1c..11ffff4e 100644
+--- a/apps/examples/testcase/le_tc/kernel/Kconfig
++++ b/apps/examples/testcase/le_tc/kernel/Kconfig
+@@ -368,5 +368,22 @@ config TC_KERNEL_ASSERT_DEBUG
+ 		This test case crashes the board on purpose, so enable it
+ 		alone and never together with the other ASSERT test cases.
+ 
++config TC_KERNEL_ASSERT_CLOCK
++	bool "Clock module ASSERT test"
++	default n
++	depends on DEBUG
++	depends on RTC_HIRES
++	---help---
++		Hit DEBUGASSERT(ts->tv_sec >= g_basetime.tv_sec) in
++		os/kernel/clock/clock_systimespec.c by moving the system boot
++		time one year ahead of the RTC and then asking for the time
++		since power up.
++
++		The assertion only exists on the high resolution RTC path, so
++		CONFIG_RTC_HIRES is required and the RTC has to be running.
++
++		This test case crashes the board on purpose, so enable it
++		alone and never together with the other ASSERT test cases.
++
+ endif #EXAMPLES_TESTCASE_KERNEL
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/Make.defs b/apps/examples/testcase/le_tc/kernel/Make.defs
+index 8369cec9..9e2ed43f 100644
+--- a/apps/examples/testcase/le_tc/kernel/Make.defs
++++ b/apps/examples/testcase/le_tc/kernel/Make.defs
+@@ -210,6 +210,10 @@ ifeq ($(CONFIG_TC_KERNEL_ASSERT_DEBUG),y)
+   CSRCS += tc_assert_debug.c
+ endif
+ 
++ifeq ($(CONFIG_TC_KERNEL_ASSERT_CLOCK),y)
++  CSRCS += tc_assert_clock.c
++endif
++
+ DEPPATH += --dep-path le_tc/kernel
+ VPATH += :le_tc/kernel
+ endif
+diff --git a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+index 9adec868..6c0f4c9c 100644
+--- a/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
++++ b/apps/examples/testcase/le_tc/kernel/kernel_tc_main.c
+@@ -254,6 +254,10 @@ int tc_kernel_main(int argc, char *argv[])
+ 	debug_assert_main();
+ #endif
+ 
++#ifdef CONFIG_TC_KERNEL_ASSERT_CLOCK
++	clock_assert_main();
++#endif
++
+ 	close(g_tc_fd);
+ 	g_tc_fd = -1;
+ 
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_assert_clock.c b/apps/examples/testcase/le_tc/kernel/tc_assert_clock.c
+new file mode 100644
+index 00000000..ed7e7285
+--- /dev/null
++++ b/apps/examples/testcase/le_tc/kernel/tc_assert_clock.c
+@@ -0,0 +1,80 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/// @file tc_assert_clock.c
++
++/// @brief Negative test case which hits the ASSERT of os/kernel/clock
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++#include <stdio.h>
++#include <stdbool.h>
++#include <errno.h>
++#include <sys/ioctl.h>
++#include <tinyara/os_api_test_drv.h>
++#include "tc_internal.h"
++
++/**
++ * @fn                   :tc_assert_clock_systimespec_basetime_in_future
++ * @brief                :Hit DEBUGASSERT(ts->tv_sec >= g_basetime.tv_sec) of clock_systimespec()
++ * @scenario             :Read the time since power up while the boot time sits ahead of the RTC
++ * Assertion under test  :os/kernel/clock/clock_systimespec.c
++ *                       :DEBUGASSERT(ts->tv_sec >= g_basetime.tv_sec);
++ * Expected result       :The board asserts and this function never returns.
++ *                       :Returning from the ioctl means the ASSERT was not
++ *                       :hit and the test case fails.
++ * @return               :void
++ */
++
++static void tc_assert_clock_systimespec_basetime_in_future(void)
++{
++	int fd;
++	int ret_chk;
++
++	fd = tc_get_drvfd();
++	TC_ASSERT_GEQ("tc_get_drvfd", fd, 0);
++
++	printf("\n[TC_ASSERT_CLOCK] Read the time since power up while the boot time sits ahead of the RTC\n");
++	printf("[TC_ASSERT_CLOCK] Expecting an assertion at os/kernel/clock/clock_systimespec.c\n");
++	printf("[TC_ASSERT_CLOCK] The board is expected to crash dump and reboot now.\n");
++
++	/* The kernel side helper violates the precondition of the API under
++	 * test.  Control is not expected to come back from this ioctl.
++	 */
++
++	ret_chk = ioctl(fd, TESTIOC_ASSERT_CLOCK, 0);
++
++	printf("[TC_ASSERT_CLOCK] ioctl returned %d, the ASSERT was not hit\n", ret_chk);
++	if (ret_chk == -ENOSYS) {
++		printf("[TC_ASSERT_CLOCK] Enable CONFIG_DEBUG so that DEBUGASSERT() is built in\n");
++	}
++
++	TC_ASSERT("clock_systimespec DEBUGASSERT on the base time was not hit", false);
++
++	TC_SUCCESS_RESULT();
++}
++
++int clock_assert_main(void)
++{
++	tc_assert_clock_systimespec_basetime_in_future();
++
++	return 0;
++}
+diff --git a/apps/examples/testcase/le_tc/kernel/tc_internal.h b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+index c1d72eeb..910a673f 100644
+--- a/apps/examples/testcase/le_tc/kernel/tc_internal.h
++++ b/apps/examples/testcase/le_tc/kernel/tc_internal.h
+@@ -107,6 +107,7 @@ int paging_assert_main(void);
+ int binary_manager_assert_main(void);
+ int init_assert_main(void);
+ int debug_assert_main(void);
++int clock_assert_main(void);
+ int tc_get_drvfd(void);
+ 
+ #endif /* __EXAMPLES_TESTCASE_KERNEL_TC_INTERNAL_H */
+diff --git a/os/drivers/os_api_test/kernel/Make.defs b/os/drivers/os_api_test/kernel/Make.defs
+index e8faeee6..c0422bc9 100644
+--- a/os/drivers/os_api_test/kernel/Make.defs
++++ b/os/drivers/os_api_test/kernel/Make.defs
+@@ -66,6 +66,10 @@ ifeq ($(CONFIG_TC_KERNEL_ASSERT_DEBUG),y)
+ CSRCS += test_assert_debug.c
+ endif
+ 
++ifeq ($(CONFIG_TC_KERNEL_ASSERT_CLOCK),y)
++CSRCS += test_assert_clock.c
++endif
++
+ CFLAGS += -I$(TOPDIR)/kernel
+ 
+ # Include OS API test driver support
+diff --git a/os/drivers/os_api_test/kernel/test_assert_clock.c b/os/drivers/os_api_test/kernel/test_assert_clock.c
+new file mode 100644
+index 00000000..dc00f03c
+--- /dev/null
++++ b/os/drivers/os_api_test/kernel/test_assert_clock.c
+@@ -0,0 +1,127 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++/****************************************************************************
++ * Kernel side helper for the os/kernel/clock ASSERT test case.
++ *
++ * Target assertion:
++ *   os/kernel/clock/clock_systimespec.c
++ *     int clock_systimespec(FAR struct timespec *ts)
++ *     {
++ *             ...
++ *             ret = up_rtc_gettime(ts);
++ *             ...
++ *             DEBUGASSERT(ts->tv_sec >= g_basetime.tv_sec);
++ *
++ * clock_systimespec() converts the wall clock time reported by a high
++ * resolution RTC into the time since power up by subtracting g_basetime,
++ * the wall clock time the system booted at. A base time in the future of
++ * the RTC would make that difference negative, which the assertion rejects
++ * before the following subtraction underflows.
++ *
++ * The test case moves g_basetime one year ahead of the RTC, which is the
++ * inconsistent state the assertion is there to catch.
++ *
++ * Requires CONFIG_RTC_HIRES and CONFIG_DEBUG.
++ ****************************************************************************/
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++#include <sys/types.h>
++#include <time.h>
++#include <debug.h>
++#include <errno.h>
++
++#include <tinyara/arch.h>
++#include <tinyara/clock.h>
++#include <tinyara/os_api_test_drv.h>
++
++#include "clock/clock.h"
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++/* How far ahead of the RTC the boot time is moved. Any positive offset
++ * works, one year keeps the assertion clearly violated.
++ */
++
++#define ASSERT_CLOCK_FUTURE_SEC   (365 * 24 * 60 * 60)
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: test_assert_clock
++ *
++ * Description:
++ *   Move the system boot time ahead of the RTC and read the time since
++ *   power up, so that DEBUGASSERT(ts->tv_sec >= g_basetime.tv_sec) in
++ *   os/kernel/clock/clock_systimespec.c is hit.
++ *
++ * Returned Value:
++ *   This function does not return when the assertion is enabled.
++ *   -ENOSYS is returned when the assertion is compiled out.
++ *
++ ****************************************************************************/
++
++int test_assert_clock(int cmd, unsigned long arg)
++{
++	(void)cmd;
++	(void)arg;
++
++#if defined(CONFIG_RTC_HIRES) && defined(CONFIG_DEBUG)
++	struct timespec saved_basetime;
++	struct timespec ts;
++	int ret;
++
++	if (!g_rtc_enabled) {
++		lldbg("The high resolution RTC is not running yet\n");
++
++		return -EAGAIN;
++	}
++
++	lldbg("Moving the system boot time ahead of the RTC\n");
++
++	saved_basetime = g_basetime;
++	g_basetime.tv_sec += ASSERT_CLOCK_FUTURE_SEC;
++
++	/* DEBUGASSERT(ts->tv_sec >= g_basetime.tv_sec) in clock_systimespec()
++	 * is hit here.
++	 */
++
++	ret = clock_systimespec(&ts);
++
++	/* Not reached while the assertion is built in. Put the boot time back
++	 * so that the system keeps a sane clock if it ever is.
++	 */
++
++	g_basetime = saved_basetime;
++
++	lldbg("clock_systimespec() returned %d\n", ret);
++
++	return ret;
++#else
++	lldbg("CONFIG_RTC_HIRES and CONFIG_DEBUG are required\n");
++
++	return -ENOSYS;
++#endif
++}
+diff --git a/os/drivers/os_api_test/os_api_test_drv.c b/os/drivers/os_api_test/os_api_test_drv.c
+index 2095c132..9328cc4e 100644
+--- a/os/drivers/os_api_test/os_api_test_drv.c
++++ b/os/drivers/os_api_test/os_api_test_drv.c
+@@ -225,6 +225,11 @@ static int os_api_test_drv_ioctl(FAR struct file *filep, int cmd, unsigned long
+ 	case TESTIOC_ASSERT_DEBUG:
+ 		ret = test_assert_debug(cmd, arg);
+ 		break;
++#endif
++#ifdef CONFIG_TC_KERNEL_ASSERT_CLOCK
++	case TESTIOC_ASSERT_CLOCK:
++		ret = test_assert_clock(cmd, arg);
++		break;
+ #endif
+ 	default:
+ 		vdbg("Unrecognized cmd: %d arg: %ld\n", cmd, arg);
+diff --git a/os/drivers/os_api_test/os_api_test_proto.h b/os/drivers/os_api_test/os_api_test_proto.h
+index f20faa7d..15e80dc8 100644
+--- a/os/drivers/os_api_test/os_api_test_proto.h
++++ b/os/drivers/os_api_test/os_api_test_proto.h
+@@ -58,4 +58,7 @@ int test_assert_binary_manager(int cmd, unsigned long arg);
+ #ifdef CONFIG_TC_KERNEL_ASSERT_DEBUG
+ int test_assert_debug(int cmd, unsigned long arg);
+ #endif
++#ifdef CONFIG_TC_KERNEL_ASSERT_CLOCK
++int test_assert_clock(int cmd, unsigned long arg);
++#endif
+ #endif
+diff --git a/os/include/tinyara/os_api_test_drv.h b/os/include/tinyara/os_api_test_drv.h
+index 122fdfc0..843f4818 100644
+--- a/os/include/tinyara/os_api_test_drv.h
++++ b/os/include/tinyara/os_api_test_drv.h
+@@ -114,6 +114,9 @@
+ #ifdef CONFIG_TC_KERNEL_ASSERT_DEBUG
+ #define TESTIOC_ASSERT_DEBUG                   _TESTIOC(30)
+ #endif
++#ifdef CONFIG_TC_KERNEL_ASSERT_CLOCK
++#define TESTIOC_ASSERT_CLOCK                   _TESTIOC(31)
++#endif
+ 
+ #define OS_API_TEST_DRVPATH	"/dev/os_api_test"
+ 
