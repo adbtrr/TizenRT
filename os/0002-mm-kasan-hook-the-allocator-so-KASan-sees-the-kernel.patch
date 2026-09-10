@@ -1,0 +1,528 @@
+From b0235dfd96a6d64646f7011f03dd74b19551ed7e Mon Sep 17 00:00:00 2001
+From: adbtrr_work10_kasan_plan <adbtrr_work10_kasan_plan@local>
+Date: Thu, 10 Sep 2026 11:50:53 +0000
+Subject: [PATCH] mm/kasan: hook the allocator so KASan sees the kernel heap
+
+Phase 2 of the KASan plan. The runtime added in phase 1 is now driven by
+the memory manager, so heap overflow, underflow and use after free are
+detected at the instruction that performs the bad access.
+
+The rule the hooks maintain is that free memory is poisoned and only the
+user area of a live allocation is open. A region starts wholly poisoned,
+so every chunk that is split off and returned to the free list is already
+closed and needs no work.
+
+  mm_initialize.c  register the region before the heap is laid out over
+                   it, and recompute heapend from the size kasan_register()
+                   hands back
+  mm_malloc.c      open the user area, leaving the node header shut so a
+                   write below the returned pointer is an underflow
+  mm_free.c        close the chunk while node->size still describes it
+  mm_memalign.c    open only the aligned chunk that is handed out
+  mm_realloc.c     close the tail released by a shrink, and open a grown
+                   chunk before the copy rather than after
+
+Only the kernel heap is registered. Deciding that needs two conditions,
+not one. The build guard "defined(CONFIG_BUILD_FLAT) || defined(__KERNEL__)"
+says which copy of the memory manager is running: on the bring-up target,
+rtl8730e/loadable_ext_ddr, os/mm is compiled into libkmm with __KERNEL__
+defined and into libumm without it. But binfmt also runs in the kernel and
+calls mm_initialize() from there to build the user heap of every app it
+loads, so the build guard alone would register those too. That would carve
+a shadow out of the app's heap and poison memory whose allocations are
+served by libumm, where the hooks are compiled out and nothing unpoisons
+it; kernel code touching that memory legitimately would then be reported.
+mm_addregion() therefore also tests that the heap lies within g_kmmheap[].
+
+The other four hooks need no such test. Poisoning an address in a heap
+that was never registered fails the shadow lookup and does nothing, so
+they are already inert on app heaps.
+
+Two heap walkers outside os/mm need checking suspended, because os/mm is
+excluded from instrumentation as a directory but they are not, and both
+read poisoned memory on purpose:
+
+  mem_leak_checker.c  walks every node including free ones, then scans raw
+                      RAM. CONFIG_MEM_LEAK_CHECKER is set on the target, so
+                      without this the first leak check panics
+  wd_dbg.c            prints the node headers either side of a wdog
+
+mm_extend() is incompatible with KASan and carries a comment saying so.
+It would extend the heap into the shadow that kasan_register() carved from
+the region tail. It is unreachable in every configuration built today:
+mm_sbrk() is its only in-tree caller and is CONFIG_BUILD_KERNEL only, and
+kmm_extend()/umm_extend() have none.
+
+Also in this commit:
+
+  - kasan_register() rejects a region that overlaps one already
+    registered. Two shadows for the same memory would leave the second
+    permanently stale, which is far harder to diagnose than a refusal.
+  - The disabled-build stubs consume their arguments. Call sites keep a
+    size in a local purely to pass it, and discarding it left that local
+    set but unused in every build with KASan off.
+
+Verified against the real target configuration, by generating config.h
+from build/configs/rtl8730e/loadable_ext_ddr/defconfig and building the
+arch include tree the way "make context" does:
+
+  - All six memory manager files and both kernel files pass -fsyntax-only
+    at 32 bit width with the board warning set, with KASan off and on, in
+    the kernel pass and the user pass.
+  - Preprocessing confirms the split: the user pass keeps only the
+    prototype and emits no call, the kernel pass emits the call behind the
+    g_kmmheap[] bound test.
+  - Eight host tests drive the shadow through the exact hook sequence each
+    patched function performs, checking that the header stays shut around
+    an open block, that adjacent blocks stay separated, that a shrink
+    closes the released tail, that a grow opens before the copy, that
+    memalign opens only the aligned chunk, and that an overlapping region
+    is refused. Shadow overhead measured at 1/31.
+  - The phase 1 suites still pass, including the unaligned granule sweep.
+
+Caught while verifying: kasan_unpoison() used as a bare statement warns
+under -Wunused-value once the stubs consume their arguments, which would
+have broken the -Werror build with KASan off. Its result is now assigned
+at every call site.
+---
+ os/include/tinyara/mm/kasan.h      | 12 ++++++----
+ os/kernel/debug/mem_leak_checker.c | 17 +++++++++++++++
+ os/kernel/wdog/wd_dbg.c            | 12 ++++++++++
+ os/mm/kasan/generic.c              | 14 ++++++++++++
+ os/mm/mm_heap/mm_extend.c          | 14 ++++++++++++
+ os/mm/mm_heap/mm_free.c            | 13 +++++++++++
+ os/mm/mm_heap/mm_initialize.c      | 34 +++++++++++++++++++++++++++++
+ os/mm/mm_heap/mm_malloc.c          | 15 +++++++++++++
+ os/mm/mm_heap/mm_memalign.c        | 13 +++++++++++
+ os/mm/mm_heap/mm_realloc.c         | 35 ++++++++++++++++++++++++++++++
+ 10 files changed, 175 insertions(+), 4 deletions(-)
+
+diff --git a/os/include/tinyara/mm/kasan.h b/os/include/tinyara/mm/kasan.h
+index 0185d125..b576c010 100644
+--- a/os/include/tinyara/mm/kasan.h
++++ b/os/include/tinyara/mm/kasan.h
+@@ -63,12 +63,16 @@
+ 
+ /* With KASan disabled every entry point collapses to nothing, so the call
+  * sites in the memory manager need no conditional compilation of their own.
++ *
++ * Each stub still consumes its arguments. A call site typically keeps a size
++ * in a local just to pass it here, and discarding the argument would leave
++ * that local set but unused in every build with KASan off.
+  */
+ 
+-#define kasan_poison(addr, size)
+-#define kasan_unpoison(addr, size)	((FAR void *)(addr))
+-#define kasan_register(addr, size)
+-#define kasan_unregister(addr)
++#define kasan_poison(addr, size)	do { (void)(addr); (void)(size); } while (0)
++#define kasan_unpoison(addr, size)	((void)(size), (FAR void *)(addr))
++#define kasan_register(addr, size)	do { (void)(addr); (void)(size); } while (0)
++#define kasan_unregister(addr)		do { (void)(addr); } while (0)
+ #define kasan_start()
+ #define kasan_stop()
+ #define kasan_init_early()
+diff --git a/os/kernel/debug/mem_leak_checker.c b/os/kernel/debug/mem_leak_checker.c
+index 41a8ea74..3b78f141 100644
+--- a/os/kernel/debug/mem_leak_checker.c
++++ b/os/kernel/debug/mem_leak_checker.c
+@@ -28,6 +28,7 @@
+ #include <queue.h>
+ #include <sys/types.h>
+ #include <tinyara/mm/mm.h>
++#include <tinyara/mm/kasan.h>
+ #include <tinyara/mm/heap_regioninfo.h>
+ #include <arch/chip/memory_region.h>
+ #include <tinyara/binfmt/elf.h>
+@@ -394,6 +395,17 @@ int run_mem_leak_checker(int checker_pid, char *bin_name)
+ 	int broken_cnt = 0;
+ 	struct mm_heap_s *heap = NULL;
+ 
++	/* The leak checker walks every node in the heap, free ones included, and
++	 * then scans raw RAM. Both read memory that KASan has poisoned on
++	 * purpose: a free chunk, and the header in front of every live chunk.
++	 * This file is outside os/mm and so is instrumented, so checking has to
++	 * be off for the duration or the checker reports its own reads.
++	 *
++	 * Every return below must re-enable it.
++	 */
++
++	kasan_stop();
++
+ 	if (strncmp(bin_name, "kernel", strlen("kernel") + 1) == 0) {
+ 		heap = kmm_get_baseheap();
+ 	} 
+@@ -405,22 +417,26 @@ int run_mem_leak_checker(int checker_pid, char *bin_name)
+ 
+ 	if (!heap) {
+ 		printf("Can't found heap, bin name: %s", bin_name);
++		kasan_start();
+ 		return ERROR;
+ 	}
+ 
+ 	node_cnt = get_node_cnt(heap);
+ 	if (MAX_ALLOC_COUNT < node_cnt) {
+ 		printf("Available buffer size (%d) is small.\nPlease increase CONFIG_MEM_LEAK_CHECKER_MAX_ALLOC_COUNT value more than %d.\n", MAX_ALLOC_COUNT, node_cnt);
++		kasan_start();
+ 		return ERROR;
+ 	}
+ 
+ 	if (g_hash_table || g_node_info) {
+ 		printf("mem_leak_checker is already running.\n");
++		kasan_start();
+ 		return ERROR;
+ 	}
+ 
+ 	if (hash_init() != OK) {
+ 		printf("hash table memory alloc is failed.\n");
++		kasan_start();
+ 		return ERROR;
+ 	}
+ 
+@@ -432,6 +448,7 @@ int run_mem_leak_checker(int checker_pid, char *bin_name)
+ 	print_info(heap, leak_cnt, broken_cnt);
+ 
+ 	hash_deinit();
++	kasan_start();
+ 	return OK;
+ }
+ 
+diff --git a/os/kernel/wdog/wd_dbg.c b/os/kernel/wdog/wd_dbg.c
+index a9bd3d62..6fd431f4 100644
+--- a/os/kernel/wdog/wd_dbg.c
++++ b/os/kernel/wdog/wd_dbg.c
+@@ -33,6 +33,7 @@
+ #include <tinyara/arch.h>
+ #include <tinyara/wdog.h>
+ #include <tinyara/mm/mm.h>
++#include <tinyara/mm/kasan.h>
+ 
+ #include "sched/sched.h"
+ #include "wdog/wdog.h"
+@@ -62,11 +63,22 @@ void wd_corruption_dbg(struct wdog_s *wdog)
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 		// Wdog struct is in heap
+ 		lldbg("WDOG is in HEAP. Print neighbour heap nodes\n");
++
++		/* Reading the node headers around the wdog touches memory KASan
++		 * keeps poisoned, and this file is outside os/mm and so is
++		 * instrumented. Turn checking off across the dump so that a
++		 * diagnostic does not turn into a second, misleading report.
++		 */
++
++		kasan_stop();
++
+ 		wd_node = (uint32_t)wdog - SIZEOF_MM_ALLOCNODE;
+ 		lldbg("PREV WDOG INFO\n");
+ 		mm_dump_node((struct mm_allocnode_s *)(wd_node - (((struct mm_allocnode_s *)wd_node)->preceding & ~MM_ALLOC_BIT)), "PREV HEAP NODE");
+ 		lldbg("NEXT WDOG INFO\n");
+ 		mm_dump_node((struct mm_allocnode_s *)(wd_node + ((struct mm_allocnode_s *)wd_node)->size), "NEXT HEAP NODE");
++
++		kasan_start();
+ #endif
+ 
+ 	} else if (wd_is_prealloc(wdog)) {
+diff --git a/os/mm/kasan/generic.c b/os/mm/kasan/generic.c
+index 307ec077..d3faea23 100644
+--- a/os/mm/kasan/generic.c
++++ b/os/mm/kasan/generic.c
+@@ -348,6 +348,7 @@ void kasan_register(FAR void *addr, FAR size_t *size)
+ {
+ 	FAR struct kasan_region_s *region;
+ 	irqstate_t flags;
++	size_t i;
+ 
+ 	/* A region which cannot hold a shadow and a worthwhile heap is better
+ 	 * left uncovered than carved down to nothing.
+@@ -383,6 +384,19 @@ void kasan_register(FAR void *addr, FAR size_t *size)
+ 		return;
+ 	}
+ 
++	/* Two regions describing the same memory would each carve a shadow and
++	 * the lookup would always find the first, leaving the second stale. That
++	 * is far harder to diagnose than a refusal, so reject the overlap.
++	 */
++
++	for (i = 0; i < g_region_count; i++) {
++		if ((uintptr_t)addr < g_region[i]->end && g_region[i]->begin < (uintptr_t)addr + *size) {
++			spin_unlock_irqrestore(&g_lock, flags);
++			kasan_alert("region %p size %zu overlaps the one at %p\n", addr, *size, (FAR void *)g_region[i]->begin);
++			return;
++		}
++	}
++
+ 	/* Place the descriptor and its shadow in the tail of the region. This
+ 	 * is what keeps KASan free of any linker script requirement.
+ 	 */
+diff --git a/os/mm/mm_heap/mm_extend.c b/os/mm/mm_heap/mm_extend.c
+index c64003c5..71e0e1d1 100644
+--- a/os/mm/mm_heap/mm_extend.c
++++ b/os/mm/mm_heap/mm_extend.c
+@@ -107,6 +107,20 @@ void mm_extend(FAR struct mm_heap_s *heap, FAR void *mem, size_t size, int regio
+ 
+ 	DEBUGASSERT(mm_takesemaphore(heap));
+ 
++	/* NOTE: mm_extend() is not compatible with CONFIG_MM_KASAN.
++	 *
++	 * kasan_register() carves the shadow map for a region out of the tail of
++	 * that region, so the memory immediately above mm_heapend[] is the
++	 * shadow rather than free space. Extending the heap into it would
++	 * overwrite the shadow, and memory added beyond the registered end has
++	 * no shadow to describe it and would silently go unchecked.
++	 *
++	 * This is not reachable in any configuration TizenRT builds today:
++	 * mm_sbrk() is the only in-tree caller and is CONFIG_BUILD_KERNEL only,
++	 * while kmm_extend()/umm_extend() have no callers. Anyone wiring one up
++	 * alongside KASan has to grow the shadow here first.
++	 */
++
+ 	/* Get the terminal node in the old heap.  The block to extend must
+ 	 * immediately follow this node.
+ 	 */
+diff --git a/os/mm/mm_heap/mm_free.c b/os/mm/mm_heap/mm_free.c
+index 6b7043e1..4b0f6f7d 100644
+--- a/os/mm/mm_heap/mm_free.c
++++ b/os/mm/mm_heap/mm_free.c
+@@ -61,6 +61,7 @@
+ #include <unistd.h>
+ 
+ #include <tinyara/mm/mm.h>
++#include <tinyara/mm/kasan.h>
+ 
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ #include <tinyara/sched.h>
+@@ -189,6 +190,18 @@ static void mm_free_internal(FAR struct mm_heap_s *heap, FAR void *mem, mmaddres
+ 	heapinfo_subtract_size(heap, ((struct mm_allocnode_s *)node)->pid, ((struct mm_allocnode_s *)node)->size);
+ 	heapinfo_update_total_size(heap, ((-1) * ((struct mm_allocnode_s *)node)->size), ((struct mm_allocnode_s *)node)->pid);
+ #endif
++	/* Close the chunk off before it is merged into the free list, while
++	 * node->size still describes the allocation that is being released. Any
++	 * later access through the freed pointer is then reported as a
++	 * use-after-free.
++	 *
++	 * This must stay after the delay list early return above. That path
++	 * links the block into the delay list through its own first word, and
++	 * poisoning before it would flag the allocator's own bookkeeping.
++	 */
++
++	kasan_poison(mem, node->size - SIZEOF_MM_ALLOCNODE);
++
+ 	node->preceding &= ~MM_ALLOC_BIT;
+ #ifdef CONFIG_DEBUG_MM_FREEINFO
+ 	/* Record free metadata and quarantine sequence */
+diff --git a/os/mm/mm_heap/mm_initialize.c b/os/mm/mm_heap/mm_initialize.c
+index 692de114..75d07aa6 100644
+--- a/os/mm/mm_heap/mm_initialize.c
++++ b/os/mm/mm_heap/mm_initialize.c
+@@ -63,6 +63,7 @@
+ 
+ #include <tinyara/sched.h>
+ #include <tinyara/mm/mm.h>
++#include <tinyara/mm/kasan.h>
+ 
+ /****************************************************************************
+  * Pre-processor Definitions
+@@ -139,6 +140,39 @@ int mm_addregion(FAR struct mm_heap_s *heap, FAR void *heapstart, size_t heapsiz
+ 	}
+ 	heapsize = heapend - heapbase;
+ 
++#if defined(CONFIG_BUILD_FLAT) || defined(__KERNEL__)
++	/* Hand the region to KASan before the heap is laid out over it, but only
++	 * if this is the kernel heap.
++	 *
++	 * The build guard alone is not enough to decide that. It says which copy
++	 * of the memory manager is running, not which heap is being built: in a
++	 * protected build os/mm is compiled into libkmm with __KERNEL__ defined
++	 * and into libumm without it, but binfmt runs in the kernel and calls
++	 * mm_initialize() from there to build the user heap of every app it
++	 * loads. Registering those would carve a shadow out of the app's heap
++	 * and poison memory that libumm, where the app's own allocations are
++	 * served, never unpoisons. Kernel code touching that memory legitimately
++	 * would then be reported.
++	 *
++	 * kasan_register() carves its shadow out of the tail of the region and
++	 * reduces heapsize by that much, so heapend has to be recomputed from
++	 * the reduced size. Registering after the guard nodes were placed would
++	 * put the heap and its own shadow on top of each other.
++	 */
++
++	if (heap >= g_kmmheap && heap < &g_kmmheap[CONFIG_KMM_NHEAPS]) {
++		kasan_register((FAR void *)heapbase, &heapsize);
++
++		heapend = MM_ALIGN_DOWN(heapbase + heapsize);
++		heapsize = heapend - heapbase;
++
++		if (heapbase >= (uintptr_t)heapend) {
++			mdbg("ERROR : region too small once the KASan shadow is carved out.\n");
++			return -EINVAL;
++		}
++	}
++#endif
++
+ 	mlldbg("Region %d: base=%p size=%u\n", IDX + 1, heapstart, heapsize);
+ 
+ 	/* Add the size of this region to the total size of the heap */
+diff --git a/os/mm/mm_heap/mm_malloc.c b/os/mm/mm_heap/mm_malloc.c
+index 0420cc87..47abe408 100644
+--- a/os/mm/mm_heap/mm_malloc.c
++++ b/os/mm/mm_heap/mm_malloc.c
+@@ -59,6 +59,7 @@
+ #include <debug.h>
+ 
+ #include <tinyara/mm/mm.h>
++#include <tinyara/mm/kasan.h>
+ 
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ #include  <tinyara/sched.h>
+@@ -147,6 +148,7 @@ FAR void *mm_malloc(FAR struct mm_heap_s *heap, size_t size, mmaddress_t caller_
+ {
+ 	FAR struct mm_freenode_s *node;
+ 	void *ret = NULL;
++	size_t nodesize = 0;
+ 	int ndx;
+ 	bool gc_done = false;
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+@@ -293,10 +295,23 @@ retry_after_gc:
+ 		heapinfo_update_total_size(heap, allocnode->size, allocnode->pid);
+ #endif
+ 		ret = (void *)((char *)allocnode + SIZEOF_MM_ALLOCNODE);
++		nodesize = allocnode->size;
+ 	}
+ 
+ 	mm_givesemaphore(heap);
+ 
++	if (ret) {
++		/* Open up the user area of the chunk. The node header in front of
++		 * it stays poisoned, which is what turns a write just below the
++		 * returned pointer into a reported underflow.
++		 *
++		 * Done outside the semaphore: kasan_unpoison() takes a spinlock of
++		 * its own and there is no reason to hold both.
++		 */
++
++		ret = kasan_unpoison(ret, nodesize - SIZEOF_MM_ALLOCNODE);
++	}
++
+ 	if (!ret && gc_done == false) {
+ 		mdbg("Allocation failed!!! We dont have enough memory. Try to free dead task stack areas\n");
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+diff --git a/os/mm/mm_heap/mm_memalign.c b/os/mm/mm_heap/mm_memalign.c
+index 7410e60e..a47b0d63 100644
+--- a/os/mm/mm_heap/mm_memalign.c
++++ b/os/mm/mm_heap/mm_memalign.c
+@@ -64,6 +64,7 @@
+ #endif
+ #endif
+ #include <tinyara/mm/mm.h>
++#include <tinyara/mm/kasan.h>
+ 
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ #include  <tinyara/sched.h>
+@@ -111,6 +112,7 @@ FAR void *mm_memalign(FAR struct mm_heap_s *heap, size_t alignment, size_t size,
+ {
+ 	FAR struct mm_freenode_s *node = NULL;
+ 	void *ret = NULL;
++	size_t nodesize = 0;
+ 	int ndx;
+ 	size_t newsize;
+ 	FAR struct mm_allocnode_s *alignchunk = NULL;
+@@ -273,10 +275,21 @@ retry_after_gc:
+ #endif
+ 
+ 		ret = (void *)alignchunk;
++		nodesize = node->size;
+ 	}
+ 
+ 	mm_givesemaphore(heap);
+ 
++	if (ret) {
++		/* Only the aligned chunk that is handed out is opened up. The
++		 * remainders split off in front of and behind it went back to the
++		 * free list and were never unpoisoned, since a region starts out
++		 * wholly poisoned and only live allocations are cleared.
++		 */
++
++		ret = kasan_unpoison(ret, nodesize - SIZEOF_MM_ALLOCNODE);
++	}
++
+ 	if (!ret && gc_done == false) {
+ 		mdbg("Allocation failed!!! We dont have enough memory. Try to free dead task stack areas\n");
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+diff --git a/os/mm/mm_heap/mm_realloc.c b/os/mm/mm_heap/mm_realloc.c
+index 19f2cb17..2381fef3 100644
+--- a/os/mm/mm_heap/mm_realloc.c
++++ b/os/mm/mm_heap/mm_realloc.c
+@@ -64,6 +64,7 @@
+ #include <tinyara/sched.h>
+ #endif
+ #include <tinyara/mm/mm.h>
++#include <tinyara/mm/kasan.h>
+ #include "mm_node.h"
+ 
+ /****************************************************************************
+@@ -110,6 +111,7 @@ FAR void *mm_realloc(FAR struct mm_heap_s *heap, FAR void *oldmem, size_t size,
+ #endif
+ 	size_t newsize;
+ 	size_t oldsize;
++	size_t nodesize = 0;
+ #ifndef CONFIG_REALLOC_DISABLE_NEIGHBOR_EXTENSION
+ 	size_t prevsize = 0;
+ 	size_t nextsize = 0;
+@@ -159,6 +161,15 @@ FAR void *mm_realloc(FAR struct mm_heap_s *heap, FAR void *oldmem, size_t size,
+ #endif
+ 
+ 			mm_shrinkchunk(heap, oldnode, newsize);
++
++			/* Close off whatever the shrink handed back to the free list.
++			 * That tail was part of the live allocation and so was open;
++			 * mm_shrinkchunk() may keep it if the remainder is too small to
++			 * split, in which case oldnode->size is unchanged and this
++			 * poisons nothing.
++			 */
++
++			kasan_poison((FAR char *)oldnode + oldnode->size, oldsize - oldnode->size);
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 			/* update the chunk to realloc task information */
+ 			heapinfo_update_node(oldnode, caller_retaddr);
+@@ -300,6 +311,16 @@ FAR void *mm_realloc(FAR struct mm_heap_s *heap, FAR void *oldmem, size_t size,
+ 			 */
+ 
+ 			newmem = (FAR void *)((FAR char *)newnode + SIZEOF_MM_ALLOCNODE);
++
++			/* Open the grown chunk up before the copy, not after. The chunk
++			 * now covers memory that was free, and therefore poisoned, and
++			 * memcpy() lives in lib/libc which is instrumented. Copying into
++			 * still poisoned memory would be reported as a genuine looking
++			 * use-after-free coming from inside realloc.
++			 */
++
++			newmem = kasan_unpoison(newmem, oldsize - SIZEOF_MM_ALLOCNODE);
++
+ 			memcpy(newmem, oldmem, oldsize - SIZEOF_MM_ALLOCNODE);
+ 		}
+ 
+@@ -352,7 +373,21 @@ FAR void *mm_realloc(FAR struct mm_heap_s *heap, FAR void *oldmem, size_t size,
+ 		heapinfo_update_total_size(heap, oldnode->size, oldnode->pid);
+ #endif
+ 
++		/* Read the final size while the heap is still locked; another CPU
++		 * may take the semaphore the moment it is released.
++		 */
++
++		nodesize = oldnode->size;
++
+ 		mm_givesemaphore(heap);
++
++		/* Open up the whole grown chunk. This covers the extension into the
++		 * next node, which needs no copy and so is not handled above, and is
++		 * harmlessly repeated for the previous node case.
++		 */
++
++		newmem = kasan_unpoison(newmem, nodesize - SIZEOF_MM_ALLOCNODE);
++
+ 		return newmem;
+ 	}
+ 
+-- 
+2.43.0
+
