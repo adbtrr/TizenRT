@@ -348,6 +348,7 @@ void kasan_register(FAR void *addr, FAR size_t *size)
 {
 	FAR struct kasan_region_s *region;
 	irqstate_t flags;
+	size_t i;
 
 	/* A region which cannot hold a shadow and a worthwhile heap is better
 	 * left uncovered than carved down to nothing.
@@ -381,6 +382,19 @@ void kasan_register(FAR void *addr, FAR size_t *size)
 		spin_unlock_irqrestore(&g_lock, flags);
 		kasan_alert("no free region slot for %p, raise CONFIG_MM_KASAN_REGIONS above %d\n", addr, CONFIG_MM_KASAN_REGIONS);
 		return;
+	}
+
+	/* Two regions describing the same memory would each carve a shadow and
+	 * the lookup would always find the first, leaving the second stale. That
+	 * is far harder to diagnose than a refusal, so reject the overlap.
+	 */
+
+	for (i = 0; i < g_region_count; i++) {
+		if ((uintptr_t)addr < g_region[i]->end && g_region[i]->begin < (uintptr_t)addr + *size) {
+			spin_unlock_irqrestore(&g_lock, flags);
+			kasan_alert("region %p size %zu overlaps the one at %p\n", addr, *size, (FAR void *)g_region[i]->begin);
+			return;
+		}
 	}
 
 	/* Place the descriptor and its shadow in the tail of the region. This

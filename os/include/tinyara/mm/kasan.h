@@ -63,12 +63,16 @@
 
 /* With KASan disabled every entry point collapses to nothing, so the call
  * sites in the memory manager need no conditional compilation of their own.
+ *
+ * Each stub still consumes its arguments. A call site typically keeps a size
+ * in a local just to pass it here, and discarding the argument would leave
+ * that local set but unused in every build with KASan off.
  */
 
-#define kasan_poison(addr, size)
-#define kasan_unpoison(addr, size)	((FAR void *)(addr))
-#define kasan_register(addr, size)
-#define kasan_unregister(addr)
+#define kasan_poison(addr, size)	do { (void)(addr); (void)(size); } while (0)
+#define kasan_unpoison(addr, size)	((void)(size), (FAR void *)(addr))
+#define kasan_register(addr, size)	do { (void)(addr); (void)(size); } while (0)
+#define kasan_unregister(addr)		do { (void)(addr); } while (0)
 #define kasan_start()
 #define kasan_stop()
 #define kasan_init_early()
