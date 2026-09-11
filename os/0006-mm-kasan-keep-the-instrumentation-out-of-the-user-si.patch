@@ -1,0 +1,120 @@
+From 62155b7c088f11f52cb0e78be36ada911c74f69a Mon Sep 17 00:00:00 2001
+From: adbtrr_work10_kasan_plan <adbtrr_work10_kasan_plan@local>
+Date: Fri, 11 Sep 2026 10:01:39 +0000
+Subject: [PATCH] mm/kasan: keep the instrumentation out of the user side link
+
+Building rtl8730e/loadable_ext_ddr with KASan on fails at the common
+binary link:
+
+  gnu_unwind_find_exidx.o: in function `up_init_exidx':
+  undefined reference to `__asan_store4_noabort'
+
+up_init_exidx() is defined in apps/platform/gnu/gnu_unwind_find_exidx.c,
+which this configuration compiles because it sets both
+CONFIG_SUPPORT_COMMON_BINARY and CONFIG_LIBCXX_EXCEPTION. It lands in
+libapps, and up_userspace_common.o pulls it into the common binary
+through the .register_exidx entry of the userspace table. That link
+carries USERLIBS and libgcc and nothing else, so there is no libkmm and
+no KASan runtime on it; the reference cannot resolve at any link order.
+A flat configuration never compiles the file and never sees this.
+
+The board Make.defs decides whether to instrument a pass by testing
+KERNEL, and that test is an opt out: KERNEL=y instruments, KERNEL=n does
+not, and KERNEL unset instruments. Unset is right for the arch and board
+passes, which are kernel side and are invoked without it. It is wrong for
+anything on the user side that loses the variable, and the failure then
+surfaces as an unresolvable symbol at the end of a full build rather than
+where the flag was chosen.
+
+Rather than chase the variable, exclude the user side explicitly at the
+two places it is built:
+
+apps/Make.defs is included by every one of the 166 Makefiles under apps/,
+after each has included the board Make.defs, so appending the disable
+there wins for the whole tree regardless of what KERNEL holds.
+apps/import/Make.defs does reassign CFLAGS after this file, but only
+Directory.mk includes it and that compiles nothing, so no object is built
+with the reassigned value.
+
+os/Makefile.unix builds os/userspace with CFLAGS forced down as a command
+line variable, which overrides anything the sub-make sets for itself, and
+expands it in a context where KERNEL is not set. Adding KERNEL=n there
+would not help for that reason, so the disable is appended to the value
+as it is built, where it is the last flag and wins. up_userspace.c
+currently defines no functions, only a const structure, so it emits no
+calls today; this stops the first function added to it from breaking the
+link.
+
+Verified by evaluating the real board Make.defs: in the apps pass with
+KERNEL unset, which is the case that failed, -fsanitize is still present
+and -fno-sanitize now follows it and takes effect. With KERNEL=n nothing
+changes. With CONFIG_MM_KASAN off neither hunk adds anything.
+---
+ apps/Make.defs   | 19 +++++++++++++++++++
+ os/Makefile.unix | 13 ++++++++++++-
+ 2 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/apps/Make.defs b/apps/Make.defs
+index 4dacd4f2..9a903d11 100644
+--- a/apps/Make.defs
++++ b/apps/Make.defs
+@@ -53,6 +53,25 @@
+ 
+ include $(TOPDIR)/.config
+ 
++# KASan instruments the kernel only.
++#
++# Everything built under apps/ is archived into libapps and linked into the
++# user and common binaries. Those link lines carry no KASan runtime: it lives
++# in libkmm, which only the kernel image links. An instrumented object here is
++# therefore an unresolvable reference rather than a slow one, and the failure
++# lands at the end of a full build.
++#
++# os/LibTargets.mk does pass KERNEL=n when it builds libapps, which is what
++# the board Make.defs tests before adding -fsanitize=kernel-address. This does
++# not rely on that reaching every sub-make below it. The test there is an opt
++# out, so a pass which loses the variable is instrumented rather than skipped,
++# and this file is included by every Makefile under apps/.
++
++ifeq ($(CONFIG_MM_KASAN),y)
++CFLAGS += -fno-sanitize=kernel-address
++CXXFLAGS += -fno-sanitize=kernel-address
++endif
++
+ # Builtin Registration
+ 
+ BUILTIN_REGISTRY = $(APPDIR)$(DELIM)builtin$(DELIM)registry
+diff --git a/os/Makefile.unix b/os/Makefile.unix
+index 316950c8..29c12657 100644
+--- a/os/Makefile.unix
++++ b/os/Makefile.unix
+@@ -205,6 +205,17 @@ endif
+ 
+ LINKLIBS = $(patsubst $(LIBRARIES_DIR)/%,%,$(TINYARALIBS))
+ 
++# up_userspace.c is compiled into the common binary, which is linked without
++# libkmm and so carries no KASan runtime. The rule below forces CFLAGS down to
++# that sub-make as a command line variable, which overrides anything the
++# sub-make sets for itself, and the value is expanded here where KERNEL is not
++# set and instrumentation is therefore on. Append the disable at the point the
++# value is built, where it is the last flag and wins.
++
++ifeq ($(CONFIG_MM_KASAN),y)
++KASAN_USER_OFF = -fno-sanitize=kernel-address
++endif
++
+ # Export tool definitions
+ 
+ MKEXPORT = tools/mkexport.sh
+@@ -465,7 +476,7 @@ ifeq ($(CONFIG_ELF),y)
+ 	$(Q) $(LD) -r -o $(OUTBIN_DIR)/$(CONFIG_COMMON_BINARY_NAME) -T $(TOPDIR)/userspace/userspace_apps.ld -L $(LIBRARIES_DIR) --start-group $(USERLIBS) $(LIBGCC) $(LIBSUPXX) --end-group $$(cat $(OUTBIN_DIR)/lib_symbols.txt)
+ else
+ 	$(Q) $(TOPDIR)/tools/mkldscript.py
+-	$(Q) $(MAKE) -C userspace CFLAGS="$(CFLAGS)" TOPDIR="$(TOPDIR)" common_obj
++	$(Q) $(MAKE) -C userspace CFLAGS="$(CFLAGS) $(KASAN_USER_OFF)" TOPDIR="$(TOPDIR)" common_obj
+ ifneq ($(CONFIG_XIP_ELF_WARCHIVE), y)
+ 	$(Q) $(MAKE) -C $(LOADABLE_APPDIR) TOPDIR="$(TOPDIR)" LOADABLEDIR="${LOADABLE_APPDIR}" LIBRARIES_DIR="$(LIBRARIES_DIR)" USERLIBS="$(USERLIBS)" undefsym KERNEL=n
+ 	$(Q) $(LD) -o $(OUTBIN_DIR)/$(CONFIG_COMMON_BINARY_NAME) -T $(OUTBIN_DIR)/common_0.ld -T $(TOPDIR)/../build/configs/$(CONFIG_ARCH_BOARD)/scripts/xipelf/userspace_all.ld $(TOPDIR)/userspace/up_userspace_common.o -L $(LIBRARIES_DIR) --start-group $(USERLIBS) $(LIBGCC) $(LIBSUPXX) --end-group $$(cat $(OUTBIN_DIR)/lib_symbols.txt) -Map $(OUTBIN_DIR)/$(CONFIG_COMMON_BINARY_NAME).map
+-- 
+2.43.0
+
