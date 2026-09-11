@@ -10,6 +10,20 @@
 # Example: ./kasan_toolchain_gate.sh arm-none-eabi-gcc
 
 CC=${1:-arm-none-eabi-gcc}
+
+# Use the binutils that belong to this compiler. Inside the TizenRT build
+# container a bare "nm" is the host x86 one, which cannot read an
+# arm-none-eabi object: the symbol checks below would then find nothing and
+# report false failures.
+case "$CC" in
+	*gcc) PREFIX=${CC%gcc} ;;
+	*)    PREFIX= ;;
+esac
+NM=${PREFIX}nm
+SIZE=${PREFIX}size
+command -v "$NM"   >/dev/null 2>&1 || NM=nm
+command -v "$SIZE" >/dev/null 2>&1 || SIZE=size
+
 TMP=$(mktemp -d) || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
@@ -30,6 +44,7 @@ if [ -z "$v" ]; then
 	exit 1
 fi
 echo "version : $v"
+echo "binutils: $NM, $SIZE"
 echo
 
 # The sample exercises loads and stores of several widths, a bulk copy that
@@ -75,7 +90,7 @@ if ! $CC $KFLAGS -O2 -c "$TMP/t.c" -o "$TMP/t.o" 2>"$TMP/e"; then
 	exit 1
 fi
 
-syms=$(nm -u "$TMP/t.o" 2>/dev/null | grep -o '__asan[A-Za-z0-9_]*' | sort -u)
+syms=$($NM -u "$TMP/t.o" 2>/dev/null | grep -o '__asan[A-Za-z0-9_]*' | sort -u)
 if [ -n "$syms" ]; then
 	pass "instrumentation emitted ($(echo "$syms" | wc -l | tr -d ' ') distinct entry points)"
 else
@@ -136,9 +151,9 @@ fi
 
 # ---- 8. cost estimate ----------------------------------------------------
 $CC -O2 -c "$TMP/t.c" -o "$TMP/plain.o" 2>/dev/null
-if command -v size >/dev/null 2>&1; then
-	a=$(size "$TMP/plain.o" 2>/dev/null | awk 'NR==2{print $1}')
-	b=$(size "$TMP/t.o"     2>/dev/null | awk 'NR==2{print $1}')
+if command -v "$SIZE" >/dev/null 2>&1; then
+	a=$($SIZE "$TMP/plain.o" 2>/dev/null | awk 'NR==2{print $1}')
+	b=$($SIZE "$TMP/t.o"    2>/dev/null | awk 'NR==2{print $1}')
 	if [ -n "$a" ] && [ -n "$b" ] && [ "$a" -gt 0 ]; then
 		echo "  INFO  text on this sample: $a -> $b bytes (+$(( (b - a) * 100 / a ))%)"
 		echo "        access-dense sample, so a whole image grows less. Budget 30-50%."
