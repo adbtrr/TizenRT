@@ -1,0 +1,92 @@
+From b0c9c03753f48d7e968d349deabbbf0e02ecc3fe Mon Sep 17 00:00:00 2001
+From: adbtrr_work10_kasan_plan <adbtrr_work10_kasan_plan@local>
+Date: Fri, 11 Sep 2026 15:57:18 +0000
+Subject: [PATCH] mm/kasan: collapse the entry points in the user pass of a
+ split build
+
+Linking libumm fails with KASan on:
+
+  mm_free.o: in function `mm_free_internal':
+  undefined reference to `kasan_poison'
+
+os/mm is compiled twice in a protected build, into libkmm with __KERNEL__
+defined and into libumm without it. os/mm/kasan/Make.defs builds the
+runtime only for the first of those, deliberately, because the user heap
+is never registered and carrying the entry points into the user image
+would add several kilobytes for calls that could only ever find no region
+and return.
+
+The allocator hooks did not agree with that. mm_initialize.c guards its
+kasan_register() call on CONFIG_BUILD_FLAT or __KERNEL__, but the six
+poison and unpoison calls added alongside it were left unguarded, so the
+user pass emitted real calls to a runtime that is not linked into it.
+That is an undefined reference in every user image, and it surfaces at
+the end of a full build rather than where the decision was made.
+
+Guard the whole API in the header instead of at each call site: the entry
+points are real in a flat build and in the kernel pass, and collapse to
+the existing no-op stubs everywhere else. The condition is the negation of
+the one mm_initialize.c already applies, so registration and the poison
+calls now agree on which pass owns KASan, and the shared sources need no
+conditional compilation of their own.
+
+The stubs consume their arguments, so the locals the call sites keep just
+to pass a size do not become set but unused in the user pass.
+
+Verified by compiling the call site pattern in all four combinations and
+counting undefined references: KASan off 0, flat build 6, protected
+kernel pass 6, protected user pass 6 before this change and 0 after. A
+link against an archive built without the runtime, which is what libumm
+is, reproduces the reported error before and succeeds after. The self
+test app, which is user space and includes this header for the case enum
+only, is unaffected: the enum is declared outside the guard.
+---
+ os/include/tinyara/mm/kasan.h | 26 ++++++++++++++++++++++----
+ 1 file changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/os/include/tinyara/mm/kasan.h b/os/include/tinyara/mm/kasan.h
+index 755ec1c8..15082a01 100644
+--- a/os/include/tinyara/mm/kasan.h
++++ b/os/include/tinyara/mm/kasan.h
+@@ -82,10 +82,28 @@ enum kasan_selftest_e {
+  * Pre-processor Definitions
+  ****************************************************************************/
+ 
+-#ifndef CONFIG_MM_KASAN
++/* The entry points are real in two cases only: a flat build, where there is
++ * one image and one heap, and the kernel pass of a split build, which is the
++ * pass that compiles with __KERNEL__ defined.
++ *
++ * Everywhere else they collapse to nothing. The user pass of a split build
++ * compiles the same memory manager sources, but allocates from a heap that is
++ * never registered, and os/mm/kasan/Make.defs deliberately keeps the runtime
++ * out of libumm. Leaving the call sites as real calls there would put an
++ * undefined reference to kasan_poison into every user image, for a call that
++ * could only ever find no region and return.
++ *
++ * This is the same test mm_initialize.c applies before registering a heap,
++ * written the other way round, so registration and the poison calls agree on
++ * which pass owns KASan.
++ */
++
++#if !defined(CONFIG_MM_KASAN) || \
++	(!defined(CONFIG_BUILD_FLAT) && !defined(__KERNEL__))
+ 
+-/* With KASan disabled every entry point collapses to nothing, so the call
+- * sites in the memory manager need no conditional compilation of their own.
++/* With KASan disabled, or in the user pass, every entry point collapses to
++ * nothing, so the call sites in the memory manager need no conditional
++ * compilation of their own.
+  *
+  * Each stub still consumes its arguments. A call site typically keeps a size
+  * in a local just to pass it here, and discarding the argument would leave
+@@ -253,5 +271,5 @@ int kasan_selftest(int testcase);
+ }
+ #endif
+ 
+-#endif							/* CONFIG_MM_KASAN */
++#endif							/* KASan real in this pass */
+ #endif							/* __INCLUDE_MM_KASAN_H */
+-- 
+2.43.0
+
