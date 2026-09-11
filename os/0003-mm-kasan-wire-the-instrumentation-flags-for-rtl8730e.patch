@@ -1,0 +1,224 @@
+From 4b4a2561de364c182ebea6ae5f2750a400f8e2f5 Mon Sep 17 00:00:00 2001
+From: adbtrr_work10_kasan_plan <adbtrr_work10_kasan_plan@local>
+Date: Fri, 11 Sep 2026 08:10:29 +0000
+Subject: [PATCH] mm/kasan: wire the instrumentation flags for rtl8730e
+
+Phase 3 of the KASan plan. The runtime from phase 1 and the allocator
+hooks from phase 2 are dormant until the compiler is told to instrument
+anything; this adds the flags that do it, scoped so that only the code
+KASan can actually cover is paid for.
+
+build/configs/rtl8730e/Make.defs gains the flag block:
+
+  -fsanitize=kernel-address
+  --param asan-stack=0
+  --param asan-globals=0
+  --param asan-instrumentation-with-call-threshold=0
+
+The call threshold at 0 forces outline instrumentation, so every access
+becomes a helper call and the runtime resolves the shadow itself. Inline
+instrumentation would need the shadow at a link time constant address,
+which this port cannot provide because it carves the shadow out of the
+heap at run time. Stack and global instrumentation stay off for the same
+reason and because neither has a runtime here yet.
+
+Scoping. Only the kernel is instrumented. The shadow is registered for the
+kernel heap alone, so instrumenting user space would emit a call for every
+memory access that then returns immediately, having found no region to
+check: cost with no cover, on an image that has a fixed partition to fit
+into. The test is the KERNEL variable that os/LibTargets.mk already sets on
+the command line, y for the kernel libraries and n for the user ones,
+libapps, libexternal and the loadable apps. It is unset for the flat build,
+where there is one image and one heap, so everything is instrumented there.
+Verified for every pass:
+
+  protected, kernel libs   instrumented
+  protected, user and apps not instrumented
+  flat, kernel side        instrumented
+  flat, apps               instrumented
+  KASan off, any pass      not instrumented
+
+The vendor board support code is excluded by default behind a new option,
+CONFIG_MM_KASAN_INSTRUMENT_BOARD. os/board/rtl8730e/src is large and the
+kernel partition on this board is 2868 KB, so a first bring-up covers
+TizenRT's own code and widens once that boots clean. The vendor libraries
+that ship as binaries cannot be instrumented either way.
+
+os/mm/kasan/Make.defs now builds hook.c only for the passes that are
+instrumented. Carrying the runtime into libumm added several kilobytes to
+the user image for entry points nothing calls, and made a mistaken
+instrumentation of user space produce dead code instead of the link error
+it should be. This is the follow-up noted when phase 1 landed.
+
+Not changed, deliberately:
+
+  - -fomit-frame-pointer is left alone. It does not affect whether KASan
+    works, only whether a report can carry a backtrace, and the target
+    defconfig does not set CONFIG_FRAME_POINTER. Note that enabling that
+    option on this board does not currently do what its name says; that is
+    a pre-existing defect and a separate change.
+  - -Werror is left alone. It applies only under QUICKBUILD=y here, so the
+    default build will not break on a new instrumentation warning.
+
+Verified: the flag block was exercised through make for all six
+combinations above and produces the exact expected command line; the
+hook.c and board exclusions were exercised the same way; the Kconfig
+parses with balanced if and choice blocks and every symbol typed; the
+phase 1 and phase 2 host suites still pass at ARM32 word width.
+
+Note that build/configs/rtl8730e/Make.defs has CRLF line endings. The
+change preserves them, so the diff is the 43 added lines rather than the
+whole file.
+
+Gates A1 and A2 have been confirmed to pass in the TizenRT build
+container, so the toolchain does support -fsanitize=kernel-address and
+accepts all three parameters. This change has still not been built or run:
+the next gate is A3, a baseline build with CONFIG_MM_KASAN off to record
+the kernel image size, which then has to be checked against the 2868 KB
+kernel partition before the option is turned on.
+---
+ build/configs/rtl8730e/Make.defs | 43 ++++++++++++++++++++++++++++++++
+ os/board/rtl8730e/src/Makefile   | 12 +++++++++
+ os/mm/kasan/Kconfig              | 23 +++++++++++++++++
+ os/mm/kasan/Make.defs            |  9 +++++++
+ 4 files changed, 87 insertions(+)
+
+diff --git a/build/configs/rtl8730e/Make.defs b/build/configs/rtl8730e/Make.defs
+index c26305d4..7b07e595 100644
+--- a/build/configs/rtl8730e/Make.defs
++++ b/build/configs/rtl8730e/Make.defs
+@@ -136,6 +136,49 @@ ifeq ($(CONFIG_FRAME_POINTER),y)
+   ARCHOPTIMIZATION += -fomit-frame-pointer -mapcs -mno-sched-prolog
+ endif
+ 
++# KASan instrumentation.
++#
++# Only the kernel is instrumented. The shadow map is registered for the
++# kernel heap alone, so instrumenting user space would emit a call for every
++# memory access that then returns immediately, having found no region to
++# check: cost without cover. os/mm is excluded separately, by its own
++# Make.defs, because the sanitizer must not instrument itself.
++#
++# KERNEL is set on the command line by os/LibTargets.mk: y for the kernel
++# libraries, n for the user ones and for libapps, libexternal and the
++# loadable apps. It is unset for the flat build, where there is one image
++# and one heap, so everything is instrumented there.
++
++ifeq ($(CONFIG_MM_KASAN_INSTRUMENT_ALL),y)
++  KASAN_THIS_PASS = y
++  ifneq ($(CONFIG_BUILD_FLAT),y)
++    ifeq ($(KERNEL),n)
++      KASAN_THIS_PASS =
++    endif
++  endif
++endif
++
++ifeq ($(KASAN_THIS_PASS),y)
++  ARCHOPTIMIZATION += -fsanitize=kernel-address
++
++  # The call threshold at 0 forces outline instrumentation: every access
++  # becomes a helper call, so the runtime resolves the shadow itself. Inline
++  # instrumentation would need the shadow at a link time constant address,
++  # and this port carves it out of the heap at run time.
++  KASAN_PARAM += asan-stack=0
++  KASAN_PARAM += asan-globals=0
++  KASAN_PARAM += asan-instrumentation-with-call-threshold=0
++
++  ifeq ($(CONFIG_MM_KASAN_DISABLE_READS_CHECK),y)
++    KASAN_PARAM += asan-instrument-reads=0
++  endif
++  ifeq ($(CONFIG_MM_KASAN_DISABLE_WRITES_CHECK),y)
++    KASAN_PARAM += asan-instrument-writes=0
++  endif
++
++  ARCHOPTIMIZATION += $(addprefix --param ,$(KASAN_PARAM))
++endif
++
+ ARCHCFLAGS += -fno-builtin -fno-common
+ ARCHCXXFLAGS = -fno-builtin -fexceptions 
+ ifeq ($(QUICKBUILD),y)
+diff --git a/os/board/rtl8730e/src/Makefile b/os/board/rtl8730e/src/Makefile
+index 6ce981a6..a794f20b 100644
+--- a/os/board/rtl8730e/src/Makefile
++++ b/os/board/rtl8730e/src/Makefile
+@@ -51,6 +51,18 @@
+ 
+ -include $(TOPDIR)/Make.defs
+ 
++# The vendor board support code is left out of KASan instrumentation unless
++# it is asked for. It is large, and the kernel image has a fixed partition to
++# fit into, so a first bring-up covers TizenRT's own code and widens later.
++# See CONFIG_MM_KASAN_INSTRUMENT_BOARD.
++
++ifeq ($(CONFIG_MM_KASAN),y)
++ifneq ($(CONFIG_MM_KASAN_INSTRUMENT_BOARD),y)
++CFLAGS += -fno-sanitize=kernel-address
++CXXFLAGS += -fno-sanitize=kernel-address
++endif
++endif
++
+ DEPPATH = --dep-path .
+ VPATH = .
+ ASRCS =
+diff --git a/os/mm/kasan/Kconfig b/os/mm/kasan/Kconfig
+index c423eb31..3deeb0eb 100644
+--- a/os/mm/kasan/Kconfig
++++ b/os/mm/kasan/Kconfig
+@@ -68,9 +68,32 @@ config MM_KASAN_INSTRUMENT_ALL
+ 		If this is disabled, instrumentation must be requested per
+ 		directory or per file instead.
+ 
++		Only the kernel is instrumented in a protected build. User space
++		allocates from a heap that is never registered, so instrumenting
++		it would emit a call for every access that then returns having
++		found no region to check.
++
+ 		NOTE: the board Make.defs must act on this symbol for it to have
+ 		any effect. A board which does not yet do so builds unchanged.
+ 
++config MM_KASAN_INSTRUMENT_BOARD
++	bool "Instrument the vendor board support code as well"
++	depends on MM_KASAN_INSTRUMENT_ALL
++	default n
++	---help---
++		Include the vendor board support code, os/board/<board>/src, in
++		instrumentation.
++
++		Off by default. That code is large, so instrumenting it adds a
++		lot to an image that has a fixed partition to fit into, and it is
++		the least likely place for a first bring-up to want coverage.
++		Bring the board up with TizenRT's own code instrumented, confirm a
++		clean boot with no reports, then turn this on to widen.
++
++		Note that the vendor libraries which ship as binaries cannot be
++		instrumented at all whatever this is set to, so some of the board
++		remains invisible either way.
++
+ if MM_KASAN_INSTRUMENT
+ 
+ config MM_KASAN_REGIONS
+diff --git a/os/mm/kasan/Make.defs b/os/mm/kasan/Make.defs
+index 7f74b57c..653b5f92 100644
+--- a/os/mm/kasan/Make.defs
++++ b/os/mm/kasan/Make.defs
+@@ -44,8 +44,17 @@ ifeq ($(CONFIG_MM_KASAN),y)
+ # Only hook.c is listed. generic.c is included by it rather than compiled
+ # separately, so that the poison test inlines into the instrumentation entry
+ # points.
++#
++# It is built only for the passes that are actually instrumented, which is the
++# same test the board Make.defs applies to the compiler flags: the kernel and
++# the flat build, not the user libraries. Carrying the runtime into libumm
++# would add several kilobytes to the user image for entry points nothing
++# calls, and would turn a mistaken instrumentation of user space into dead
++# code rather than the link error it should be.
+ 
++ifneq ($(KERNEL),n)
+ CSRCS += hook.c
++endif
+ 
+ # NOTE: os/mm/Makefile includes every Make.defs into one make invocation and
+ # compiles the whole directory with a single $(CFLAGS). These three flags
+-- 
+2.43.0
+
