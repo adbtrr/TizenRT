@@ -44,8 +44,17 @@ ifeq ($(CONFIG_MM_KASAN),y)
 # Only hook.c is listed. generic.c is included by it rather than compiled
 # separately, so that the poison test inlines into the instrumentation entry
 # points.
+#
+# It is built only for the passes that are actually instrumented, which is the
+# same test the board Make.defs applies to the compiler flags: the kernel and
+# the flat build, not the user libraries. Carrying the runtime into libumm
+# would add several kilobytes to the user image for entry points nothing
+# calls, and would turn a mistaken instrumentation of user space into dead
+# code rather than the link error it should be.
 
+ifneq ($(KERNEL),n)
 CSRCS += hook.c
+endif
 
 # NOTE: os/mm/Makefile includes every Make.defs into one make invocation and
 # compiles the whole directory with a single $(CFLAGS). These three flags
