@@ -15,6 +15,7 @@
  * language governing permissions and limitations under the License.
  *
  ****************************************************************************/
+
 /*
  * SYNTIANT CONFIDENTIAL
  * _____________________
@@ -31,74 +32,113 @@
  *  unless prior written permission is obtained from Syntiant Corporation.
 */
 
+/*
+ * Copyright (c) 2026 Syntiant Corp.  All rights reserved.
+ * Contact at http://www.syntiant.com
+ *
+ * This software is available to you under a choice of one of two licenses.
+ * You may choose to be licensed under the terms of the GNU General Public
+ * License (GPL) Version 2, available from the file LICENSE in the main
+ * directory of this source tree, or the OpenIB.org BSD license below.  Any
+ * code involving Linux software will require selection of the GNU General
+ * Public License (GPL) Version 2.
+ *
+ * OPENIB.ORG BSD LICENSE
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ * this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright
+ * notice, this list of conditions and the following disclaimer in the
+ * documentation and/or other materials provided with the distribution.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+ * DEALINGS IN THE SOFTWARE.
+*/
+
 /****************************************************************************
  * Included Files
  ****************************************************************************/
 
-#include <tinyara/kmalloc.h>
-#include <tinyara/wqueue.h>
-#include <tinyara/pm/pm.h>
-
 #include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
+#include <poll.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <signal.h>
 #include <stdbool.h>
-#include <sys/types.h>
-#include <sys/wait.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
-#include <fcntl.h>
-#include <pthread.h>
-#include <errno.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
-#include <syntiant_ilib/syntiant_ndp.h>
-#include <syntiant_ilib/syntiant_ndp120.h>
-#include <syntiant_ilib/syntiant_ndp_error.h>
-#include <syntiant_ilib/syntiant_ndp120_mailbox.h>
+#include <tinyara/audio/i2s.h>
+#include <tinyara/audio/ndp120.h>
+#include <tinyara/gpio.h>
+#include <tinyara/kmalloc.h>
+#include <tinyara/pm/pm.h>
+#include <tinyara/spi/spi.h>
+#include <tinyara/wqueue.h>
+
 #include <syntiant-firmware/ndp120_firmware.h>
 #include <syntiant_ilib/ndp120_spi_regs.h>
+#include <syntiant_ilib/syntiant_ndp.h>
+#include <syntiant_ilib/syntiant_ndp120.h>
+#include <syntiant_ilib/syntiant_ndp120_mailbox.h>
+#include <syntiant_ilib/syntiant_ndp_error.h>
 #include <syntiant_ilib/syntiant_ndp_ilib_version.h>
 
-#include <tinyara/spi/spi.h>
-
-#include "../../../audio/ndp120_voice.h"
+#include "ndp120.h"
 
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
 
+/* Definitions moved from ndp120_voice.c. */
+#define NDP120_SAMPLE_RX_RATE AUDIO_SAMP_RATE_16K
+#define NDP120_BITS_PER_SAMPLE 16
+#define NDP120_SPI_CHANNEL_NUM 1
+#define NDP120_MIC_GAIN_MAX 10
+#define NDP120_MIC_GAIN_DEFAULT 7
+/* Definitions moved from ndp120_api.c. */
 #define min(x, y) (((x) < (y)) ? (x) : (y))
 #define round_down(x, y) ((x) - ((x) % (y)))
-#define STRING_LEN		256
-
-#define AUDIO_BEFORE_MATCH_MS	(2000)
-
+#define STRING_LEN 256
+#define AUDIO_BEFORE_MATCH_MS 2000
 #define PDM_CLOCK_PDM_RATE 1536000
-
-/* this is the higher bound of the keyword length, it will be rounded down to multiple of frame size */
-#define KEYWORD_BUFFER_LEN      (SYNTIANT_NDP120_AUDIO_SAMPLE_RATE * SYNTIANT_NDP120_AUDIO_SAMPLES_PER_WORD * AUDIO_BEFORE_MATCH_MS / 1000)
-#define NDP120_SPI_FREQ_HIGH    12000000
-#define NDP120_SPI_FREQ_INIT    1000000
+#define KEYWORD_BUFFER_LEN (SYNTIANT_NDP120_AUDIO_SAMPLE_RATE * SYNTIANT_NDP120_AUDIO_SAMPLES_PER_WORD * AUDIO_BEFORE_MATCH_MS / 1000)
+#define NDP120_SPI_FREQ_HIGH 12000000
+#define NDP120_SPI_FREQ_INIT 1000000
 #define FF_ID NDP120_DSP_DATA_FLOW_FUNCTION_FULL_FF_49
 #define SR_FE_POOLING_ID 227
 #define KEYWORD_NETWORK_ID 0
-
-/* Periodicity of NDP alivness check thread */
 #define NDP_ALIVENESS_CHECK_PERIOD_US (3 * 1000 * 1000)
-
-#define COMBINED_FLOW_SET_ID  0
-
+#define COMBINED_FLOW_SET_ID 0
 #define SHOW_DEBUG 0
-// can be enabled to print the flow rules during init
-//#define CONFIG_DEBUG_AUDIO_INFO
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof(*(x)))
+
+/* Define CONFIG_DEBUG_AUDIO_INFO to print flow rules during initialization. */
 
 /****************************************************************************
  * Private Data
  ****************************************************************************/
+
+/* Private data moved from ndp120_api.c. */
 
 #ifdef CONFIG_NDP120_AEC_SUPPORT
 enum ndp120_state_e {
@@ -147,14 +187,982 @@ static const dsp_flow_t g_flow_types[] = {
 /****************************************************************************
  * Function Prototypes
  ****************************************************************************/
+
+/* Function declarations moved from ndp120_api.c. */
 int ndp120_init(struct ndp120_dev_s *dev);
 int ndp120_load_firmware(struct ndp120_dev_s *dev);
 void ndp120_aec_enable(struct ndp120_dev_s *dev);
 void ndp120_aec_disable(struct ndp120_dev_s *dev);
 void ndp120_test_internal_passthrough_switch(struct ndp120_dev_s *dev, int internal);
+int ndp120_irq_handler(struct ndp120_dev_s *dev);
+int ndp120_extract_audio(struct ndp120_dev_s *dev, struct ap_buffer_s *apb);
+int ndp120_kd_start(struct ndp120_dev_s *dev);
+int ndp120_kd_stop(struct ndp120_dev_s *dev);
+int ndp120_change_kd(struct ndp120_dev_s *dev, uint8_t kd_num);
+int ndp120_kd_start_match_process(struct ndp120_dev_s *dev);
+int ndp120_kd_stop_match_process(struct ndp120_dev_s *dev);
+int ndp120_start_sample_ready(struct ndp120_dev_s *dev);
+int ndp120_stop_sample_ready(struct ndp120_dev_s *dev);
+int ndp120_kw_sensitivity_set(struct ndp120_dev_s *dev, uint16_t sensitivity);
+int ndp120_kw_sensitivity_get(struct ndp120_dev_s *dev, uint16_t *sensitivity);
+int ndp120_change_dsp_flow(struct ndp120_dev_s *dev, uint8_t dsp_flow_num);
+#ifdef CONFIG_DUMP4CH_SUPPORT
+/* Function declarations moved from ndp120_debug_utils.c. */
+int ndp120_utils_stream_init(struct ndp120_dev_s *dev, unsigned int duration, int verbose, int *dev_extract_size);
+int ndp120_utils_stream_deinit(struct ndp120_dev_s *dev);
+int ndp120_utils_stream_get_data(struct ndp120_dev_s *dev, uint8_t *data, uint32_t *extracted_size);
+#endif
 
 static void do_ndp120_i2s_setup(struct syntiant_ndp_device_s *ndp);
 static void attach_algo_config_area(struct syntiant_ndp_device_s *ndp, int32_t algo_id, int32_t algo_config_index);
+
+/* Audio lower-half implementation moved from ndp120_voice.c. */
+
+/****************************************************************************
+ * Private Function Prototypes
+ ****************************************************************************/
+
+static int ndp120_getcaps(FAR struct audio_lowerhalf_s *dev, int type, FAR struct audio_caps_s *caps);
+#ifdef CONFIG_AUDIO_MULTI_SESSION
+static int ndp120_configure(FAR struct audio_lowerhalf_s *dev, FAR void *session, FAR const struct audio_caps_s *caps);
+#else
+static int ndp120_configure(FAR struct audio_lowerhalf_s *dev, FAR const struct audio_caps_s *caps);
+#endif
+static int ndp120_shutdown(FAR struct audio_lowerhalf_s *dev);
+
+#ifdef CONFIG_AUDIO_MULTI_SESSION
+static int ndp120_start(FAR struct audio_lowerhalf_s *dev, FAR void *session);
+#else
+static int ndp120_start(FAR struct audio_lowerhalf_s *dev);
+#endif
+
+#ifndef CONFIG_AUDIO_EXCLUDE_STOP
+#ifdef CONFIG_AUDIO_MULTI_SESSION
+static int ndp120_stop(FAR struct audio_lowerhalf_s *dev, FAR void *session);
+#else
+static int ndp120_stop(FAR struct audio_lowerhalf_s *dev);
+#endif
+#endif
+#ifndef CONFIG_AUDIO_EXCLUDE_PAUSE_RESUME
+#ifdef CONFIG_AUDIO_MULTI_SESSION
+static int ndp120_pause(FAR struct audio_lowerhalf_s *dev, FAR void *session);
+static int ndp120_resume(FAR struct audio_lowerhalf_s *dev, FAR void *session);
+#else
+static int ndp120_pause(FAR struct audio_lowerhalf_s *dev);
+static int ndp120_resume(FAR struct audio_lowerhalf_s *dev);
+#endif
+#endif
+static int ndp120_enqueuebuffer(FAR struct audio_lowerhalf_s *dev, FAR struct ap_buffer_s *apb);
+static int ndp120_cancelbuffer(FAR struct audio_lowerhalf_s *dev, FAR struct ap_buffer_s *apb);
+static int ndp120_ioctl(FAR struct audio_lowerhalf_s *dev, int cmd, unsigned long arg);
+#ifdef CONFIG_AUDIO_MULTI_SESSION
+static int ndp120_reserve(FAR struct audio_lowerhalf_s *dev, FAR void **session);
+#else
+static int ndp120_reserve(FAR struct audio_lowerhalf_s *dev);
+#endif
+#ifdef CONFIG_AUDIO_MULTI_SESSION
+static int ndp120_release(FAR struct audio_lowerhalf_s *dev, FAR void *session);
+#else
+static int ndp120_release(FAR struct audio_lowerhalf_s *dev);
+#endif
+
+#ifdef CONFIG_PM
+static struct ndp120_dev_s *g_ndp120;
+
+static void ndp_pm_notify(struct pm_callback_s *cb, enum pm_state_e pmstate);
+static int ndp_pm_prepare(struct pm_callback_s *cb, enum pm_state_e pmstate);
+
+static struct pm_callback_s g_pmndpcb =
+{
+	.notify  = ndp_pm_notify,
+	.prepare = ndp_pm_prepare,
+};
+#endif
+
+/****************************************************************************
+ * Private Data
+ ****************************************************************************/
+
+static const struct audio_ops_s g_audioops = {
+	ndp120_getcaps,           /* getcaps        */
+	ndp120_configure,         /* configure      */
+	ndp120_shutdown,          /* shutdown       */
+	ndp120_start,             /* start          */
+#ifndef CONFIG_AUDIO_EXCLUDE_STOP
+	ndp120_stop,              /* stop           */
+#endif
+#ifndef CONFIG_AUDIO_EXCLUDE_PAUSE_RESUME
+	ndp120_pause,             /* pause          */
+	ndp120_resume,            /* resume         */
+#endif
+	NULL,                     /* allocbuffer    */
+	NULL,                     /* freebuffer     */
+	ndp120_enqueuebuffer,     /* enqueue_buffer */
+	ndp120_cancelbuffer,      /* cancel_buffer  */
+	ndp120_ioctl,             /* ioctl          */
+	NULL,                     /* read           */
+	NULL,                     /* write          */
+	ndp120_reserve,           /* reserve        */
+	ndp120_release,           /* release        */
+};
+
+/****************************************************************************
+ * Private Functions
+ ****************************************************************************/
+
+/****************************************************************************
+ * ndp120 semaphore functions
+ ****************************************************************************/
+
+static inline void ndp120_takesem(sem_t *sem)
+{
+	int ret;
+
+	do {
+		ret = sem_wait(sem);
+		DEBUGASSERT(ret == 0 || errno == EINTR);
+	} while (ret < 0);
+}
+
+static inline int ndp120_givesem(sem_t *sem)
+{
+	return sem_post(sem);
+}
+
+static int ndp120_setMute(FAR struct ndp120_dev_s *priv, bool mute)
+{
+	int ret = 0;
+	FAR struct audio_lowerhalf_s *dev = &priv->dev;
+
+	auddbg("mute : %d\n", mute);
+	DEBUGASSERT(priv && dev->upper);
+	/* if NDP has not been initialized, return without doing anything */
+	if (!priv->ndp) {
+		return 0;
+	}
+	if (mute) {
+		ret = ndp120_kd_stop(priv);
+		if (ret != 0) {
+			auddbg("ndp120_kd_stop failed ret : %d\n", ret);
+			return ret;
+		}
+#ifdef CONFIG_AUDIO_MULTI_SESSION
+		dev->upper(dev->priv, AUDIO_CALLBACK_MICMUTE, NULL, OK, NULL);
+#else
+		dev->upper(dev->priv, AUDIO_CALLBACK_MICMUTE, NULL, OK);
+#endif
+	} else {
+		uint32_t notifications = 0;
+		struct syntiant_ndp_device_s *ndp = priv->ndp;
+		ret = syntiant_ndp120_poll(ndp, &notifications, 1);
+		if (ret != 0) {
+			auddbg("ndp120 poll failed ret: %d\n", ret);
+			return ret;
+		}
+		ret = ndp120_kd_start(priv);
+		if (ret != 0) {
+			auddbg("ndp120_kd_start failed ret : %d\n", ret);
+			return ret;
+		}
+#ifdef CONFIG_AUDIO_MULTI_SESSION
+		dev->upper(dev->priv, AUDIO_CALLBACK_MICUNMUTE, NULL, OK, NULL);
+#else
+		dev->upper(dev->priv, AUDIO_CALLBACK_MICUNMUTE, NULL, OK);
+#endif
+	}
+	return ret;
+}
+
+/****************************************************************************
+ * ndp120 audio operations
+ ****************************************************************************/
+
+static int ndp120_getcaps(FAR struct audio_lowerhalf_s *dev, int type, FAR struct audio_caps_s *caps)
+{
+	/* Validate the structure */
+	FAR struct ndp120_dev_s *priv = (FAR struct ndp120_dev_s *)dev;
+	int ret = 0;
+
+	DEBUGASSERT(caps && caps->ac_len >= sizeof(struct audio_caps_s));
+	audvdbg("type=%d ac_type=%d\n", type, caps->ac_type);
+
+	/* Fill in the caller's structure based on requested info */
+
+	caps->ac_format.hw = 0;
+	caps->ac_controls.w = 0;
+
+	switch (caps->ac_type) {
+		/* Caller is querying for the types of units we support */
+	case AUDIO_TYPE_QUERY:
+		/* Provide our overall capabilities.  The interfacing software
+		 * must then call us back for specific info for each capability.
+		 */
+
+			caps->ac_channels = 1; /* Mono output */
+		
+		switch (caps->ac_subtype) {
+		case AUDIO_TYPE_QUERY:
+			/* We don't decode any formats!  Only something above us in
+			 * the audio stream can perform decoding on our behalf.
+			 */
+
+			/* The types of audio units we implement */
+
+			caps->ac_controls.b[0] = AUDIO_TYPE_INPUT | AUDIO_TYPE_FEATURE | AUDIO_TYPE_PROCESSING;
+			break;
+		default:
+			caps->ac_controls.b[0] = AUDIO_SUBFMT_END; /* what is this used for???? */
+			break;
+		}
+		break;
+	case AUDIO_TYPE_INPUT:
+			caps->ac_channels = 1;
+		switch (caps->ac_subtype) {
+		case AUDIO_TYPE_QUERY:
+			/* Report the Sample rates we support */
+			caps->ac_controls.b[0] = AUDIO_SAMP_RATE_TYPE_16K;
+			break;
+		default:
+			break;
+		}
+		break;
+	case AUDIO_TYPE_FEATURE:
+		switch (caps->ac_subtype) {
+		case AUDIO_FU_INP_GAIN:
+			return -ENOSYS;
+		case AUDIO_FU_MUTE:
+			ndp120_takesem(&priv->devsem);
+			caps->ac_controls.b[0] = priv->mute;
+			ndp120_givesem(&priv->devsem);
+			break;
+		default:
+			break;
+		}
+		break;
+	case AUDIO_TYPE_PROCESSING:
+		audvdbg("\n\tAUDIO_TYPE_PROCESSING, type:%d, subtype:%d\n", caps->ac_type, caps->ac_subtype);
+
+		switch (caps->ac_subtype) {
+		case AUDIO_PU_UNDEF:
+			caps->ac_controls.b[0] =
+#ifdef CONFIG_AUDIO_SPEECH_DETECT_FEATURES
+				AUDIO_PU_SPEECH_DETECT |
+#endif
+				AUDIO_PU_UNDEF;
+			break;
+
+		case AUDIO_PU_SPEECH_DETECT:
+			audvdbg("\n\tNDP120, AUDIO_PU_SPPECH_DETECT, ac_controls.b[0] = %d\n", caps->ac_controls.b[0]);
+			/* Provide capabilities of our Speech Detect */
+			caps->ac_controls.b[0] =
+#ifdef CONFIG_AUDIO_SPEECH_DETECT_FEATURES
+#ifdef CONFIG_AUDIO_KEYWORD_DETECT
+				AUDIO_SD_KEYWORD_DETECT |
+#ifdef CONFIG_NDP120_AEC_SUPPORT
+				AUDIO_SD_AEC |
+#endif
+#endif
+#endif
+				AUDIO_SD_UNDEF;
+			break;
+		case AUDIO_PU_KD_SENSITIVITY: {
+			uint16_t sensitivity;
+			ndp120_takesem(&priv->devsem);
+			ret = ndp120_kw_sensitivity_get(priv, &sensitivity);
+			if (ret != 0) {
+				auddbg("ndp120_kw_sensitivity_get failed ret : %d\n", ret);
+				ndp120_givesem(&priv->devsem);
+				return -EIO;
+			}
+			caps->ac_controls.w = sensitivity;
+			ndp120_givesem(&priv->devsem);
+		}
+		break;
+		default:
+			/* Other types of processing unit we don't support */
+			break;
+		}
+		break;
+	/* All others we don't support */
+	default:
+		/* Zero out the fields to indicate no support */
+		caps->ac_subtype = 0;
+		caps->ac_channels = 0;
+		break;
+	}
+
+	/* Return the length of the audio_caps_s struct for validation of
+	 * proper Audio device type.
+	 */
+	audvdbg("Return %d\n", caps->ac_len);
+	return caps->ac_len;
+}
+
+#ifdef CONFIG_AUDIO_MULTI_SESSION
+static int ndp120_configure(FAR struct audio_lowerhalf_s *dev,
+							FAR void *session,
+							FAR const struct audio_caps_s *caps)
+#else
+static int ndp120_configure(FAR struct audio_lowerhalf_s *dev,
+							FAR const struct audio_caps_s *caps)
+#endif
+{
+	FAR struct ndp120_dev_s *priv = (FAR struct ndp120_dev_s *)dev;
+	int ret = 0;
+
+	DEBUGASSERT(priv && caps);
+	audvdbg("ac_type: %d\n", caps->ac_type);
+
+	/* Process the configure operation */
+
+	switch (caps->ac_type) {
+	case AUDIO_TYPE_INPUT:
+		audvdbg("AUDIO_TYPE_INPUT");
+		break;
+	case AUDIO_TYPE_FEATURE:
+		audvdbg("AUDIO_TYPE_FEATURE");
+
+		/* Process based on Feature Unit */
+		switch (caps->ac_format.hw) {
+		case AUDIO_FU_INP_GAIN: {
+			return -ENOSYS;
+		}
+		break;
+		case AUDIO_FU_MUTE: {
+			/* Mute or unmute:  true(1) or false(0) */
+			bool mute = caps->ac_controls.b[0];
+			audvdbg("mute: 0x%x\n", mute);
+			ndp120_takesem(&priv->devsem);
+			ret = ndp120_setMute(priv, mute);
+			if (ret != 0) {
+				auddbg("ndp120_setMute failed ret : %d\n", ret);
+				ndp120_givesem(&priv->devsem);
+				return ret;
+			}
+			priv->mute = mute;
+			/* No api to control gain as of now */
+			ndp120_givesem(&priv->devsem);
+		}
+		break;
+		default:
+			audvdbg("ERROR: Unrecognized feature unit\n");
+			break;
+		}
+
+		break;
+	case AUDIO_TYPE_PROCESSING:
+		auddbg("AUDIO_TYPE_PROCESSING");
+		switch (caps->ac_subtype) {
+		case AUDIO_PU_SPEECH_DETECT:
+			switch (caps->ac_controls.w) {
+#ifdef CONFIG_AUDIO_SPEECH_DETECT_FEATURES
+			case AUDIO_SD_KEYWORD_DETECT:
+			case AUDIO_SD_LOCAL:
+#ifdef CONFIG_AUDIO_KEYWORD_DETECT
+				/* DO Nothing for now */
+#else
+				ret = -EINVAL;
+#endif
+				break;
+#endif
+			}
+			break;
+		case AUDIO_PU_KD_SENSITIVITY: {
+			uint16_t sensitivity = caps->ac_controls.w;
+			ndp120_takesem(&priv->devsem);
+			ret = ndp120_kw_sensitivity_set(priv, sensitivity);
+			if (ret != 0) {
+				auddbg("ndp120_kw_sensitivity_set failed ret : %d\n", ret);
+				ndp120_givesem(&priv->devsem);
+				return -EIO;
+			}
+			ndp120_givesem(&priv->devsem);
+		}
+		break;
+		default:
+			break;
+		}
+		break;
+	default:
+		audvdbg("ndp120_configure received unknown ac_type 0x%x\n", caps->ac_type);
+		ret = -EINVAL;
+		break;
+	}
+
+	return ret;
+}
+
+static int ndp120_shutdown(FAR struct audio_lowerhalf_s *dev)
+{
+	/* TBD:disable interrupts */
+
+	return 0;
+}
+
+#ifdef CONFIG_AUDIO_MULTI_SESSION
+static int ndp120_start(FAR struct audio_lowerhalf_s *dev, FAR void *session)
+#else
+static int ndp120_start(FAR struct audio_lowerhalf_s *dev)
+#endif
+{
+	FAR struct ndp120_dev_s *priv = (FAR struct ndp120_dev_s *)dev;
+	if (priv->running) {
+		return 0;
+	}
+
+	if (priv->mute) {
+		return -ESTRPIPE;
+	}
+
+	audvdbg(" ndp120_start Entry\n");
+	ndp120_takesem(&priv->devsem);
+
+	ndp120_start_sample_ready(priv);
+	priv->running = true;
+	priv->total_size = 0;
+
+	/* Enqueue buffers (enqueueed before the start of alc) to lower layer */
+	sq_entry_t *tmp = NULL;
+	sq_queue_t *q = &priv->pendq;
+	for (tmp = sq_peek(q); tmp; tmp = sq_next(tmp)) {
+		ndp120_enqueuebuffer(dev, (struct ap_buffer_s *)tmp);
+	}
+	/* Remove audio buffers from pending queue here */
+	while ((tmp = sq_remfirst(&priv->pendq)) != NULL) {
+		apb_free((struct ap_buffer_s *)tmp);
+	}
+	
+	ndp120_givesem(&priv->devsem);
+	return 0;
+}
+
+#ifndef CONFIG_AUDIO_EXCLUDE_STOP
+#ifdef CONFIG_AUDIO_MULTI_SESSION
+static int ndp120_stop(FAR struct audio_lowerhalf_s *dev, FAR void *session)
+#else
+static int ndp120_stop(FAR struct audio_lowerhalf_s *dev)
+#endif
+{
+	FAR struct ndp120_dev_s *priv = (FAR struct ndp120_dev_s *)dev;
+	if (!priv) {
+		return -EINVAL;
+	}
+
+	audvdbg(" ndp120_i2s_stop Entry\n");
+	ndp120_takesem(&priv->devsem);
+	auddbg("Total record size : %lu\n", priv->total_size);
+	ndp120_stop_sample_ready(priv);
+
+	priv->running = false;
+	priv->total_size = 0;
+	ndp120_givesem(&priv->devsem);
+	return 0;
+}
+#endif
+
+#ifndef CONFIG_AUDIO_EXCLUDE_PAUSE_RESUME
+#ifdef CONFIG_AUDIO_MULTI_SESSION
+static int ndp120_pause(FAR struct audio_lowerhalf_s *dev, FAR void *session)
+#else
+static int ndp120_pause(FAR struct audio_lowerhalf_s *dev)
+#endif
+{
+	FAR struct ndp120_dev_s *priv = (FAR struct ndp120_dev_s *)dev;
+	ndp120_takesem(&priv->devsem);
+	ndp120_stop_sample_ready(priv);
+	ndp120_givesem(&priv->devsem);
+	return 0;
+}
+
+#ifdef CONFIG_AUDIO_MULTI_SESSION
+static int ndp120_resume(FAR struct audio_lowerhalf_s *dev, FAR void *session)
+#else
+static int ndp120_resume(FAR struct audio_lowerhalf_s *dev)
+#endif
+{
+	FAR struct ndp120_dev_s *priv = (FAR struct ndp120_dev_s *)dev;
+	ndp120_takesem(&priv->devsem);
+	ndp120_start_sample_ready(priv);
+	ndp120_givesem(&priv->devsem);
+	return 0;
+}
+#endif
+
+/****************************************************************************
+ * Name: ndp120_enqueuebuffer
+ *
+ * Description: Enqueue an Audio Pipeline Buffer for playback/ processing.
+ *
+ ****************************************************************************/
+
+static int ndp120_enqueuebuffer(FAR struct audio_lowerhalf_s *dev, FAR struct ap_buffer_s *apb)
+{
+	FAR struct ndp120_dev_s *priv = (FAR struct ndp120_dev_s *)dev;
+
+	DEBUGASSERT(priv && priv->dev.upper && apb);
+
+	audvdbg("ndp120_enqueuebuffer: apbadr = 0x%x\n", apb);
+
+	/* TODO pendq should be handled by ndp120.c later. worker & interrupt logic need to be implemented there */
+	if (!priv->running) {
+		/* Add the new buffer to the tail of pending audio buffers */
+		ndp120_takesem(&priv->devsem);
+		sq_addlast((sq_entry_t *)&apb->dq_entry, &priv->pendq);
+		audvdbg("enqueue added buf 0x%x\n", apb);
+		ndp120_givesem(&priv->devsem);
+		return OK;
+	}
+
+	sq_entry_t *tmp;
+
+	int ret = ndp120_extract_audio(priv, apb);
+	if (ret == SYNTIANT_NDP_ERROR_UNINIT) {
+		// notify upper layer to stop capture, hence here just return OK.
+		priv->dev.upper(priv->dev.priv, AUDIO_CALLBACK_UNREACHABLE, NULL, OK);
+		return OK;
+	}
+
+	for (tmp = (sq_entry_t *)sq_peek(&priv->pendq); tmp; tmp = sq_next(tmp)) {
+		if (tmp == (sq_entry_t *)apb) {
+			sq_rem(tmp, &priv->pendq);
+			audvdbg("found the apb to remove 0x%x\n", tmp);
+			break;
+		}
+	}
+
+	priv->dev.upper(priv->dev.priv, AUDIO_CALLBACK_DEQUEUE, apb, ret);
+	return OK;
+}
+
+static int ndp120_cancelbuffer(FAR struct audio_lowerhalf_s *dev, FAR struct ap_buffer_s *apb)
+{
+	/* TBD */
+	return 0;
+}
+
+static int ndp120_spi_registerprocess(FAR struct audio_lowerhalf_s *dev, struct mq_des *mq)
+{
+	FAR struct ndp120_dev_s *priv = (FAR struct ndp120_dev_s *)dev;
+
+	if (priv->dev.process_mq == NULL) {
+		priv->dev.process_mq = mq;
+		return OK;
+	}
+	auddbg("already registered!!\n");
+	return -EBUSY;
+}
+
+static int ndp120_spi_unregisterprocess(FAR struct audio_lowerhalf_s *dev)
+{
+	FAR struct ndp120_dev_s *priv = (FAR struct ndp120_dev_s *)dev;
+	int ret = OK;
+	ndp120_takesem(&priv->devsem);
+	if (priv->dev.process_mq != NULL) {
+		priv->dev.process_mq = NULL;
+	} else {
+		auddbg("mq is null\n");
+		ret = -ENOENT;
+	}
+	ndp120_givesem(&priv->devsem);
+	return ret;
+}
+
+static int ndp120_ioctl(FAR struct audio_lowerhalf_s *dev, int cmd, unsigned long arg)
+{
+	FAR struct ap_buffer_info_s *bufinfo;
+	FAR struct ndp120_dev_s *priv = (FAR struct ndp120_dev_s *)dev;
+
+	if (!priv) {
+		return -EINVAL;
+	}
+
+	/* Deal with ioctls passed from the upper-half driver */
+
+	int ret = OK;
+	switch (cmd) {
+	case AUDIOIOC_PREPARE: {
+		/* nothing to prepare... */
+	}
+	break;
+	case AUDIOIOC_GETBUFFERINFO: {
+		/* Report our preferred buffer size and quantity */
+		audvdbg("AUDIOIOC_GETBUFFERINFO:\n");
+		/* Take semaphore */
+		ndp120_takesem(&priv->devsem);
+
+		bufinfo = (FAR struct ap_buffer_info_s *)arg;
+
+		bufinfo->buffer_size = 4 * priv->sample_size;
+		bufinfo->nbuffers = CONFIG_NDP120_NUM_BUFFERS;
+		
+		audvdbg("buffer_size : %d nbuffers : %d\n",
+				bufinfo->buffer_size, bufinfo->nbuffers);
+
+		/* Give semaphore */
+		ndp120_givesem(&priv->devsem);
+	}
+	break;
+	case AUDIOIOC_REGISTERPROCESS: {
+#ifdef CONFIG_AUDIO_PROCESSING_FEATURES
+		ret = ndp120_spi_registerprocess(dev, (mqd_t)arg);
+		if (ret != 0) {
+			auddbg("Process Start Failed ret : %d\n", ret);
+			return ret;
+		}
+#else
+		audvdbg("Register Process Failed - Device Doesn't support\n");
+		ret = -EINVAL;
+#endif
+	}
+	break;
+	case AUDIOIOC_UNREGISTERPROCESS: {
+#ifdef CONFIG_AUDIO_PROCESSING_FEATURES
+		ret = ndp120_spi_unregisterprocess(dev);
+		if (ret != 0) {
+			auddbg("Process Start Failed ret : %d\n", ret);
+			return ret;
+		}
+#else
+		auddbg("UnRegister Process Failed - Device Doesn't support\n");
+		ret = -EINVAL;
+#endif
+	}
+	break;
+	case AUDIOIOC_STARTPROCESS: {
+		audvdbg("set start process!!\n");
+#ifdef CONFIG_AUDIO_PROCESSING_FEATURES
+		switch ((uint8_t)arg) {
+#ifdef CONFIG_AUDIO_KEYWORD_DETECT
+		case AUDIO_SD_LOCAL:
+		case AUDIO_SD_KEYWORD_DETECT: {
+			if (priv->kd_enabled == false) {
+				ndp120_kd_start_match_process(priv);
+				priv->kd_enabled = true;
+			}
+		}
+		break;
+#endif
+		case AUDIO_SD_AEC: {
+#ifdef CONFIG_NDP120_AEC_SUPPORT
+			ndp120_aec_enable(priv);
+#endif
+		}
+		break;
+		default: {
+			/* DO Nothing for now */
+		}
+		break;
+		}
+#else
+		audvdbg("start Process Failed - Device Doesn't support\n");
+		ret = -EINVAL;
+#endif	/* CONFIG_AUDIO_PROCESSING_FEATURES */
+	}
+	break;
+	case AUDIOIOC_STOPPROCESS: {
+		audvdbg("set stop process!!\n");
+#ifdef CONFIG_AUDIO_PROCESSING_FEATURES
+		switch ((uint8_t)arg) {
+#ifdef CONFIG_AUDIO_KEYWORD_DETECT
+		case AUDIO_SD_KEYWORD_DETECT: {
+			if (priv->kd_enabled == true) {
+				ndp120_kd_stop_match_process(priv);
+				priv->kd_enabled = false;
+			}
+		}
+		break;
+#endif
+		default:
+			break;
+		}
+#else
+		audvdbg("start Process Failed - Device Doesn't support\n");
+		ret = -EINVAL;
+#endif	/* CONFIG_AUDIO_PROCESSING_FEATURES */
+	}
+	break;
+#ifdef CONFIG_AUDIO_PROCESSING_FEATURES
+#ifdef CONFIG_AUDIO_KEYWORD_DETECT
+	case AUDIOIOC_GETKDBUFSIZE: {
+		*(uint32_t *)arg = priv->keyword_bytes;
+	}
+	break;
+	case AUDIOIOC_GETKDDATA: {
+		memcpy((uint8_t *)arg, priv->keyword_buffer, priv->keyword_bytes);
+		priv->keyword_bytes_left = 0;
+	}
+	break;
+#endif  /* CONFIG_AUDIO_KEYWORD_DETECT */
+#endif  /* CONFIG_AUDIO_PROCESSING_FEATURES */
+	case AUDIOIOC_ENABLEDMIC: {
+		if (priv->lower && priv->lower->set_dmic) {
+			bool enable = (bool)arg;
+			priv->lower->set_dmic(enable);
+			ret = OK;
+		} else {
+			ret = -ENOSYS;
+		}
+		break;
+	}
+	case AUDIOIOC_CHANGEKD: {
+		if (((arg & AUDIO_NN_MODEL_MASK) > AUDIO_NN_MODEL_MAX) ||
+				((arg & AUDIO_NN_MODEL_LANG_MASK) > AUDIO_NN_MODEL_LANG_MAX)) {
+			return -EINVAL;
+		}
+		if (priv->running) {
+			return -EBUSY;
+		}
+		uint8_t kd_num = arg;
+		if (ndp120_change_kd(priv, kd_num) != SYNTIANT_NDP_ERROR_NONE) {
+			ret = -EIO;
+		}
+		break;
+	}
+	case AUDIOIOC_CHANGEDSPFLOW: {
+		uint8_t dsp_flow_num = (uint8_t)arg;
+		ret = ndp120_change_dsp_flow(priv, dsp_flow_num);
+		if (ret != 0) {
+			auddbg("ndp120_change_dsp_flow failed ret : %d\n", ret);
+			return ret;
+		}
+		break;
+	}
+#ifdef CONFIG_DUMP4CH_SUPPORT
+	case AUDIOIOC_MULTI_CH_STREAM_INIT: {
+		/* stream init */
+		struct audio_debug_dump_stream_init_s *stream_args;
+		stream_args = (FAR struct audio_debug_dump_stream_init_s *)arg;
+		int s = ndp120_utils_stream_init(priv, stream_args->duration, stream_args->verbose, stream_args->dev_extract_size);
+		if (s) {
+			ret = -EINVAL;
+		}
+		break;
+	}
+	case AUDIOIOC_MULTI_CH_STREAM_READ: {
+		/* blocking read */
+		struct audio_debug_dump_stream_read_s *read_args;
+		read_args = (FAR struct audio_debug_dump_stream_read_s *)arg;
+		int s = ndp120_utils_stream_get_data(priv, read_args->buffer, read_args->extracted_len);
+		if (s) {
+			ret = -EINTR;
+		}
+		break;
+	}
+	case AUDIOIOC_MULTI_CH_STREAM_DEINIT: {
+		/* stream deinit */
+		int s = ndp120_utils_stream_deinit(priv);
+		if (s) {
+			ret = -EINVAL;
+		}
+		break;
+	}
+#endif
+	default:
+		audvdbg("ndp120_ioctl received unkown cmd 0x%x\n", cmd);
+		ret = -EINVAL;
+		break;
+	}
+
+	return ret;
+}
+
+#ifdef CONFIG_AUDIO_MULTI_SESSION
+int ndp120_reserve(FAR struct audio_lowerhalf_s *dev, FAR void **session)
+#else
+int ndp120_reserve(FAR struct audio_lowerhalf_s *dev)
+#endif
+{
+	FAR struct ndp120_dev_s *priv = (FAR struct ndp120_dev_s *)dev;
+	int ret = 0;
+
+	/* Borrow the APBQ semaphore for thread sync */
+
+	ndp120_takesem(&priv->devsem);
+	if (priv->reserved) {
+		ret = -EBUSY;
+	} else {
+		/* Initialize the session context */
+
+#ifdef CONFIG_AUDIO_MULTI_SESSION
+		*session = NULL;
+#endif
+		priv->running = false;
+		priv->reserved = true;
+	}
+
+	ndp120_givesem(&priv->devsem);
+
+	return ret;
+}
+
+/****************************************************************************
+ * Name: ndp120_release
+ *
+ * Description: Releases the session (the only one we have).
+ *
+ ****************************************************************************/
+#ifdef CONFIG_AUDIO_MULTI_SESSION
+static int ndp120_release(FAR struct audio_lowerhalf_s *dev, FAR void *session)
+#else
+static int ndp120_release(FAR struct audio_lowerhalf_s *dev)
+#endif
+{
+	FAR struct ndp120_dev_s *priv = (FAR struct ndp120_dev_s *)dev;
+
+	if (!priv) {
+		return -EINVAL;
+	}
+
+	ndp120_takesem(&priv->devsem);
+	if (priv->running) {
+		priv->running = false;
+	}
+	priv->reserved = false;
+	ndp120_givesem(&priv->devsem);
+
+	return 0;
+}
+
+static void ndp120_interrupt_dispatch(int d)
+{
+	struct ndp120_dev_s *priv = (struct ndp120_dev_s *)d;
+#ifdef CONFIG_PM
+	pm_timedsuspend(priv->pm_domain, 10000);
+#endif
+	ndp120_irq_handler(priv);
+}
+
+#ifdef CONFIG_PM
+/****************************************************************************
+ * Name: ndp_pm_notify
+ *
+ * Description:
+ *   Notify the driver of new power state. This callback is called after
+ *   all drivers have had the opportunity to prepare for the new power state.
+ *
+ ****************************************************************************/
+
+static void ndp_pm_notify(struct pm_callback_s *cb, enum pm_state_e state)
+{
+	/* Currently PM follows the state changes as follows,
+	 * On boot, we are in PM_NORMAL. After that we only use PM_NORMAL and PM_SLEEP
+	 * on boot : PM_NORMAL -> PM_SLEEP, from there on
+	 * PM_SLEEP -> PM_NORMAL -> PM_SLEEP -> PM_NORMAL........
+	 */
+	switch (state) {
+	case(PM_SLEEP): {
+		audvdbg("entering SLEEP\n");
+#ifdef CONFIG_NDP120_AEC_SUPPORT
+		ndp120_aec_disable(g_ndp120);
+#endif
+	}
+	break;
+	default: {
+		/* Nothing to do */
+		audvdbg("default case\n");
+	}
+	break;
+	}
+}
+
+/****************************************************************************
+ * Name: ndp_pm_prepare
+ *
+ * Description:
+ *   Request the driver to prepare for a new power state. This is a warning
+ *   that the system is about to enter into a new power state. The driver
+ *   should begin whatever operations that may be required to enter power
+ *   state. The driver may abort the state change mode by returning a
+ *   non-zero value from the callback function.
+ *
+ ****************************************************************************/
+
+static int ndp_pm_prepare(struct pm_callback_s *cb, enum pm_state_e state)
+{
+	audvdbg("entry\n");
+	return OK;
+}
+#endif	/* End of CONFIG_PM */
+
+/****************************************************************************
+ * Public Functions
+ ****************************************************************************/
+
+/****************************************************************************
+ * Name: ndp120_lowerhalf_initialize
+ *
+ * Description:
+ *   Initialize the NDP120 device.
+ *
+ * Input Parameters:
+ *
+ * Returned Value:
+ *   A new lower half audio interface for the ndp120 device is returned on
+ *   success; NULL is returned on failure.
+ *
+ ****************************************************************************/
+FAR struct audio_lowerhalf_s *ndp120_lowerhalf_initialize(FAR struct spi_dev_s *spi, FAR struct ndp120_lower_s *lower)
+{
+	FAR struct ndp120_dev_s *priv;
+	int ret;
+
+	/* Sanity check */
+
+	DEBUGASSERT(spi);
+
+	/* Allocate a NDP120 device structure */
+	priv = (FAR struct ndp120_dev_s *)kmm_zalloc(sizeof(struct ndp120_dev_s));
+	if (priv == NULL) {
+		return NULL;
+	}
+
+	priv->dev.ops = &g_audioops;
+	priv->spi = spi;
+	priv->mic_gain = NDP120_MIC_GAIN_DEFAULT;
+	sq_init(&priv->pendq);
+	sem_init(&priv->devsem, 0, 1);
+
+	priv->lower = lower;
+	priv->recording = false;
+	priv->mute = false;
+#ifdef CONFIG_PM
+	/* only used during pm callbacks */
+	g_ndp120 = priv;
+
+	priv->pm_domain = pm_domain_register("NDP120");
+	DEBUGASSERT(priv->pm_domain >= 0);
+#endif
+
+	int retry = NDP120_INIT_RETRY_COUNT;
+	while (retry--) {
+		lower->reset();
+		ret = ndp120_init(priv);
+		if (ret != SYNTIANT_NDP_ERROR_NONE) {
+			auddbg("ndp120 init failed\n");
+			ret = -EIO;
+		} else {
+			break;
+		}
+	}
+
+	if (ret != OK) {
+		pm_domain_unregister(priv->pm_domain);
+		g_ndp120 = NULL;
+		free(priv);
+		return NULL;
+	}
+
+#ifdef CONFIG_PM
+	/* register callbacks only if NDP init is done */
+	ret = pm_register(&g_pmndpcb);
+	DEBUGASSERT(ret == OK);
+#endif
+
+	priv->lower->attach(ndp120_interrupt_dispatch, priv);
+	return &priv->dev;
+}
+
+/* Core API implementation moved from ndp120_api.c. */
 
 void ndp120_semtake(struct ndp120_dev_s *dev)
 {
@@ -178,20 +1186,6 @@ static int check_status(char *message, int s)
 		auddbg("%s failed: %s\n", message, syntiant_ndp_error_name(s));
 	}
 	return s;
-}
-
-static int check_io(char *message, int expected_len, int len)
-{
-	if (len < expected_len) {
-		if (len < 0) {
-			auddbg("%s failed\n", message);
-		} else {
-			auddbg("%s truncated\n", message);
-		}
-		return SYNTIANT_NDP_ERROR_FAIL;
-	}
-
-	return SYNTIANT_NDP_ERROR_NONE;
 }
 
 static void timer_start(struct timespec *ts)
@@ -848,8 +1842,6 @@ void print_flow_rule(ndp120_dsp_data_flow_rule_t *flow, int type, size_t len)
 		flow++;
 	}
 }
-#define ARRAY_SIZE(x)   (sizeof(x)/sizeof(*(x)))
-
 void dsp_flow_show(struct syntiant_ndp_device_s *ndp)
 {
 	for(uint32_t v = 0; v < 1; v++) {
@@ -2275,3 +3267,147 @@ int ndp120_change_dsp_flow(struct ndp120_dev_s *dev, uint8_t dsp_flow_num)
 	ndp120_semgive(dev);
 	return s;
 }
+
+#ifdef CONFIG_DUMP4CH_SUPPORT
+
+/* Debug utilities moved from ndp120_debug_utils.c. */
+
+static int pdm_clk_en(struct syntiant_ndp_device_s *ndp, uint32_t clk)
+{
+	struct syntiant_ndp120_config_pdm_s pdm_config;
+	int s;
+
+	pdm_config.get = 0;
+	pdm_config.set = 0;
+	pdm_config.interface = 0;
+	pdm_config.sample_rate = 0;
+	pdm_config.pdm_rate = 0;
+	pdm_config.clk_mode = 0;
+	pdm_config.mode = 0;
+	pdm_config.clk = clk;
+
+	pdm_config.set = SYNTIANT_NDP120_CONFIG_SET_PDM_CLK;
+	s = syntiant_ndp120_config_pdm(ndp, &pdm_config);
+	if (s) {
+		auddbg("ERROR: PDM clock set (%d) failed: %d\n", clk, s);
+	}
+	return s;
+}
+
+int ndp120_utils_stream_init(struct ndp120_dev_s *dev, unsigned int duration, int verbose, int* dev_extract_size)
+{
+	int num_channels = 4;
+	int s;
+
+	auddbg("Stream.... Duration: %d.  verbose: %d\n", duration, verbose);
+
+	auddbg("num_channels: %d    Sample size: %d   Annotated: %d dev_extract_size: %d\n", num_channels, dev->sample_size, dev->sample_size_orig_annot, dev->extract_size);
+	*dev_extract_size =  dev->extract_size;
+
+	s = pdm_clk_en(dev->ndp, 0);
+	if (s) {
+		auddbg("ERROR: PDM clock disable failed: %d\n", s);
+	}
+	s = syntiant_ndp120_init_ring_buffer_pointers(dev->ndp, 0);
+	if (s) {
+		auddbg("ERROR: syntiant_ndp120_init_ring_buffer_pointers failed: %d\n", s);
+	}
+	s = syntiant_ndp120_dsp_restart(dev->ndp);
+	if (s) {
+		auddbg("ERROR: syntiant_ndp120_dsp_restart failed: %d\n", s);
+	}
+	s = pdm_clk_en(dev->ndp, 1);
+	if (s) {
+		auddbg("ERROR: PDM clock enable failed: %d\n", s);
+	}
+
+    auddbg("Turning on sample ready...\n");
+    s = syntiant_ndp120_config_notify_on_sample_ready(dev->ndp, 1);
+	if (s) {
+		auddbg("ERROR: syntiant_ndp120_config_notify_on_sample_ready failed: %d\n", s);
+	}
+	return s;
+}
+
+int ndp120_utils_stream_deinit(struct ndp120_dev_s *dev)
+{
+	auddbg("Turning off sample ready...\n");
+    int s = syntiant_ndp120_config_notify_on_sample_ready(dev->ndp, 0);
+	if (s) {
+		auddbg("ERROR: syntiant_ndp120_config_notify_on_sample_ready failed: %d\n", s);
+	}
+	return s;
+}
+
+int ndp120_utils_stream_get_data(struct ndp120_dev_s *dev, uint8_t *data, uint32_t *extracted_size)
+{
+	static int started = 0;
+	static unsigned long n_extractions = 0;
+	uint32_t extract_size;
+	int s;
+
+	/* wait for sample interrupt */
+	int err = pthread_mutex_lock(&dev->ndp_mutex_notification_sample);
+	if (err) {
+		auddbg("NDP sample mutex lock err: %d\n", err);
+		goto err_out;
+	}
+
+	/* wait with timeout if already started */
+	if (started) {
+		struct timespec abstime;
+		clock_gettime(CLOCK_REALTIME, &abstime);
+
+		{
+			// Convert to nanoseconds
+			long nanoseconds = 80000000;
+
+			// Add nanoseconds to the current nanosecond value
+			abstime.tv_nsec += nanoseconds;
+
+			// Check for overflow and adjust seconds and nanoseconds accordingly
+			while (abstime.tv_nsec >= 1000000000) {
+				abstime.tv_nsec -= 1000000000;
+				abstime.tv_sec++;
+			}
+		}
+		err = pthread_cond_timedwait(&dev->ndp_cond_notification_sample,
+								&dev->ndp_mutex_notification_sample, &abstime);
+		if (err) {
+			/*
+			this is not a real error, we may just have read the data in an earlier round
+			syntiant_ms_time tnow;
+			syntiant_get_ms_time(&tnow);
+			audvdbg("Sample ready notification timeout @ %u\n", tnow);
+			*/
+		}
+	} else {
+		err = pthread_cond_wait(&dev->ndp_cond_notification_sample,
+								&dev->ndp_mutex_notification_sample);
+		if (err) {
+			auddbg("NDP sample wait err: %d\n", err);
+			goto err_out;
+		}
+		started = 1;
+		auddbg("1st sample ready arrived\n");
+	}
+	err = pthread_mutex_unlock(&dev->ndp_mutex_notification_sample);
+	if (err) {
+		auddbg("NDP sample mutex unlock err: %d\n", err);
+		goto err_out;
+	}
+
+	do {
+		extract_size = dev->extract_size;
+		s = syntiant_ndp_extract_data(dev->ndp,
+			SYNTIANT_NDP_EXTRACT_TYPE_INPUT,
+			SYNTIANT_NDP_EXTRACT_FROM_UNREAD, data, &extract_size);
+	} while (s == SYNTIANT_NDP_ERROR_DATA_REREAD);
+	n_extractions++;
+	*extracted_size = extract_size;
+
+err_out:
+	return err;
+}
+
+#endif /* CONFIG_DUMP4CH_SUPPORT */
