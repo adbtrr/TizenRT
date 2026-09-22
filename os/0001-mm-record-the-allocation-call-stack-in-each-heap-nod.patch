@@ -1,0 +1,1391 @@
+From 8f8dde5242ba8e21513dd353105bc9cf5d3c0d3b Mon Sep 17 00:00:00 2001
+From: adbtrr_work22_bt <>
+Date: Tue, 22 Sep 2026 07:48:32 +0000
+Subject: [PATCH 1/2] mm: record the allocation call stack in each heap node
+
+Replace the single 'alloc_call_addr' field of mm_allocnode_s with a
+backtrace[] array, so a heap block can be tied to the code path that
+created it and not just to its immediate caller.
+
+  backtrace[0] is the caller address the malloc API already captured and
+  is written by heapinfo_update_node() exactly as alloc_call_addr was.
+  backtrace[1] upwards hold the deeper frames, collected by whichever
+  unwinder is configured:
+
+    user space with CONFIG_SCHED_BACKTRACE - precise EHABI unwind through
+        libgcc's _Unwind_Backtrace, no frame pointer needed. Ported from
+        NuttX as lib/libc/sched/sched_backtrace.c.
+    everything else - the arch up_backtrace() frame walk, which is safe in
+        early-boot, IDLE and IRQ context.
+
+The unwinder never writes backtrace[0], so a target with no unwinder keeps
+exactly the caller information it has today in heapinfo, the memory leak
+checker and the double-free report.
+
+CONFIG_MM_BACKTRACE selects the depth and defaults to -1 (disabled).
+CONFIG_DEBUG_MM_HEAPINFO raises the floor to 1, which is the depth the old
+alloc_call_addr field represented: on a 32-bit target that keeps
+SIZEOF_MM_ALLOCNODE at 16 bytes and SIZEOF_MM_FREENODE at 24, so an
+existing heapinfo configuration pays no extra RAM. A deeper trace is an
+explicit opt-in and costs sizeof(void *) per chunk per level.
+
+Also exposes the recorded path through the mminfo driver:
+  - HEAPINFO_DETAIL_BACKTRACE dumps the call path of every live chunk
+  - MMINFOIOC_SET_BACKTRACE_SKIP adjusts the unwinder skip count at runtime
+Both are driven by the heapinfo command, added in the following commit.
+
+Also fixes the alignment search in mm_memalign(). It did pointer
+arithmetic on 'struct mm_allocnode_s *' and 'struct mm_freenode_s *' where
+byte arithmetic was intended, so the step advanced by
+alignment * sizeof(node) and skipped all but every Nth candidate address,
+and the loop bound was scaled by sizeof(node) as well. The bound is also
+changed to test for room for 'size' rather than for 'alignment', which is
+what the acceptance test inside the loop actually requires; expressed in
+'alignment' it rejects the last candidate that would still fit whenever
+alignment > size. This commit changes both SIZEOF_MM_ALLOCNODE and
+SIZEOF_MM_FREENODE, which that loop scales by, so the fix belongs here
+rather than separately.
+
+CONFIG_ARCH_HAVE_BACKTRACE is introduced and selected by
+ARCH_CHIP_AMEBASMART, so the arch unwinder is built where the
+architecture provides it rather than being tied to CONFIG_SCHED_BACKTRACE,
+which selects the libc engine and needs no arch support. mm_backtrace.c
+always carries a weak up_backtrace(), so the symbol resolves on every
+path the macro can take, including the kernel pass of a protected build.
+---
+ lib/libc/sched/Make.defs               |   4 +
+ lib/libc/sched/sched_backtrace.c       | 180 ++++++++++++++++++++
+ os/arch/Kconfig                        |   9 +
+ os/arch/arm/Kconfig                    |   1 +
+ os/arch/arm/src/amebasmart/Make.defs   |   6 +-
+ os/arch/arm/src/armv7-a/Toolchain.defs |  22 +++
+ os/drivers/memory/mminfo.c             |  38 +++++
+ os/include/sched.h                     |  14 ++
+ os/include/tinyara/fs/ioctl.h          |   1 +
+ os/include/tinyara/mm/mm.h             | 219 ++++++++++++++++++++++--
+ os/kernel/Kconfig                      |  16 ++
+ os/kernel/debug/mem_leak_checker.c     |  24 ++-
+ os/mm/Kconfig                          |  42 +++++
+ os/mm/mm_heap/Make.defs                |  12 ++
+ os/mm/mm_heap/mm_backtrace.c           |  90 ++++++++++
+ os/mm/mm_heap/mm_free.c                |   2 +-
+ os/mm/mm_heap/mm_heap_dbg.c            |   6 +-
+ os/mm/mm_heap/mm_heapinfo_backtrace.c  | 224 +++++++++++++++++++++++++
+ os/mm/mm_heap/mm_heapinfo_parse_heap.c |   4 +-
+ os/mm/mm_heap/mm_heapinfo_utils.c      |   7 +-
+ os/mm/mm_heap/mm_initialize.c          |   4 +
+ os/mm/mm_heap/mm_malloc.c              |   7 +
+ os/mm/mm_heap/mm_memalign.c            |  20 ++-
+ os/mm/mm_heap/mm_realloc.c             |  10 +-
+ 24 files changed, 936 insertions(+), 26 deletions(-)
+ create mode 100644 lib/libc/sched/sched_backtrace.c
+ create mode 100644 os/mm/mm_heap/mm_backtrace.c
+ create mode 100644 os/mm/mm_heap/mm_heapinfo_backtrace.c
+
+diff --git a/lib/libc/sched/Make.defs b/lib/libc/sched/Make.defs
+index b279410b..b32ac7d4 100644
+--- a/lib/libc/sched/Make.defs
++++ b/lib/libc/sched/Make.defs
+@@ -54,6 +54,10 @@
+ 
+ CSRCS += sched_getprioritymax.c sched_getprioritymin.c
+ 
++ifeq ($(CONFIG_SCHED_BACKTRACE),y)
++CSRCS += sched_backtrace.c
++endif
++
+ ifeq ($(CONFIG_BUILD_PROTECTED),y)
+ CSRCS += task_startup.c
+ endif
+diff --git a/lib/libc/sched/sched_backtrace.c b/lib/libc/sched/sched_backtrace.c
+new file mode 100644
+index 00000000..a4eb5557
+--- /dev/null
++++ b/lib/libc/sched/sched_backtrace.c
+@@ -0,0 +1,180 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++/****************************************************************************
++ * lib/libc/sched/sched_backtrace.c
++ *
++ * Ported from NuttX (libs/libc/sched/sched_backtrace.c).
++ *
++ * Returns the call-stack (return addresses) of the CURRENT thread using the
++ * compiler-generated EHABI unwind tables (.ARM.exidx) via libgcc's
++ * _Unwind_Backtrace.  This is precise (no frame pointer, no stack-scan
++ * heuristic) and runs entirely in the caller's context - no syscall trap.
++ *
++ * Requires the unwound code to be compiled with unwind tables
++ * (-funwind-tables); CONFIG_SCHED_BACKTRACE turns that on.
++ *
++ * Note: only the current thread is supported (tid must be the caller).
++ * Backtracing another (sleeping) thread needs its saved context and is not
++ * provided by this user-space implementation.
++ ****************************************************************************/
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++
++#ifdef CONFIG_SCHED_BACKTRACE
++
++#include <sys/types.h>
++#include <unistd.h>
++#include <unwind.h>
++
++/****************************************************************************
++ * Private Data Types
++ ****************************************************************************/
++
++struct trace_arg {
++	FAR void **array;	/* Caller-supplied buffer for return addresses */
++	_Unwind_Word cfa;	/* Canonical Frame Address of the previous frame */
++	int cnt;		/* Number of entries stored so far (starts negative
++				 * to honour 'skip') */
++	int size;		/* Capacity of 'array' */
++};
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/* Allow arch-specific adjustment of a return address (weak: identity). */
++
++__attribute__((weak))
++FAR void *unwind_arch_adjustment(FAR void *prev, FAR void *addr)
++{
++	(void)prev;
++	return addr;
++}
++
++/****************************************************************************
++ * Name: backtrace_helper
++ *
++ * Description:
++ *   Called by _Unwind_Backtrace once per stack frame.  Records the return
++ *   address (instruction pointer) of each frame into the caller's buffer.
++ ****************************************************************************/
++
++static _Unwind_Reason_Code backtrace_helper(FAR struct _Unwind_Context *ctx, FAR void *a)
++{
++	FAR struct trace_arg *arg = a;
++
++	/* We are first called with the address inside this backtrace machinery;
++	 * negative 'cnt' skips those (and any user-requested 'skip') frames.
++	 */
++
++	/* 'cnt' is bounded below by the >= 0 test and above by 'size'.  The upper
++	 * test matters because the store happens before the increment below, so a
++	 * caller that started 'cnt' beyond the buffer would otherwise write past
++	 * its end on the very first frame.
++	 */
++
++	if (arg->cnt >= 0 && arg->cnt < arg->size) {
++		arg->array[arg->cnt] = (FAR void *)_Unwind_GetIP(ctx);
++		if (arg->cnt > 0) {
++			arg->array[arg->cnt] = unwind_arch_adjustment(arg->array[arg->cnt - 1], arg->array[arg->cnt]);
++		}
++
++		/* Detect lack of progress (same IP + CFA) -> end of stack. */
++
++		_Unwind_Word cfa = _Unwind_GetCFA(ctx);
++
++		if (arg->cnt > 0 && arg->array[arg->cnt - 1] == arg->array[arg->cnt] && cfa == arg->cfa) {
++			return _URC_END_OF_STACK;
++		}
++
++		arg->cfa = cfa;
++	}
++
++	if (++arg->cnt >= arg->size) {
++		return _URC_END_OF_STACK;
++	}
++
++	return _URC_NO_REASON;
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: sched_backtrace
++ *
++ * Description:
++ *   Get the backtrace (return addresses) of the specified thread.  Only the
++ *   calling thread (tid == getpid()) is supported.
++ *
++ * Input Parameters:
++ *   tid    - Thread ID (must be the current thread)
++ *   buffer - Where the return addresses are stored
++ *   size   - Maximum number of addresses to store
++ *   skip   - Number of innermost frames to omit
++ *
++ * Returned Value:
++ *   The number of addresses stored in 'buffer', or 0 on failure.
++ *
++ ****************************************************************************/
++
++int sched_backtrace(pid_t tid, FAR void **buffer, int size, int skip)
++{
++	struct trace_arg arg;
++
++	if (buffer == NULL || size <= 0) {
++		return 0;
++	}
++
++	/* A negative 'skip' would make the initial 'cnt' below positive, so the
++	 * first recorded frame would land past the end of 'buffer'.  Treat it as
++	 * "skip nothing"; negating INT_MIN would also be undefined.
++	 */
++
++	if (skip < 0) {
++		skip = 0;
++	}
++
++	/* This user-space implementation can only unwind its own stack. */
++
++	if (tid != getpid()) {
++		return 0;
++	}
++
++	arg.array = buffer;
++	arg.cfa = 0;
++	arg.size = size;
++	arg.cnt = -skip - 1;
++
++	_Unwind_Backtrace(backtrace_helper, &arg);
++
++	/* _Unwind_Backtrace tends to leave a trailing NULL above _start. */
++
++	if (arg.cnt > 1 && arg.array[arg.cnt - 1] == NULL) {
++		--arg.cnt;
++	}
++
++	return arg.cnt > 0 ? arg.cnt : 0;
++}
++
++#endif /* CONFIG_SCHED_BACKTRACE */
+diff --git a/os/arch/Kconfig b/os/arch/Kconfig
+index af757e33..e8dbce49 100644
+--- a/os/arch/Kconfig
++++ b/os/arch/Kconfig
+@@ -74,6 +74,15 @@ config ARCH_HAVE_TESTSET
+ 	bool
+ 	default n
+ 
++config ARCH_HAVE_BACKTRACE
++	bool
++	default n
++	---help---
++		Selected by an architecture that provides a working up_backtrace().
++		When it is not selected, CONFIG_MM_BACKTRACE either uses the libc
++		EHABI unwinder (CONFIG_SCHED_BACKTRACE, user space) or falls back to
++		the weak no-op in os/mm/mm_heap/mm_backtrace.c.
++
+ config ARCH_HAVE_VFORK
+ 	bool
+ 	default n
+diff --git a/os/arch/arm/Kconfig b/os/arch/arm/Kconfig
+index 7759a75f..50046a7c 100644
+--- a/os/arch/arm/Kconfig
++++ b/os/arch/arm/Kconfig
+@@ -118,6 +118,7 @@ config ARCH_CHIP_AMEBALITE
+ config ARCH_CHIP_AMEBASMART
+ 	bool "Realtek AMEBASMART"
+ 	select ARCH_CORTEXA32
++	select ARCH_HAVE_BACKTRACE
+ 	select ARM_HAVE_NEON
+ 	select ARCH_HAVE_CRC32
+ 	select ARCH_HAVE_TRUSTZONE
+diff --git a/os/arch/arm/src/amebasmart/Make.defs b/os/arch/arm/src/amebasmart/Make.defs
+index a9f55ee0..e45cdad8 100644
+--- a/os/arch/arm/src/amebasmart/Make.defs
++++ b/os/arch/arm/src/amebasmart/Make.defs
+@@ -106,7 +106,11 @@ ifeq ($(CONFIG_SCHED_THREAD_LOCAL),y)
+   CMN_CSRCS += arm_tls.c
+ endif
+ 
+-ifeq ($(CONFIG_SCHED_BACKTRACE),y)
++# The arch up_backtrace() is built where the architecture actually provides it.
++# It is NOT tied to CONFIG_SCHED_BACKTRACE: that option selects the libc
++# sched_backtrace() engine, which unwinds the current thread through libgcc's
++# EHABI tables and needs no arch support.
++ifeq ($(CONFIG_ARCH_HAVE_BACKTRACE),y)
+   ifeq ($(CONFIG_FRAME_POINTER),y)
+     ifeq ($(CONFIG_ARM_THUMB),y)
+       CMN_CSRCS += arm_backtrace_thumb.c
+diff --git a/os/arch/arm/src/armv7-a/Toolchain.defs b/os/arch/arm/src/armv7-a/Toolchain.defs
+index b74f6b63..6866aa2d 100644
+--- a/os/arch/arm/src/armv7-a/Toolchain.defs
++++ b/os/arch/arm/src/armv7-a/Toolchain.defs
+@@ -138,6 +138,28 @@ else
+   ARCHOPTIMIZATION += -fomit-frame-pointer
+ endif
+ 
++# sched_backtrace() walks the EHABI unwind tables (.ARM.exidx) via libgcc's
++# _Unwind_Backtrace.  Without unwind tables a C function gets only an
++# EXIDX_CANTUNWIND entry and the unwinder stops immediately.
++#
++# Enable it for USER-space objects only, and only in a two-pass build.  The
++# kernel image spans flash + SRAM + DRAM; unwind tables on RAM-resident kernel
++# code emit .ARM.exidx entries whose R_ARM_PREL31 relocation to the far RAM
++# address overflows at link time.
++#
++# A kernel pass carries __KERNEL__ in EXTRADEFINES and a user pass does not, so
++# that test isolates the user pass.  It cannot do so in a flat build, where no
++# directory is compiled with __KERNEL__ and the test would match the whole
++# image - hence the explicit CONFIG_BUILD_FLAT exclusion.
++ifeq ($(CONFIG_SCHED_BACKTRACE),y)
++ifneq ($(CONFIG_BUILD_FLAT),y)
++ifeq ($(findstring __KERNEL__,$(EXTRADEFINES)),)
++  ARCHCFLAGS += -funwind-tables
++  ARCHCXXFLAGS += -funwind-tables
++endif
++endif
++endif
++
+ ifeq ($(CONFIG_STACK_CANARIES),y)
+   ARCHOPTIMIZATION += -fstack-protector-all
+ endif
+diff --git a/os/drivers/memory/mminfo.c b/os/drivers/memory/mminfo.c
+index ea205813..69608a9e 100644
+--- a/os/drivers/memory/mminfo.c
++++ b/os/drivers/memory/mminfo.c
+@@ -131,6 +131,23 @@ static int mminfo_ioctl(FAR struct file *filep, int cmd, unsigned long arg)
+ 			heap->peak_alloc_size = 0;
+ 			break;
+ 		}
++#if CONFIG_MM_BACKTRACE > 0
++		if (option->mode == HEAPINFO_DETAIL_BACKTRACE) {
++#if CONFIG_KMM_NHEAPS > 1
++			if (option->heap_type == HEAPINFO_HEAP_TYPE_KERNEL) {
++				int heap_idx;
++				for (heap_idx = HEAP_START_IDX; heap_idx <= HEAP_END_IDX; heap_idx++) {
++					printf("\n [HEAP %d]\n", heap_idx);
++					heapinfo_dump_backtrace(&heap[heap_idx], option->pid);
++				}
++			} else
++#endif
++			{
++				heapinfo_dump_backtrace(heap, option->pid);
++			}
++			break;
++		}
++#endif
+ #if CONFIG_KMM_NHEAPS > 1
+ 		if (option->heap_type == HEAPINFO_HEAP_TYPE_KERNEL) {
+ 			int heap_idx;
+@@ -154,6 +171,27 @@ static int mminfo_ioctl(FAR struct file *filep, int cmd, unsigned long arg)
+ 	case MMINFOIOC_GC:
+ 		sched_garbagecollection();
+ 		break;
++#endif
++#if CONFIG_MM_BACKTRACE > 0
++	case MMINFOIOC_SET_BACKTRACE_SKIP:
++		/* Set the kernel-side copy of g_mm_backtrace_skip.  In a
++		 * protected/loadable build the kernel has its own copy, which can only
++		 * be reached from user space through this ioctl.
++		 *
++		 * The value reaches the unwinder on every allocation, so reject
++		 * anything out of range here rather than letting it through.
++		 */
++		{
++			int skip = (int)arg;
++
++			if (skip < 0 || skip > HEAPINFO_BACKTRACE_SKIP_MAX) {
++				mdbg("Invalid backtrace skip %d, expected 0..%d\n", skip, HEAPINFO_BACKTRACE_SKIP_MAX);
++				ret = -EINVAL;
++				break;
++			}
++			g_mm_backtrace_skip = skip;
++		}
++		break;
+ #endif
+ 	default:
+ 		mdbg("Not supported\n");
+diff --git a/os/include/sched.h b/os/include/sched.h
+index 706c2887..fe1c06e7 100644
+--- a/os/include/sched.h
++++ b/os/include/sched.h
+@@ -474,6 +474,20 @@ int sched_unlock(void);
+  */
+ int sched_lockcount(void);
+ 
++#ifdef CONFIG_SCHED_BACKTRACE
++/**
++ * @ingroup SCHED_KERNEL
++ * @brief get the call-stack (return addresses) of a thread
++ * @details @b #include <sched.h> \n
++ *      Fills 'buffer' with up to 'size' return addresses of thread 'tid',
++ *      omitting the innermost 'skip' frames.  Only the calling thread is
++ *      supported.  Uses the EHABI unwind tables via libgcc.
++ * @return Number of addresses stored, or 0 on failure.
++ * @since TizenRT v4.0
++ */
++int sched_backtrace(pid_t tid, FAR void **buffer, int size, int skip);
++#endif
++
+ #undef EXTERN
+ #if defined(__cplusplus)
+ }
+diff --git a/os/include/tinyara/fs/ioctl.h b/os/include/tinyara/fs/ioctl.h
+index e82fd5a8..72c1d01b 100644
+--- a/os/include/tinyara/fs/ioctl.h
++++ b/os/include/tinyara/fs/ioctl.h
+@@ -510,6 +510,7 @@
+ #define MMINFOIOC_PARSE             _MMINFOIOC(0x0002)
+ #define MMINFOIOC_MNG_ALLOCFAIL     _MMINFOIOC(0x0003)
+ #define MMINFOIOC_GC                _MMINFOIOC(0x0004)
++#define MMINFOIOC_SET_BACKTRACE_SKIP _MMINFOIOC(0x0005)
+ 
+ /* Compress driver ioctl definitions ************************/
+ #define _COMPIOCVALID(c)    (_IOC_TYPE(c) == _COMPBASE)
+diff --git a/os/include/tinyara/mm/mm.h b/os/include/tinyara/mm/mm.h
+index 48fd8eb4..06c96397 100644
+--- a/os/include/tinyara/mm/mm.h
++++ b/os/include/tinyara/mm/mm.h
+@@ -187,6 +187,7 @@
+ #define HEAPINFO_DETAIL_SPECIFIC_HEAP 5
+ #define HEAPINFO_INIT_PEAK 6
+ #define HEAPINFO_DUMP_HEAP 7
++#define HEAPINFO_DETAIL_BACKTRACE 8
+ #define HEAPINFO_PID_ALL -1
+ 
+ #define HEAPINFO_INIT_INFO -1
+@@ -235,8 +236,66 @@ typedef size_t mmsize_t;
+ /* typedef is used for defining size of address space */
+ typedef void *mmaddress_t;             /* 32 bit address space */
+ 
++/* CONFIG_MM_BACKTRACE : how many call addresses are recorded in every
++ * allocated node.
++ *
++ *   -1 : disabled, no per-node storage at all (the default)
++ *    1 : the immediate malloc caller only.  This is what heapinfo has always
++ *        recorded; it used to live in the dedicated 'alloc_call_addr' field.
++ *   >1 : the immediate caller plus (N - 1) deeper frames, collected by the
++ *        unwinder selected by MM_ADD_BACKTRACE() below.
++ *
++ * backtrace[0] is always written by heapinfo_update_node() from the return
++ * address the malloc API captured, so it is meaningful even when no unwinder
++ * is available.  The unwinder only ever fills backtrace[1] upwards, and so
++ * can never destroy the caller address that the existing heapinfo, leak
++ * checker and double-free diagnostics depend on.
++ */
++
++#ifdef CONFIG_DEBUG_MM_HEAPINFO
++/* heapinfo needs the immediate caller, which now lives in backtrace[0].  Keep
++ * the floor at 1 so that a heapinfo build with no explicit CONFIG_MM_BACKTRACE
++ * keeps exactly the node layout it had while this was 'alloc_call_addr'.  A
++ * deeper trace is an explicit opt-in.
++ */
++#if !defined(CONFIG_MM_BACKTRACE) || (CONFIG_MM_BACKTRACE < 1)
++#undef CONFIG_MM_BACKTRACE
++#define CONFIG_MM_BACKTRACE 1
++#endif
++#endif
++
++#ifndef CONFIG_MM_BACKTRACE
++#define CONFIG_MM_BACKTRACE -1
++#endif
++
++#ifndef CONFIG_MM_BACKTRACE_SKIP
++#define CONFIG_MM_BACKTRACE_SKIP 3
++#endif
++
++#if CONFIG_MM_BACKTRACE > 0
++/* Upper bound accepted for the runtime skip value (g_mm_backtrace_skip).  The
++ * skip count only has to cover the malloc wrapper chain, so anything beyond
++ * this is a typo rather than a real request.  Validated by both the heapinfo
++ * command and the mminfo ioctl, neither of which requires heapinfo itself, so
++ * this must not sit inside the CONFIG_DEBUG_MM_HEAPINFO block.
++ */
++#define HEAPINFO_BACKTRACE_SKIP_MAX 32
++#endif
++
++/* The node header is rounded up to a MM_MIN_CHUNK multiple: the allocator
++ * hands out (node + SIZEOF_MM_ALLOCNODE) as the user pointer and places every
++ * node on a granule boundary, so a header that is not a granule multiple
++ * would misalign both.  Applied to the allocated node only - the free node is
++ * allowed its natural size, it just has to stay >= the allocated one.
++ */
++#if CONFIG_MM_BACKTRACE >= 0
++#define MM_NODE_ALIGN __attribute__((aligned(MM_MIN_CHUNK)))
++#else
++#define MM_NODE_ALIGN
++#endif
++
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+-#define SIZEOF_MM_MALLOC_DEBUG_INFO (sizeof(mmaddress_t) + sizeof(pid_t) + sizeof(uint16_t))
++#define SIZEOF_MM_MALLOC_DEBUG_INFO (sizeof(pid_t) + sizeof(uint16_t))
+ 
+ /* Memory state values */
+ #define MM_MEMORY_STATE_UNUSED   0  /* Initial state */
+@@ -261,28 +320,41 @@ typedef void *mmaddress_t;             /* 32 bit address space */
+ struct mm_allocnode_s {
+ 	mmsize_t preceding;				/* Size of the preceding chunk */
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+-	mmaddress_t alloc_call_addr;			/* malloc call address */
+ 	pid_t pid;					/* PID info */
+ 	uint16_t memory_state;				/* Memory state for leak detection. */
+ #endif
+ 	mmsize_t size;					/* Size of this chunk */
++	/* Call-stack recording.  Kept after 'size' so that 'size' and every field
++	 * before it stay at the same offset in mm_allocnode_s and mm_freenode_s.
++	 */
++#if (CONFIG_MM_BACKTRACE >= 0) && defined(CONFIG_MM_BACKTRACE_SEQNO)
++	unsigned long seqno;				/* Allocation sequence number */
++#endif
++#if CONFIG_MM_BACKTRACE > 0
++	FAR void *backtrace[CONFIG_MM_BACKTRACE];	/* [0] = caller, [1..] = unwound */
++#endif
++} MM_NODE_ALIGN;
+ 
+-};
++/* What is the size of the allocnode? Use sizeof() so the value always tracks
++ * the real layout, including any padding MM_NODE_ALIGN adds.
++ */
+ 
+-/* What is the size of the allocnode? */
++#define SIZEOF_MM_ALLOCNODE sizeof(struct mm_allocnode_s)
+ 
+-#define SIZEOF_MM_ALLOCNODE \
+-	(sizeof(mmsize_t) + sizeof(mmsize_t) + SIZEOF_MM_MALLOC_DEBUG_INFO)
++/* mm_malloc() guarantees 8-byte alignment of the data it hands out, and the
++ * data starts at (node + SIZEOF_MM_ALLOCNODE), so the header size has to be a
++ * multiple of 8.  That is the property worth asserting now that the sizes
++ * themselves come from sizeof().
++ */
+ 
+ #define CHECK_ALLOCNODE_SIZE \
+-	DEBUGASSERT(sizeof(struct mm_allocnode_s) == SIZEOF_MM_ALLOCNODE)
++	DEBUGASSERT((SIZEOF_MM_ALLOCNODE & 7) == 0)
+ 
+ /* This describes a free chunk */
+ 
+ struct mm_freenode_s {
+ 	mmsize_t preceding;			/* Size of the preceding chunk */
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+-	mmaddress_t alloc_call_addr;			/* malloc call address */
+ 	pid_t pid;					/* PID info */
+ 	uint16_t memory_state;				/* Memory state for leak detection. */
+ #endif
+@@ -293,6 +365,16 @@ struct mm_freenode_s {
+ 	mmaddress_t free_call_addr;		/* free call address */
+ 	pid_t free_call_pid;			/* free call PID */
+ 	uint16_t reserved;				/* Reserved for future use and padding for 4-byte alignment */
++#endif
++	/* Padding that keeps SIZEOF_MM_FREENODE >= SIZEOF_MM_ALLOCNODE now that
++	 * the allocated node carries the backtrace region.  A free chunk never
++	 * records a backtrace, so these bytes are never read while it is free.
++	 */
++#if (CONFIG_MM_BACKTRACE >= 0) && defined(CONFIG_MM_BACKTRACE_SEQNO)
++	unsigned long reserved_seqno;
++#endif
++#if CONFIG_MM_BACKTRACE > 0
++	FAR void *reserved_backtrace[CONFIG_MM_BACKTRACE];
+ #endif
+ };
+ 
+@@ -300,11 +382,119 @@ struct mm_freenode_s {
+ 
+ #define MM_PTR_SIZE sizeof(FAR struct mm_freenode_s *)
+ 
+-#define SIZEOF_MM_FREENODE \
+-	(SIZEOF_MM_ALLOCNODE + 2 * MM_PTR_SIZE + SIZEOF_MM_FREE_DEBUG_INFO)
++#define SIZEOF_MM_FREENODE sizeof(struct mm_freenode_s)
+ 
+ #define CHECK_FREENODE_SIZE \
+-	DEBUGASSERT(sizeof(struct mm_freenode_s) == SIZEOF_MM_FREENODE)
++	DEBUGASSERT(SIZEOF_MM_FREENODE >= SIZEOF_MM_ALLOCNODE)
++
++/****************************************************************************
++ * Allocation call-stack recording
++ ****************************************************************************/
++
++/* Global allocation sequence counter (defined in mm_initialize.c) */
++
++#if CONFIG_MM_BACKTRACE >= 0
++extern unsigned long g_mm_seqno;
++#endif
++
++#if (CONFIG_MM_BACKTRACE >= 0) && defined(CONFIG_MM_BACKTRACE_SEQNO)
++#define MM_ADD_SEQNO(node) do { (node)->seqno = ++g_mm_seqno; } while (0)
++#else
++#define MM_ADD_SEQNO(node) do { } while (0)
++#endif
++
++#if CONFIG_MM_BACKTRACE > 0
++/* Number of innermost frames the unwinder drops, so that the stored trace
++ * starts at the real caller instead of inside the allocator.  Initialised to
++ * CONFIG_MM_BACKTRACE_SKIP and adjustable at runtime with "heapinfo -s".
++ * Defined in os/mm/mm_heap/mm_backtrace.c.
++ */
++extern int g_mm_backtrace_skip;
++#endif
++
++/* MM_BACKTRACE_BASE : the first backtrace[] slot MM_ADD_BACKTRACE() may write.
++ * When heapinfo is enabled it owns backtrace[0], which holds the return
++ * address the malloc API captured; the unwinder must never overwrite it,
++ * because a build with no unwinder would otherwise lose the caller address
++ * that heapinfo, the leak checker and the double-free report all print.
++ */
++
++#ifdef CONFIG_DEBUG_MM_HEAPINFO
++#define MM_BACKTRACE_BASE 1
++#else
++#define MM_BACKTRACE_BASE 0
++#endif
++
++/* MM_ADD_BACKTRACE(node) : record the deeper call frames of a fresh
++ * allocation.  Called from mm_malloc / mm_memalign / mm_realloc once the node
++ * is owned, immediately after heapinfo_update_node().
++ *
++ * Engine:
++ *   user space with CONFIG_SCHED_BACKTRACE - precise EHABI unwind through
++ *       libgcc, via sched_backtrace().
++ *   everything else - the arch up_backtrace() frame walk, which is safe in
++ *       early-boot, IDLE and IRQ context.  mm_backtrace.c always provides a
++ *       weak no-op definition, so the symbol resolves even on an architecture
++ *       that does not select CONFIG_ARCH_HAVE_BACKTRACE.
++ */
++
++#if CONFIG_MM_BACKTRACE > MM_BACKTRACE_BASE
++
++#if defined(CONFIG_SCHED_BACKTRACE) && !defined(__KERNEL__)
++
++/* Forward declarations, so this widely included header does not have to pull
++ * in <unistd.h>/<sched.h>.  Wrapped in extern "C" so C++ translation units
++ * agree on C linkage with the real prototypes.
++ */
++#ifdef __cplusplus
++extern "C" {
++#endif
++pid_t getpid(void);
++int sched_backtrace(pid_t tid, FAR void **buffer, int size, int skip);
++#ifdef __cplusplus
++}
++#endif
++
++#define MM_BACKTRACE_COLLECT(buf, len, skip) sched_backtrace(getpid(), (buf), (len), (skip))
++
++#else
++
++struct tcb_s;
++int up_backtrace(FAR struct tcb_s *tcb, FAR void **buffer, int size, int skip);
++
++#define MM_BACKTRACE_COLLECT(buf, len, skip) up_backtrace(NULL, (buf), (len), (skip))
++
++#endif /* CONFIG_SCHED_BACKTRACE && !__KERNEL__ */
++
++#define MM_ADD_BACKTRACE(node) \
++	do { \
++		int _depth; \
++		_depth = MM_BACKTRACE_COLLECT(&(node)->backtrace[MM_BACKTRACE_BASE], \
++					CONFIG_MM_BACKTRACE - MM_BACKTRACE_BASE, \
++					g_mm_backtrace_skip); \
++		if (_depth < 0) { \
++			_depth = 0; \
++		} \
++		if ((MM_BACKTRACE_BASE + _depth) < CONFIG_MM_BACKTRACE) { \
++			(node)->backtrace[MM_BACKTRACE_BASE + _depth] = NULL; \
++		} \
++		MM_ADD_SEQNO(node); \
++	} while (0)
++
++#elif CONFIG_MM_BACKTRACE >= 0
++
++/* There is no room beyond backtrace[0] (or the feature records the sequence
++ * number only), so there are no frames to collect.
++ */
++
++#define MM_ADD_BACKTRACE(node) MM_ADD_SEQNO(node)
++
++#else
++
++#define MM_ADD_BACKTRACE(node)
++
++#endif /* CONFIG_MM_BACKTRACE > MM_BACKTRACE_BASE */
++
+ 
+ /*
+  *	This structure is used in the free delay list. 
+@@ -686,6 +876,13 @@ void heapinfo_exclude_stacksize(void *stack_ptr);
+ void heapinfo_peak_init(struct mm_heap_s *heap);
+ void heapinfo_dealloc_tcbinfo(void *address, pid_t pid);
+ void heapinfo_dump_heap(struct mm_heap_s *heap);
++#if CONFIG_MM_BACKTRACE > 0
++/* Walk the heap and print, one line per live allocation, the call path
++ * recorded at malloc time.  If pid is HEAPINFO_PID_ALL every allocation is
++ * printed, otherwise only those owned by the given pid.
++ */
++void heapinfo_dump_backtrace(FAR struct mm_heap_s *heap, pid_t pid);
++#endif
+ #ifdef CONFIG_HEAPINFO_USER_GROUP
+ void heapinfo_update_group(mmsize_t size, pid_t pid);
+ void heapinfo_update_group_info(pid_t pid, int group, int type);
+diff --git a/os/kernel/Kconfig b/os/kernel/Kconfig
+index 04572371..3fb46eea 100644
+--- a/os/kernel/Kconfig
++++ b/os/kernel/Kconfig
+@@ -874,6 +874,22 @@ config SCHED_ONEXIT
+ 	---help---
+ 		Enables the on_exit() API
+ 
++config SCHED_BACKTRACE
++	bool "Enable thread backtrace via sched_backtrace()"
++	default n
++	---help---
++		Enables sched_backtrace(), which returns the call-stack (return
++		addresses) of the calling thread. On ARM this walks the
++		compiler-generated EHABI unwind tables (.ARM.exidx) through
++		libgcc's _Unwind_Backtrace, so it is precise and needs no frame
++		pointer.
++
++		When enabled, CONFIG_MM_BACKTRACE recording uses
++		sched_backtrace() in user space instead of the arch stack walk.
++		It requires the unwound code to be built with unwind tables
++		(-funwind-tables), which this option turns on for the user-space
++		pass of a two-pass (protected/kernel) build.
++
+ endmenu # RTOS hooks
+ 
+ menu "Signal Numbers"
+diff --git a/os/kernel/debug/mem_leak_checker.c b/os/kernel/debug/mem_leak_checker.c
+index 41a8ea74..9d9a6985 100644
+--- a/os/kernel/debug/mem_leak_checker.c
++++ b/os/kernel/debug/mem_leak_checker.c
+@@ -336,7 +336,10 @@ static void print_mem_hex_dump(void *addr, size_t alloc_size)
+ static void print_info(struct mm_heap_s *heap, int leak_cnt, int broken_cnt)
+ {
+ 	volatile struct mm_allocnode_s *node;
+-	uint32_t owner_addr;	
++	uint32_t owner_addr;
++#if CONFIG_MM_BACKTRACE > 1
++	int bt_idx;
++#endif
+ 
+ 	if (leak_cnt > 0 || broken_cnt > 0) {
+ 		printf("Type   |    Addr    | Size(byte) |    Owner   | PID \n");
+@@ -359,11 +362,11 @@ static void print_info(struct mm_heap_s *heap, int leak_cnt, int broken_cnt)
+ 			for (node = heap->mm_heapstart[region]; node <  heap->mm_heapend[region]; node = (struct mm_allocnode_s *)((char *)node + node->size)) {
+ 				ASSERT(node->size);
+ 				if (node->memory_state == MM_MEMORY_STATE_LEAK) {
+-					/* alloc_call_addr can be from kernel, app or common binary.
++					/* backtrace[0] can be from kernel, app or common binary.
+ 					* based on the text addresses printed, user needs to check the
+ 					* corresponding binaries accordingly
+ 					*/
+-					owner_addr = (uint32_t)node->alloc_call_addr;
++					owner_addr = (uint32_t)(uintptr_t)node->backtrace[0];
+ 					pid_t pid = node->pid;
+ 					if (pid < 0) {
+ 						/* For stack allocated node, pid is negative value.
+@@ -373,6 +376,21 @@ static void print_info(struct mm_heap_s *heap, int leak_cnt, int broken_cnt)
+ 					}
+ 					printf("LEAK   | %10p |  %8d  | %10p | %d\n", (void *)((char *)node + SIZEOF_MM_ALLOCNODE), node->size - SIZEOF_MM_ALLOCNODE, owner_addr, pid);
+ 					print_mem_hex_dump((void *)((char *)node + SIZEOF_MM_ALLOCNODE), node->size - SIZEOF_MM_ALLOCNODE);
++#if CONFIG_MM_BACKTRACE > 1
++					/* Deeper frames recorded at malloc time, innermost first.
++					 * Each entry is a PC value; subtract the text start address
++					 * of the matching binary to resolve it.
++					 */
++					printf("       Backtrace:");
++					for (bt_idx = 1; bt_idx < CONFIG_MM_BACKTRACE && node->backtrace[bt_idx] != NULL; bt_idx++) {
++						printf(" <- %p", node->backtrace[bt_idx]);
++					}
++					if (bt_idx == 1) {
++						printf(" (no deeper frames recorded)");
++					}
++					printf("\n");
++#endif
++					printf("\n");
+ 				} else if (node->memory_state == MM_MEMORY_STATE_BROKEN) {
+ 					printf("BROKEN | %p\n", node);
+ 				}
+diff --git a/os/mm/Kconfig b/os/mm/Kconfig
+index d2cc71ec..19b8eeee 100644
+--- a/os/mm/Kconfig
++++ b/os/mm/Kconfig
+@@ -156,3 +156,45 @@ config MM_LARGE_ALLOC_THRESHOLD
+ 		to this value are placed at the back of the selected free
+ 		chunk. Default is 512KB. Must be larger than SIZEOF_MM_FREENODE.
+ 
++
++config MM_BACKTRACE
++	int "Allocation call-stack depth recorded per heap chunk"
++	default -1
++	---help---
++		Number of call addresses stored in every allocated heap node.
++
++		-1  Disabled. No per-node storage.
++		 1  The immediate malloc caller only. This is what heapinfo has
++		    always recorded, and is the floor CONFIG_DEBUG_MM_HEAPINFO
++		    raises the value to, so a heapinfo build keeps the node layout
++		    it has always had.
++		>1  The immediate caller plus (N - 1) deeper frames, collected by
++		    the unwinder: sched_backtrace() in user space when
++		    CONFIG_SCHED_BACKTRACE is set, otherwise the arch
++		    up_backtrace().
++
++		Each step above 1 grows every allocated AND free chunk by
++		sizeof(void *), and the node header is rounded up to a
++		MM_MIN_CHUNK multiple, so a deeper trace costs RAM on every live
++		allocation. Measure before raising it on a constrained target.
++
++if MM_BACKTRACE >= 0
++
++config MM_BACKTRACE_SEQNO
++	bool "Record an allocation sequence number"
++	default n
++	---help---
++		Tag each allocation with a monotonically increasing sequence
++		number, for ordering and range based leak filtering. Costs
++		sizeof(unsigned long) in every chunk.
++
++config MM_BACKTRACE_SKIP
++	int "Number of innermost frames to skip when unwinding"
++	default 3
++	depends on MM_BACKTRACE > 1
++	---help---
++		Drop this many innermost frames, which are the allocator itself,
++		so the stored trace starts at the real caller. Adjustable at
++		runtime with "heapinfo -s".
++
++endif # MM_BACKTRACE >= 0
+diff --git a/os/mm/mm_heap/Make.defs b/os/mm/mm_heap/Make.defs
+index 732c094c..8f9a4f75 100644
+--- a/os/mm/mm_heap/Make.defs
++++ b/os/mm/mm_heap/Make.defs
+@@ -66,6 +66,18 @@ ifeq ($(CONFIG_DEBUG_MM_UAF),y)
+ CSRCS += mm_uaf.c
+ endif
+ 
++# CONFIG_MM_BACKTRACE > 0 needs mm_backtrace.c, which carries
++# g_mm_backtrace_skip and the weak up_backtrace().  mm.h raises the value to at
++# least 1 whenever CONFIG_DEBUG_MM_HEAPINFO is set - the build system cannot
++# see that, so test for heapinfo too.
++ifeq ($(CONFIG_DEBUG_MM_HEAPINFO),y)
++CSRCS += mm_backtrace.c mm_heapinfo_backtrace.c
++else
++ifneq ($(filter-out -1 0,$(CONFIG_MM_BACKTRACE)),)
++CSRCS += mm_backtrace.c
++endif
++endif
++
+ ifeq ($(CONFIG_DEBUG_MM_HEAPINFO),y)
+ CSRCS += mm_heapinfo_parse_heap.c mm_heapinfo_utils.c
+ ifeq ($(CONFIG_HEAPINFO_USER_GROUP),y)
+diff --git a/os/mm/mm_heap/mm_backtrace.c b/os/mm/mm_heap/mm_backtrace.c
+new file mode 100644
+index 00000000..767b9bbf
+--- /dev/null
++++ b/os/mm/mm_heap/mm_backtrace.c
+@@ -0,0 +1,90 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied. See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ *
++ ****************************************************************************/
++/****************************************************************************
++ * os/mm/mm_heap/mm_backtrace.c
++ *
++ * Runtime state for CONFIG_MM_BACKTRACE, plus a weak fallback for
++ * up_backtrace().
++ *
++ * MM_ADD_BACKTRACE() calls up_backtrace() on every path except user-space
++ * with CONFIG_SCHED_BACKTRACE, so the symbol has to resolve in all of them:
++ *
++ *   - kernel build on an architecture that selects CONFIG_ARCH_HAVE_BACKTRACE:
++ *     arm_backtrace_thumb.c / arm_backtrace_fp.c provide a strong definition
++ *     which overrides the weak one below.
++ *   - kernel build on an architecture that does not: the weak stub is used and
++ *     reports "no frames" instead of failing the link.
++ *   - user-space (libumm) build: there is no arch unwinder at all, so the weak
++ *     stub is the only definition.
++ *
++ * The stub is therefore compiled whenever CONFIG_MM_BACKTRACE is active, not
++ * only when CONFIG_SCHED_BACKTRACE is absent.  Gating it on the absence of
++ * CONFIG_SCHED_BACKTRACE left the kernel pass of a protected build with an
++ * undefined reference, because there the macro still uses up_backtrace().
++ ****************************************************************************/
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++#include <tinyara/mm/mm.h>
++
++#if CONFIG_MM_BACKTRACE > 0
++
++/****************************************************************************
++ * Public Data
++ ****************************************************************************/
++
++/* Number of innermost frames the unwinder drops.  Initialised to the
++ * compile-time default and adjustable at runtime with "heapinfo -s".
++ */
++
++int g_mm_backtrace_skip = CONFIG_MM_BACKTRACE_SKIP;
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: up_backtrace
++ *
++ * Description:
++ *   Weak no-op implementation, overridden by the arch unwinder where one is
++ *   built.  Returns 0 frames and NULL-terminates the caller's buffer so that
++ *   MM_ADD_BACKTRACE() records an empty deeper call stack.
++ *
++ * Returned Value:
++ *   Always 0 (no frames captured).
++ *
++ ****************************************************************************/
++
++int __attribute__((weak)) up_backtrace(FAR struct tcb_s *tcb, FAR void **buffer, int size, int skip)
++{
++	(void)tcb;
++	(void)skip;
++
++	if (buffer && size > 0) {
++		buffer[0] = NULL;
++	}
++
++	return 0;
++}
++
++#endif /* CONFIG_MM_BACKTRACE > 0 */
+diff --git a/os/mm/mm_heap/mm_free.c b/os/mm/mm_heap/mm_free.c
+index 6b7043e1..6f735e7e 100644
+--- a/os/mm/mm_heap/mm_free.c
++++ b/os/mm/mm_heap/mm_free.c
+@@ -180,7 +180,7 @@ static void mm_free_internal(FAR struct mm_heap_s *heap, FAR void *mem, mmaddres
+ 		mdbg("2nd free (double free): now try to release by %s (%d) at addr 0x%08x\n", task_name, free_call_pid, free_call_addr);
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 		GET_TASK_NAME_BY_PID(task_name, node->pid);
+-		mdbg("The node was allocated by %s (%d) at addr 0x%08x\n", task_name, node->pid, node->alloc_call_addr);
++		mdbg("The node was allocated by %s (%d) at addr 0x%08x\n", task_name, node->pid, (mmaddress_t)((FAR struct mm_allocnode_s *)node)->backtrace[0]);
+ #endif
+ 		mm_givesemaphore(heap);
+ 		return;
+diff --git a/os/mm/mm_heap/mm_heap_dbg.c b/os/mm/mm_heap/mm_heap_dbg.c
+index 7165412e..563f524a 100644
+--- a/os/mm/mm_heap/mm_heap_dbg.c
++++ b/os/mm/mm_heap/mm_heap_dbg.c
+@@ -133,12 +133,12 @@ void mm_dump_node(struct mm_allocnode_s *node, char *node_type)
+ 	}
+ #if CONFIG_TASK_NAME_SIZE > 0
+ 	if (prctl(PR_GET_NAME_BYPID, myname, pid) == OK) {
+-		mfdbg("%s owner pid = %d (%s%s), allocated by code at addr = 0x%08x\n", node_type, node->pid, myname, is_stack, node->alloc_call_addr);
++		mfdbg("%s owner pid = %d (%s%s), allocated by code at addr = 0x%08x\n", node_type, node->pid, myname, is_stack, (mmaddress_t)node->backtrace[0]);
+ 	} else {
+-		mfdbg("%s owner pid = %d (Exited Task%s), allocated by code at addr = 0x%08x\n", node_type, node->pid, is_stack, node->alloc_call_addr);
++		mfdbg("%s owner pid = %d (Exited Task%s), allocated by code at addr = 0x%08x\n", node_type, node->pid, is_stack, (mmaddress_t)node->backtrace[0]);
+ 	}
+ #else
+-	mfdbg("%s owner pid = %d%s, allocated by code at addr = 0x%08x\n", node_type, node->pid, is_stack, node->alloc_call_addr);
++	mfdbg("%s owner pid = %d%s, allocated by code at addr = 0x%08x\n", node_type, node->pid, is_stack, (mmaddress_t)node->backtrace[0]);
+ #endif
+ #endif
+ }
+diff --git a/os/mm/mm_heap/mm_heapinfo_backtrace.c b/os/mm/mm_heap/mm_heapinfo_backtrace.c
+new file mode 100644
+index 00000000..90f54445
+--- /dev/null
++++ b/os/mm/mm_heap/mm_heapinfo_backtrace.c
+@@ -0,0 +1,224 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied. See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ *
++ ****************************************************************************/
++/****************************************************************************
++ * os/mm/mm_heap/mm_heapinfo_backtrace.c
++ *
++ * Prints, one line per live allocation, the allocation call-stack that was
++ * captured at malloc time (sched_backtrace() when CONFIG_SCHED_BACKTRACE is
++ * set, otherwise the arch up_backtrace()).  Unlike a heuristic stack scan this
++ * only reads the backtrace already stored in each allocated node, so the
++ * reported call path is exactly the one recorded by the allocator.
++ ****************************************************************************/
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++
++#include <stdio.h>
++#include <stdint.h>
++#include <assert.h>
++
++#include <tinyara/sched.h>
++#include <tinyara/mm/mm.h>
++
++#if defined(CONFIG_DEBUG_MM_HEAPINFO) && (CONFIG_MM_BACKTRACE > 0)
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++/* pid value used to mark an allocation made from interrupt context */
++
++#define HEAPINFO_INT      INT16_MAX
++
++/* Max length of a single "bt: a <- b <- c" line: the fixed header (pid, task
++ * name, pointer, size, sequence number) plus each recorded address
++ * ("0x........") and its " <- " separator.
++ */
++
++#define HEAPINFO_BT_LINELEN (96 + (CONFIG_MM_BACKTRACE * 16))
++
++/* Append to buf/len, never past the end.  snprintf() returns the length it
++ * WOULD have written, so 'len' has to be clamped or the next call would be
++ * handed a negative size that converts to a huge size_t.
++ */
++
++#define BT_APPEND(...) \
++	do { \
++		int _n; \
++		if (len >= (int)sizeof(buf) - 1) { \
++			break; \
++		} \
++		_n = snprintf(buf + len, sizeof(buf) - len, __VA_ARGS__); \
++		if (_n < 0) { \
++			break; \
++		} \
++		len += _n; \
++		if (len > (int)sizeof(buf) - 1) { \
++			len = (int)sizeof(buf) - 1; \
++		} \
++	} while (0)
++
++#if CONFIG_KMM_REGIONS > 1
++#define HEAPINFO_NREGIONS (heap->mm_nregions)
++#else
++#define HEAPINFO_NREGIONS 1
++#endif
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: heapinfo_print_node_backtrace
++ *
++ * Description:
++ *   Format and print a single allocated node as:
++ *     PID=<pid>(<name>) ptr=<mem> size=<size> seq=<seqno> bt: a <- b <- c
++ *
++ * Returned Value:
++ *   1 if at least one backtrace frame was recorded for this node, else 0.
++ *
++ ****************************************************************************/
++
++static int heapinfo_print_node_backtrace(FAR struct mm_allocnode_s *node)
++{
++	int i;
++	int len = 0;
++	char buf[HEAPINFO_BT_LINELEN];
++	FAR void *mem = (FAR void *)((char *)node + SIZEOF_MM_ALLOCNODE);
++	pid_t pid = (node->pid >= 0) ? node->pid : -(node->pid);
++#if CONFIG_TASK_NAME_SIZE > 0
++	FAR struct tcb_s *tcb;
++	FAR const char *name = "unknown";
++
++	if (node->pid == HEAPINFO_INT) {
++		name = "INT";
++	} else if (node->pid < 0) {
++		/* A negative pid marks memory used as the stack of that pid. */
++		name = "stack";
++	} else {
++		tcb = sched_gettcb(node->pid);
++		if (tcb != NULL) {
++			name = tcb->name;
++		}
++	}
++
++	BT_APPEND("PID=%d(%s) ptr=%p size=%u", pid, name, mem, (unsigned int)node->size);
++#else
++	BT_APPEND("PID=%d ptr=%p size=%u", pid, mem, (unsigned int)node->size);
++#endif
++
++#ifdef CONFIG_MM_BACKTRACE_SEQNO
++	BT_APPEND(" seq=%lu", node->seqno);
++#endif
++
++	/* backtrace[0] is the immediate malloc caller, always recorded.  The
++	 * deeper frames follow from [1] and are only present where an unwinder is
++	 * configured and succeeded.
++	 */
++
++	BT_APPEND(" bt: %p", node->backtrace[0]);
++
++	for (i = 1; i < CONFIG_MM_BACKTRACE && node->backtrace[i] != NULL; i++) {
++		BT_APPEND(" <- %p", node->backtrace[i]);
++	}
++
++	if (i == 1) {
++		BT_APPEND(" (caller only)");
++	}
++
++	heap_dbg("%s\n", buf);
++
++	return (i > 1) ? 1 : 0;
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: heapinfo_dump_backtrace
++ *
++ * Description:
++ *   Walk every region of the heap and print the allocation backtrace of each
++ *   live (in-use) chunk.  When pid == HEAPINFO_PID_ALL all chunks are printed,
++ *   otherwise only those owned by the given pid.
++ *
++ ****************************************************************************/
++
++void heapinfo_dump_backtrace(FAR struct mm_heap_s *heap, pid_t pid)
++{
++	FAR struct mm_allocnode_s *node;
++	int region;
++	int count = 0;
++	int bt_count = 0;
++	size_t total = 0;
++
++	ASSERT(mm_check_heap_corruption(heap) == OK);
++
++	heap_dbg("PID(name) | Alloc Addr | Size | Backtrace (malloc call path)\n");
++	heap_dbg("-------------------------------------------------------------\n");
++
++	for (region = 0; region < HEAPINFO_NREGIONS; region++) {
++		/* Retake the semaphore for each region to reduce latencies. */
++
++		DEBUGASSERT(mm_takesemaphore(heap));
++
++		for (node = heap->mm_heapstart[region]; node < heap->mm_heapend[region]; node = (FAR struct mm_allocnode_s *)((char *)node + node->size)) {
++			ASSERT(node->size);
++
++			/* Skip the region head sentinel node.  It is marked allocated
++			 * (MM_ALLOC_BIT) but is never handed out by mm_malloc, so its
++			 * seqno/backtrace fields hold the heap fill pattern.
++			 */
++			if (node == heap->mm_heapstart[region]) {
++				continue;
++			}
++
++			/* Only in-use chunks carry a valid allocation backtrace. */
++
++			if ((node->preceding & MM_ALLOC_BIT) == 0) {
++				continue;
++			}
++
++			if (pid != HEAPINFO_PID_ALL && node->pid != pid) {
++				continue;
++			}
++
++			bt_count += heapinfo_print_node_backtrace(node);
++			count++;
++			total += node->size;
++		}
++
++		mm_givesemaphore(heap);
++	}
++
++	heap_dbg("-------------------------------------------------------------\n");
++	if (pid == HEAPINFO_PID_ALL) {
++		heap_dbg("Total live allocations : %d (%u bytes)\n", count, (unsigned int)total);
++	} else {
++		heap_dbg("PID %d live allocations : %d (%u bytes)\n", pid, count, (unsigned int)total);
++	}
++	heap_dbg("  with deeper frames : %d  (caller only : %d)\n", bt_count, count - bt_count);
++}
++
++#endif /* defined(CONFIG_DEBUG_MM_HEAPINFO) && (CONFIG_MM_BACKTRACE > 0) */
+diff --git a/os/mm/mm_heap/mm_heapinfo_parse_heap.c b/os/mm/mm_heap/mm_heapinfo_parse_heap.c
+index fead25ca..750dd141 100644
+--- a/os/mm/mm_heap/mm_heapinfo_parse_heap.c
++++ b/os/mm/mm_heap/mm_heapinfo_parse_heap.c
+@@ -194,9 +194,9 @@ void heapinfo_parse_heap(FAR struct mm_heap_s *heap, int mode, pid_t pid)
+ 			if ((pid == HEAPINFO_PID_ALL || node->pid == pid) && (node->preceding & MM_ALLOC_BIT) != 0) {
+ 				if (mode == HEAPINFO_DETAIL_ALL || mode == HEAPINFO_DETAIL_PID || mode == HEAPINFO_DETAIL_SPECIFIC_HEAP) {
+ 					if (node->pid >= 0) {
+-						heap_dbg("0x%x | %8u |   %c    | 0x%8x | %3d   |\n", node, node->size, 'A', node->alloc_call_addr, node->pid);
++						heap_dbg("0x%x | %8u |   %c    | 0x%8x | %3d   |\n", node, node->size, 'A', (mmaddress_t)node->backtrace[0], node->pid);
+ 					} else {
+-						heap_dbg("0x%x | %8u |   %c    | 0x%8x | %3d(S)|\n", node, node->size, 'A', node->alloc_call_addr, -(node->pid));
++						heap_dbg("0x%x | %8u |   %c    | 0x%8x | %3d(S)|\n", node, node->size, 'A', (mmaddress_t)node->backtrace[0], -(node->pid));
+ 					}
+ 				}
+ 
+diff --git a/os/mm/mm_heap/mm_heapinfo_utils.c b/os/mm/mm_heap/mm_heapinfo_utils.c
+index 8f2b43b8..a0685f2f 100644
+--- a/os/mm/mm_heap/mm_heapinfo_utils.c
++++ b/os/mm/mm_heap/mm_heapinfo_utils.c
+@@ -124,7 +124,12 @@ void heapinfo_update_total_size(struct mm_heap_s *heap, mmsize_t size, pid_t pid
+ void heapinfo_update_node(FAR struct mm_allocnode_s *node, mmaddress_t caller_retaddr)
+ {
+ 	DEBUGASSERT(node);
+-	node->alloc_call_addr = caller_retaddr;
++	/* backtrace[0] is the immediate caller.  MM_ADD_BACKTRACE(), called by
++	 * the allocator right after this, fills the deeper frames from [1] on and
++	 * never touches [0], so the caller address survives on a target with no
++	 * unwinder.
++	 */
++	node->backtrace[0] = caller_retaddr;
+ 	node->memory_state = MM_MEMORY_STATE_UNUSED;
+ 	node->pid = getpid();
+ }
+diff --git a/os/mm/mm_heap/mm_initialize.c b/os/mm/mm_heap/mm_initialize.c
+index 692de114..e535bc1e 100644
+--- a/os/mm/mm_heap/mm_initialize.c
++++ b/os/mm/mm_heap/mm_initialize.c
+@@ -72,6 +72,10 @@
+  * Public Variables
+  ****************************************************************************/
+ 
++#if CONFIG_MM_BACKTRACE >= 0
++unsigned long g_mm_seqno;	/* Monotonically increasing allocation sequence counter */
++#endif
++
+ /****************************************************************************
+  * Private Functions
+  ****************************************************************************/
+diff --git a/os/mm/mm_heap/mm_malloc.c b/os/mm/mm_heap/mm_malloc.c
+index 0420cc87..4a218218 100644
+--- a/os/mm/mm_heap/mm_malloc.c
++++ b/os/mm/mm_heap/mm_malloc.c
+@@ -289,6 +289,13 @@ retry_after_gc:
+ 
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 		heapinfo_update_node(allocnode, caller_retaddr);
++#endif
++		/* Record the deeper call frames.  backtrace[0] already holds the
++		 * caller address stored by heapinfo_update_node() above; the
++		 * unwinder only fills backtrace[1] upwards.
++		 */
++		MM_ADD_BACKTRACE(allocnode);
++#ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 		heapinfo_add_size(heap, allocnode->pid, allocnode->size);
+ 		heapinfo_update_total_size(heap, allocnode->size, allocnode->pid);
+ #endif
+diff --git a/os/mm/mm_heap/mm_memalign.c b/os/mm/mm_heap/mm_memalign.c
+index 7410e60e..8ceb4bb3 100644
+--- a/os/mm/mm_heap/mm_memalign.c
++++ b/os/mm/mm_heap/mm_memalign.c
+@@ -181,9 +181,18 @@ retry_after_gc:
+ 		/* Now, traverse the list in reverse direction, towards bigger size nodes */
+ 		for ( ; node; node = node->blink) {
+ 			/* Search the suitable aligned address in the same node. */
++			/* 'alignchunk' and 'node' are typed pointers, so "+ alignment" and
++			 * "+ node->size" scaled the step and the bound by the size of the
++			 * node structures instead of advancing by bytes.  The step skipped
++			 * all but every Nth candidate address, and the bound has to match
++			 * the acceptance test in the body below, which needs room for
++			 * 'size' rather than for 'alignment' - a bound expressed in
++			 * 'alignment' rejects the last candidate that would still fit
++			 * whenever alignment > size.
++			 */
+ 			for (alignchunk = (FAR struct mm_allocnode_s *)(((size_t)node + SIZEOF_MM_ALLOCNODE + mask) & ~mask);
+-				(uintptr_t)(alignchunk + alignment) < (uintptr_t)(node + node->size);
+-				alignchunk = alignchunk + alignment) {
++				((size_t)alignchunk + size) <= ((size_t)node + node->size);
++				alignchunk = (FAR struct mm_allocnode_s *)((size_t)alignchunk + alignment)) {
+ 
+ 				size_t alignsize = (size_t)alignchunk - (size_t)node + size;
+ 				size_t remainsize = (size_t)alignchunk - SIZEOF_MM_ALLOCNODE - (size_t)node;
+@@ -268,6 +277,13 @@ retry_after_gc:
+ 
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 		heapinfo_update_node((struct mm_allocnode_s *)node, caller_retaddr);
++#endif
++		/* Record the deeper call frames.  backtrace[0] already holds the
++		 * caller address stored by heapinfo_update_node() above; the
++		 * unwinder only fills backtrace[1] upwards.
++		 */
++		MM_ADD_BACKTRACE((FAR struct mm_allocnode_s *)node);
++#ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 		heapinfo_add_size(heap, ((struct mm_allocnode_s *)node)->pid, node->size);
+ 		heapinfo_update_total_size(heap, node->size, ((struct mm_allocnode_s *)node)->pid);
+ #endif
+diff --git a/os/mm/mm_heap/mm_realloc.c b/os/mm/mm_heap/mm_realloc.c
+index 19f2cb17..2d2b3dc0 100644
+--- a/os/mm/mm_heap/mm_realloc.c
++++ b/os/mm/mm_heap/mm_realloc.c
+@@ -162,7 +162,10 @@ FAR void *mm_realloc(FAR struct mm_heap_s *heap, FAR void *oldmem, size_t size,
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 			/* update the chunk to realloc task information */
+ 			heapinfo_update_node(oldnode, caller_retaddr);
+-
++#endif
++			/* Record the deeper call frames; backtrace[0] holds the caller. */
++			MM_ADD_BACKTRACE(oldnode);
++#ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 			heapinfo_add_size(heap, oldnode->pid, oldnode->size);
+ 			heapinfo_update_total_size(heap, oldnode->size, oldnode->pid);
+ #endif
+@@ -347,7 +350,10 @@ FAR void *mm_realloc(FAR struct mm_heap_s *heap, FAR void *oldmem, size_t size,
+ #ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 		/* update the chunk to realloc task information */
+ 		heapinfo_update_node(oldnode, caller_retaddr);
+-
++#endif
++		/* Record the deeper call frames; backtrace[0] holds the caller. */
++		MM_ADD_BACKTRACE(oldnode);
++#ifdef CONFIG_DEBUG_MM_HEAPINFO
+ 		heapinfo_add_size(heap, oldnode->pid, oldnode->size);
+ 		heapinfo_update_total_size(heap, oldnode->size, oldnode->pid);
+ #endif
+-- 
+2.43.0
+

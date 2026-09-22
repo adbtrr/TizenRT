@@ -1,0 +1,177 @@
+From f9d1e8cfd9bd8064a0b2922bb323529ded3257a4 Mon Sep 17 00:00:00 2001
+From: adbtrr_work22_bt <>
+Date: Tue, 22 Sep 2026 07:48:33 +0000
+Subject: [PATCH 2/2] apps/system/utils: add heapinfo -t and -s
+
+-t prints one line per live allocation with the call path recorded at
+malloc time, so a suspicious block can be traced back to the code that
+created it. It accepts the existing -p PID and -b NAME selectors, so a
+single task or a single application heap can be inspected.
+
+-s sets the number of innermost frames the unwinder drops, which is
+otherwise fixed at CONFIG_MM_BACKTRACE_SKIP. It is applied to the copy
+this binary allocates against and, through the mminfo driver, to the
+kernel's own copy, which in a protected or loadable build lives in a
+separate address space.
+
+Both options only exist where the allocator records a call path
+(CONFIG_MM_BACKTRACE > 0). The skip value is parsed with strtol and
+range-checked against HEAPINFO_BACKTRACE_SKIP_MAX rather than passed
+through atoi, since it reaches the unwinder on every allocation.
+
+-s and -t are acted on after option parsing rather than inside the loop,
+so the result does not depend on where they appear on the command line.
+getopt's optind is reset on entry because the command is run repeatedly
+from the shell.
+---
+ apps/system/utils/utils_heapinfo.c | 93 +++++++++++++++++++++++++++++-
+ 1 file changed, 91 insertions(+), 2 deletions(-)
+
+diff --git a/apps/system/utils/utils_heapinfo.c b/apps/system/utils/utils_heapinfo.c
+index b5cbb9ce..b175c8cf 100644
+--- a/apps/system/utils/utils_heapinfo.c
++++ b/apps/system/utils/utils_heapinfo.c
+@@ -49,6 +49,15 @@ const static char *end_list = CONFIG_HEAPINFO_USER_GROUP_LIST + sizeof(CONFIG_HE
+ #endif
+ 
+ #define HEAPINFO_BUFLEN 128
++
++/* Options accepted by heapinfo.  The -t and -s views only exist when the
++ * allocator records a call path per node.
++ */
++#if CONFIG_MM_BACKTRACE > 0
++#define HEAPINFO_OPTSTRING "ikb:d:ap:fgrs:t"
++#else
++#define HEAPINFO_OPTSTRING "ikb:d:ap:fgr"
++#endif
+ #define HEAPINFO_DISPLAY_ALL            0
+ #define HEAPINFO_DISPLAY_SPECIFIC_HEAP  1
+ #define HEAPINFO_DISPLAY_GROUP          2
+@@ -212,6 +221,11 @@ int utils_heapinfo(int argc, char **args)
+ 	int heapinfo_display_flag = HEAPINFO_DISPLAY_ALL;
+ 	bool init_flag = false;
+ 	bool bin_selected = false;
++#if CONFIG_MM_BACKTRACE > 0
++	bool backtrace_dump = false;
++	bool set_skip = false;
++	int skip = 0;
++#endif
+ 	heapinfo_option_t options;
+ 	options.heap_type = HEAPINFO_HEAP_TYPE_KERNEL;
+ 	options.mode = HEAPINFO_SIMPLE;
+@@ -224,7 +238,13 @@ int utils_heapinfo(int argc, char **args)
+ 		goto usage;
+ 	}
+ 
+-	while ((opt = getopt(argc, args, "ikb:d:ap:fgr")) != ERROR) {
++	/* Reset getopt's global state.  This command can be run repeatedly from
++	 * the shell, and a previous invocation leaves optind pointing past the
++	 * arguments it consumed.
++	 */
++	optind = 0;
++
++	while ((opt = getopt(argc, args, HEAPINFO_OPTSTRING)) != ERROR) {
+ 		switch (opt) {
+ 		/* i : initialize the peak allocated memory size. */
+ 		case 'i':
+@@ -282,6 +302,35 @@ int utils_heapinfo(int argc, char **args)
+ 			options.mode = HEAPINFO_SIMPLE;
+ 			heapinfo_display_flag = HEAPINFO_DISPLAY_GROUP;
+ 			break;
++#if CONFIG_MM_BACKTRACE > 0
++		/* t : dump the call path recorded in every live allocation.  A
++		 * preceding -p PID narrows it to one task.
++		 */
++		case 't':
++			backtrace_dump = true;
++			heapinfo_display_flag = HEAPINFO_DISPLAY_ALL;
++			break;
++		/* s : set the number of innermost frames the unwinder drops. */
++		case 's':
++			{
++				char *endptr;
++				long value;
++
++				/* strtol rather than atoi: the value is used as a frame count
++				 * by the unwinder on every allocation, so a negative or
++				 * non-numeric argument has to be rejected here instead of
++				 * being silently turned into 0.
++				 */
++				value = strtol(optarg, &endptr, 0);
++				if (*optarg == '\0' || *endptr != '\0' || value < 0 || value > HEAPINFO_BACKTRACE_SKIP_MAX) {
++					printf("Invalid skip value. Expected 0..%d\n", HEAPINFO_BACKTRACE_SKIP_MAX);
++					goto usage;
++				}
++				skip = (int)value;
++				set_skip = true;
++			}
++			break;
++#endif
+ 		case 'r':
+ #if CONFIG_KMM_REGIONS > 1
+ 			heapinfo_print_regions();
+@@ -296,6 +345,37 @@ int utils_heapinfo(int argc, char **args)
+ 		}
+ 	}
+ 
++#if CONFIG_MM_BACKTRACE > 0
++	if (set_skip) {
++		int mminfo_fd;
++
++		/* Set the copy this binary allocates against.  g_mm_backtrace_skip is
++		 * declared by <tinyara/mm/mm.h> and lives in the mm library linked
++		 * into this image, which in a flat build is the same object the
++		 * kernel uses.
++		 */
++		g_mm_backtrace_skip = skip;
++
++		/* In a protected or loadable build the kernel has its own copy in a
++		 * separate address space, reachable only through the mminfo driver.
++		 */
++		mminfo_fd = open(MMINFO_DRVPATH, O_RDWR);
++		if (mminfo_fd >= 0) {
++			ioctl(mminfo_fd, MMINFOIOC_SET_BACKTRACE_SKIP, (unsigned long)skip);
++			close(mminfo_fd);
++		}
++		printf("Backtrace skip value set to %d\n", skip);
++		return OK;
++	}
++
++	/* A backtrace dump wins over any display mode set earlier on the command
++	 * line, so "-t -p 5" and "-p 5 -t" behave identically.
++	 */
++	if (backtrace_dump) {
++		options.mode = HEAPINFO_DETAIL_BACKTRACE;
++	}
++#endif
++
+ #ifdef CONFIG_BUILD_PROTECTED
+ 	heapinfo_show_binname(init_flag, heap_name);
+ #endif
+@@ -341,7 +421,11 @@ int utils_heapinfo(int argc, char **args)
+ 	}
+ 	close(heapinfo_fd);
+ 
+-	if (options.mode != HEAPINFO_DUMP_HEAP) {
++	if (options.mode != HEAPINFO_DUMP_HEAP
++#if CONFIG_MM_BACKTRACE > 0
++		&& options.mode != HEAPINFO_DETAIL_BACKTRACE
++#endif
++	   ) {
+ 		if (init_flag == true) {
+ #ifdef CONFIG_BUILD_PROTECTED
+ 			printf("[%s]", heap_name);
+@@ -385,5 +469,10 @@ usage:
+ #endif
+ 	printf(" -i             Initialize the peak allocated size\n");
+ 	printf(" -d NAME	Dump entire heap. NAME can be either \"kernel\" or the app name\n");
++#if CONFIG_MM_BACKTRACE > 0
++	printf(" -t             Show the call path recorded for every live allocation.\n");
++	printf("                Combine with -p PID for one task, -b NAME for an app heap.\n");
++	printf(" -s SKIP        Set the number of innermost frames the unwinder drops\n");
++#endif
+ 	return ERROR;
+ }
+-- 
+2.43.0
+
