@@ -56,6 +56,27 @@
 #include <tinyara/compiler.h>
 
 /****************************************************************************
+ * Public Types
+ ****************************************************************************/
+
+/* Cases the self test can run.
+ *
+ * Every case but the first is expected to be reported and, unless the
+ * corresponding panic has been disabled, to assert. That is the pass
+ * condition, not a failure of the test.
+ */
+
+enum kasan_selftest_e {
+	KASAN_SELFTEST_INBOUNDS = 0,	/* Access inside the block. No report. */
+	KASAN_SELFTEST_OVERFLOW_WRITE,	/* Write one byte past the block */
+	KASAN_SELFTEST_OVERFLOW_READ,	/* Read one byte past the block */
+	KASAN_SELFTEST_UNDERFLOW,	/* Write one byte before the block */
+	KASAN_SELFTEST_USE_AFTER_FREE,	/* Write to a block already freed */
+	KASAN_SELFTEST_STRADDLE,	/* Word write across the block end */
+	KASAN_SELFTEST_MAX
+};
+
+/****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
 
@@ -199,6 +220,34 @@ void kasan_stop(void);
 #else
 #define kasan_start()
 #define kasan_stop()
+#endif
+
+/****************************************************************************
+ * Name: kasan_selftest
+ *
+ * Description:
+ *   Perform one deliberate memory error against the kernel heap so that the
+ *   instrumentation can be shown to work. Without this there is no way to
+ *   tell a system with no memory errors from a system where the
+ *   instrumentation was never emitted; both are silent.
+ *
+ *   Lives outside mm/ because everything under mm/ is built with
+ *   -fno-sanitize=kernel-address and so cannot raise a report.
+ *
+ *   Called directly from the test application: this is a flat build, so the
+ *   application and the kernel are one image and one link.
+ *
+ * Input Parameters:
+ *   testcase - one of enum kasan_selftest_e
+ *
+ * Returned Value:
+ *   Zero when KASAN_SELFTEST_INBOUNDS completed with nothing reported, or a
+ *   negated errno. The remaining cases are not expected to return at all.
+ *
+ ****************************************************************************/
+
+#ifdef CONFIG_MM_KASAN_SELFTEST
+int kasan_selftest(int testcase);
 #endif
 
 #ifdef __cplusplus
