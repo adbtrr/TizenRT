@@ -136,6 +136,52 @@ ifeq ($(CONFIG_FRAME_POINTER),y)
   ARCHOPTIMIZATION += -fomit-frame-pointer -mapcs -mno-sched-prolog
 endif
 
+# KASan instrumentation.
+#
+# Every configuration this board ships but two is CONFIG_BUILD_FLAT, where
+# there is one image and one heap, so everything is instrumented and the
+# KERNEL test below never fires. The test is kept so that the two protected
+# configurations, cpp_loadable and loadable_apps, behave like rtl8730e: there
+# the user libraries allocate from a heap that is never registered with KASan,
+# and instrumenting them would emit a call for every access that then returns
+# having found no region to check.
+#
+# os/mm is excluded separately by its own Make.defs, because the sanitizer
+# must not instrument itself.
+#
+# KERNEL is set on the command line by os/LibTargets.mk: y for the kernel
+# libraries, n for the user ones. It is unset for the flat build.
+
+ifeq ($(CONFIG_MM_KASAN_INSTRUMENT_ALL),y)
+  KASAN_THIS_PASS = y
+  ifneq ($(CONFIG_BUILD_FLAT),y)
+    ifeq ($(KERNEL),n)
+      KASAN_THIS_PASS =
+    endif
+  endif
+endif
+
+ifeq ($(KASAN_THIS_PASS),y)
+  ARCHOPTIMIZATION += -fsanitize=kernel-address
+
+  # The call threshold at 0 forces outline instrumentation: every access
+  # becomes a helper call, so the runtime resolves the shadow itself. Inline
+  # instrumentation would need the shadow at a link time constant address,
+  # and this port carves it out of the heap at run time.
+  KASAN_PARAM += asan-stack=0
+  KASAN_PARAM += asan-globals=0
+  KASAN_PARAM += asan-instrumentation-with-call-threshold=0
+
+  ifeq ($(CONFIG_MM_KASAN_DISABLE_READS_CHECK),y)
+    KASAN_PARAM += asan-instrument-reads=0
+  endif
+  ifeq ($(CONFIG_MM_KASAN_DISABLE_WRITES_CHECK),y)
+    KASAN_PARAM += asan-instrument-writes=0
+  endif
+
+  ARCHOPTIMIZATION += $(addprefix --param ,$(KASAN_PARAM))
+endif
+
 ARCHCFLAGS = -fno-builtin -fno-common -mcpu=cortex-m33 -mfpu=fpv5-sp-d16
 ARCHCXXFLAGS = -fno-builtin -mcpu=cortex-m33 -mfpu=fpv5-sp-d16
 

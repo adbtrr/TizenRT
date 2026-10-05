@@ -53,23 +53,31 @@
 
 include $(TOPDIR)/.config
 
-# KASan instruments the kernel only.
+# KASan instruments the kernel only, in a split build.
 #
-# Everything built under apps/ is archived into libapps and linked into the
-# user and common binaries. Those link lines carry no KASan runtime: it lives
-# in libkmm, which only the kernel image links. An instrumented object here is
-# therefore an unresolvable reference rather than a slow one, and the failure
-# lands at the end of a full build.
+# There, everything built under apps/ is archived into libapps and linked into
+# the user and common binaries. Those link lines carry no KASan runtime: it
+# lives in libkmm, which only the kernel image links. An instrumented object
+# here is therefore an unresolvable reference rather than a slow one, and the
+# failure lands at the end of a full build.
 #
 # os/LibTargets.mk does pass KERNEL=n when it builds libapps, which is what
 # the board Make.defs tests before adding -fsanitize=kernel-address. This does
 # not rely on that reaching every sub-make below it. The test there is an opt
 # out, so a pass which loses the variable is instrumented rather than skipped,
 # and this file is included by every Makefile under apps/.
+#
+# A flat build is the opposite case and must not be excluded. There is one
+# image, one heap, and os/FlatLibs.mk puts libapps and libmm into the same
+# TINYARALIBS list, so an instrumented object under apps/ resolves against the
+# runtime on the very same link line. Excluding it would give up coverage of
+# most of the code on a flat target for no link reason at all.
 
 ifeq ($(CONFIG_MM_KASAN),y)
+ifneq ($(CONFIG_BUILD_FLAT),y)
 CFLAGS += -fno-sanitize=kernel-address
 CXXFLAGS += -fno-sanitize=kernel-address
+endif
 endif
 
 # Builtin Registration
