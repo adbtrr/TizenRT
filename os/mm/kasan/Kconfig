@@ -74,6 +74,28 @@ config MM_KASAN_INSTRUMENT_ALL
 		NOTE: the board Make.defs must act on this symbol for it to have
 		any effect. A board which does not yet do so builds unchanged.
 
+config MM_KASAN_INSTRUMENT_BOARD
+	bool "Instrument the vendor board support code as well"
+	depends on MM_KASAN_INSTRUMENT_ALL
+	default n
+	---help---
+		Include the vendor board support code, os/board/<board>/src, in
+		instrumentation.
+
+		Off by default. That code is large, the flat image has a fixed
+		partition to fit into, and it is the least likely place for a
+		first bring-up to want coverage. Bring the board up with
+		TizenRT's own code instrumented, confirm a clean boot with no
+		reports, then turn this on to widen.
+
+		On rtl8721csm this also keeps the sanitizer away from the
+		TrustZone secure gateway veneers which the prebuilt cmse_implib
+		archives call into.
+
+		Note that the vendor libraries which ship as binaries cannot be
+		instrumented at all whatever this is set to, so some of the board
+		remains invisible either way.
+
 if MM_KASAN_INSTRUMENT
 
 config MM_KASAN_REGIONS
