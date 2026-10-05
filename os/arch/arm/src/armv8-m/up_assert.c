@@ -87,6 +87,7 @@
 #include <tinyara/sched.h>
 
 #include <tinyara/mm/mm.h>
+#include <tinyara/mm/kasan.h>
 
 #ifdef CONFIG_APP_BINARY_SEPARATION
 #include <tinyara/binfmt/elf.h>
@@ -596,6 +597,27 @@ void up_assert(const uint8_t *filename, int lineno)
 {
 
 	irqstate_t flags = irqsave();
+
+	/* Stop checking for the rest of this call.
+	 *
+	 * An assert raised by KASan itself arrives with checking already off;
+	 * kasan_report() stops it before it prints. This is for the other
+	 * direction: an assert from anywhere else, whose dump then reads
+	 * poisoned memory and raises a report from inside the dump. A task
+	 * which aborted on a freed TCB or a freed stack does exactly that, and
+	 * the report would PANIC() back into this function, find the state
+	 * already ABORT_STATE and go straight to the kernel fault path below,
+	 * discarding the dump that was being collected.
+	 *
+	 * The dump is the more useful of the two, and the memory error that
+	 * would have been reported is a consequence of the fault being dumped
+	 * rather than a separate finding.
+	 *
+	 * Nothing re-enables it. Either the board resets, or execution
+	 * continues with whatever reports were already made.
+	 */
+
+	kasan_stop();
 
 	/* Add new line to distinguish between normal log and assert log.*/
 	lldbg_noarg("\n");
