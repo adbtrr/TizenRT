@@ -1,0 +1,238 @@
+From 6c2c6b684efcabe2aa8d7e704096df7c8c36c08a Mon Sep 17 00:00:00 2001
+From: adbtrr_work5_kasan_flat <adbtrr_work5_kasan_flat@local>
+Date: Mon, 5 Oct 2026 11:04:46 +0000
+Subject: [PATCH] mm/kasan: wire the instrumentation for rtl8721csm and the
+ flat build
+
+Extends the port to a second board and, with it, to the flat build model
+and to armv8-m. The runtime, the allocator hooks and the self test need no
+change: nothing under os/mm/kasan is architecture specific, and the only
+width assumption is sizeof(uintptr_t), which is 4 on Cortex-M33 as it is
+on Cortex-A32.
+
+Four changes.
+
+build/configs/rtl8721csm/Make.defs gains the same instrumentation block
+rtl8730e carries. Nine of this board's eleven configurations are
+CONFIG_BUILD_FLAT, where there is one image and one heap, so everything is
+instrumented and the KERNEL test never fires. The test is kept for
+cpp_loadable and loadable_apps, the two protected configurations, where
+the user libraries allocate from a heap that is never registered.
+
+os/board/rtl8721csm/src/Makefile excludes the vendor board support code
+unless CONFIG_MM_KASAN_INSTRUMENT_BOARD asks for it, as on rtl8730e. On
+this board that also keeps the sanitizer away from the TrustZone secure
+gateway veneers which the prebuilt cmse_implib archives call into.
+
+os/arch/arm/src/armv8-m/up_assert.c stops checking for the duration of the
+dump. The function has the same shape as the armv7-a one: a recursive
+abort test on entry and a check_heap_corrupt() call later, so an assert
+that did not come from KASan can read a freed TCB, raise a report from
+inside the dump, re-enter and lose the dump. up_assert.c is in CMN_CSRCS
+for amebad, so it builds in the kernel pass only and cannot reference a
+runtime that is not linked.
+
+apps/Make.defs stops excluding apps/ in a flat build. The exclusion exists
+because in a split build libapps is linked into the user and common
+binaries, which carry no runtime. A flat build is the opposite case:
+os/FlatLibs.mk puts libapps and libmm into the same TINYARALIBS list, so
+an instrumented object under apps/ resolves against the runtime on the
+very same link line. Excluding it gave up coverage of most of the code on
+a flat target for no link reason, which would have made this port much
+less useful than it looks.
+
+Verified by evaluating the real board Make.defs across every pass. Flat:
+os/ instrumented, apps/ instrumented. Protected: kernel pass
+instrumented, user pass not, apps/ not with KERNEL=n and not with KERNEL
+unset, which is the case patch 0006 exists to catch. The assert insertion
+compiles clean under -Wall -Werror with KASan off, flat with KASan on,
+protected kernel, and in the none mode.
+
+Not verified, and it decides whether any of this runs: GCC support for
+-fsanitize=kernel-address on Cortex-M33. The sanitizer is a middle end
+pass and should be architecture neutral, but no toolchain was available to
+confirm it. Build an instrumented object with the board's own CPU flags
+and check for __asan_load4_noabort before trusting this patch.
+
+The flash budget is the other open question. The flat kernel partition is
+1792 KB and holds the whole image, where rtl8730e has 2868 KB for the
+kernel alone and separate partitions for the applications. The 30 to 50
+percent growth therefore applies to everything against a smaller box. RAM
+is comfortable: the shadow costs about 13.8 KB of the 456 KB SRAM region
+and 93 KB of the 3 MB PSRAM region.
+---
+ apps/Make.defs                      | 20 +++++++++----
+ build/configs/rtl8721csm/Make.defs  | 46 +++++++++++++++++++++++++++++
+ os/arch/arm/src/armv8-m/up_assert.c | 22 ++++++++++++++
+ os/board/rtl8721csm/src/Makefile    | 15 ++++++++++
+ 4 files changed, 97 insertions(+), 6 deletions(-)
+
+diff --git a/apps/Make.defs b/apps/Make.defs
+index 9a903d11..d6c9f9a6 100644
+--- a/apps/Make.defs
++++ b/apps/Make.defs
+@@ -53,24 +53,32 @@
+ 
+ include $(TOPDIR)/.config
+ 
+-# KASan instruments the kernel only.
++# KASan instruments the kernel only, in a split build.
+ #
+-# Everything built under apps/ is archived into libapps and linked into the
+-# user and common binaries. Those link lines carry no KASan runtime: it lives
+-# in libkmm, which only the kernel image links. An instrumented object here is
+-# therefore an unresolvable reference rather than a slow one, and the failure
+-# lands at the end of a full build.
++# There, everything built under apps/ is archived into libapps and linked into
++# the user and common binaries. Those link lines carry no KASan runtime: it
++# lives in libkmm, which only the kernel image links. An instrumented object
++# here is therefore an unresolvable reference rather than a slow one, and the
++# failure lands at the end of a full build.
+ #
+ # os/LibTargets.mk does pass KERNEL=n when it builds libapps, which is what
+ # the board Make.defs tests before adding -fsanitize=kernel-address. This does
+ # not rely on that reaching every sub-make below it. The test there is an opt
+ # out, so a pass which loses the variable is instrumented rather than skipped,
+ # and this file is included by every Makefile under apps/.
++#
++# A flat build is the opposite case and must not be excluded. There is one
++# image, one heap, and os/FlatLibs.mk puts libapps and libmm into the same
++# TINYARALIBS list, so an instrumented object under apps/ resolves against the
++# runtime on the very same link line. Excluding it would give up coverage of
++# most of the code on a flat target for no link reason at all.
+ 
+ ifeq ($(CONFIG_MM_KASAN),y)
++ifneq ($(CONFIG_BUILD_FLAT),y)
+ CFLAGS += -fno-sanitize=kernel-address
+ CXXFLAGS += -fno-sanitize=kernel-address
+ endif
++endif
+ 
+ # Builtin Registration
+ 
+diff --git a/build/configs/rtl8721csm/Make.defs b/build/configs/rtl8721csm/Make.defs
+index 34241df4..8afa8206 100644
+--- a/build/configs/rtl8721csm/Make.defs
++++ b/build/configs/rtl8721csm/Make.defs
+@@ -136,6 +136,52 @@ ifeq ($(CONFIG_FRAME_POINTER),y)
+   ARCHOPTIMIZATION += -fomit-frame-pointer -mapcs -mno-sched-prolog
+ endif
+ 
++# KASan instrumentation.
++#
++# Every configuration this board ships but two is CONFIG_BUILD_FLAT, where
++# there is one image and one heap, so everything is instrumented and the
++# KERNEL test below never fires. The test is kept so that the two protected
++# configurations, cpp_loadable and loadable_apps, behave like rtl8730e: there
++# the user libraries allocate from a heap that is never registered with KASan,
++# and instrumenting them would emit a call for every access that then returns
++# having found no region to check.
++#
++# os/mm is excluded separately by its own Make.defs, because the sanitizer
++# must not instrument itself.
++#
++# KERNEL is set on the command line by os/LibTargets.mk: y for the kernel
++# libraries, n for the user ones. It is unset for the flat build.
++
++ifeq ($(CONFIG_MM_KASAN_INSTRUMENT_ALL),y)
++  KASAN_THIS_PASS = y
++  ifneq ($(CONFIG_BUILD_FLAT),y)
++    ifeq ($(KERNEL),n)
++      KASAN_THIS_PASS =
++    endif
++  endif
++endif
++
++ifeq ($(KASAN_THIS_PASS),y)
++  ARCHOPTIMIZATION += -fsanitize=kernel-address
++
++  # The call threshold at 0 forces outline instrumentation: every access
++  # becomes a helper call, so the runtime resolves the shadow itself. Inline
++  # instrumentation would need the shadow at a link time constant address,
++  # and this port carves it out of the heap at run time.
++  KASAN_PARAM += asan-stack=0
++  KASAN_PARAM += asan-globals=0
++  KASAN_PARAM += asan-instrumentation-with-call-threshold=0
++
++  ifeq ($(CONFIG_MM_KASAN_DISABLE_READS_CHECK),y)
++    KASAN_PARAM += asan-instrument-reads=0
++  endif
++  ifeq ($(CONFIG_MM_KASAN_DISABLE_WRITES_CHECK),y)
++    KASAN_PARAM += asan-instrument-writes=0
++  endif
++
++  ARCHOPTIMIZATION += $(addprefix --param ,$(KASAN_PARAM))
++endif
++
+ ARCHCFLAGS = -fno-builtin -fno-common -mcpu=cortex-m33 -mfpu=fpv5-sp-d16
+ ARCHCXXFLAGS = -fno-builtin -mcpu=cortex-m33 -mfpu=fpv5-sp-d16
+ 
+diff --git a/os/arch/arm/src/armv8-m/up_assert.c b/os/arch/arm/src/armv8-m/up_assert.c
+index 48a1757d..e9359582 100644
+--- a/os/arch/arm/src/armv8-m/up_assert.c
++++ b/os/arch/arm/src/armv8-m/up_assert.c
+@@ -87,6 +87,7 @@
+ #include <tinyara/sched.h>
+ 
+ #include <tinyara/mm/mm.h>
++#include <tinyara/mm/kasan.h>
+ 
+ #ifdef CONFIG_APP_BINARY_SEPARATION
+ #include <tinyara/binfmt/elf.h>
+@@ -597,6 +598,27 @@ void up_assert(const uint8_t *filename, int lineno)
+ 
+ 	irqstate_t flags = irqsave();
+ 
++	/* Stop checking for the rest of this call.
++	 *
++	 * An assert raised by KASan itself arrives with checking already off;
++	 * kasan_report() stops it before it prints. This is for the other
++	 * direction: an assert from anywhere else, whose dump then reads
++	 * poisoned memory and raises a report from inside the dump. A task
++	 * which aborted on a freed TCB or a freed stack does exactly that, and
++	 * the report would PANIC() back into this function, find the state
++	 * already ABORT_STATE and go straight to the kernel fault path below,
++	 * discarding the dump that was being collected.
++	 *
++	 * The dump is the more useful of the two, and the memory error that
++	 * would have been reported is a consequence of the fault being dumped
++	 * rather than a separate finding.
++	 *
++	 * Nothing re-enables it. Either the board resets, or execution
++	 * continues with whatever reports were already made.
++	 */
++
++	kasan_stop();
++
+ 	/* Add new line to distinguish between normal log and assert log.*/
+ 	lldbg_noarg("\n");
+ 
+diff --git a/os/board/rtl8721csm/src/Makefile b/os/board/rtl8721csm/src/Makefile
+index 8aaae455..e9e3e6a5 100644
+--- a/os/board/rtl8721csm/src/Makefile
++++ b/os/board/rtl8721csm/src/Makefile
+@@ -51,6 +51,21 @@
+ 
+ -include $(TOPDIR)/Make.defs
+ 
++# The vendor board support code is left out of KASan instrumentation unless it
++# is asked for. It is large, and the single flat image has a fixed partition to
++# fit into, so a first bring-up covers TizenRT's own code and widens later.
++# See CONFIG_MM_KASAN_INSTRUMENT_BOARD.
++#
++# This also keeps the sanitizer away from the TrustZone secure gateway veneers
++# and the code behind them, which the prebuilt cmse_implib archives call into.
++
++ifeq ($(CONFIG_MM_KASAN),y)
++ifneq ($(CONFIG_MM_KASAN_INSTRUMENT_BOARD),y)
++CFLAGS += -fno-sanitize=kernel-address
++CXXFLAGS += -fno-sanitize=kernel-address
++endif
++endif
++
+ DEPPATH = --dep-path .
+ VPATH = .
+ ASRCS =
+-- 
+2.43.0
+
