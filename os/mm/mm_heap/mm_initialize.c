@@ -63,6 +63,7 @@
 
 #include <tinyara/sched.h>
 #include <tinyara/mm/mm.h>
+#include <tinyara/mm/kasan.h>
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -138,6 +139,35 @@ int mm_addregion(FAR struct mm_heap_s *heap, FAR void *heapstart, size_t heapsiz
 		return -EINVAL;
 	}
 	heapsize = heapend - heapbase;
+
+	/* Hand the region to KASan before the heap is laid out over it, but only
+	 * if this is the kernel heap.
+	 *
+	 * This port is flat only, so there is one memory manager and one image.
+	 * The test is still on which heap is being built rather than on the
+	 * build model, because binfmt calls mm_initialize() to build the user
+	 * heap of every application it loads when CONFIG_APP_BINARY_SEPARATION
+	 * is set, which a flat build may also do. Registering those would carve
+	 * a shadow out of an application's heap and poison memory that nothing
+	 * ever unpoisons.
+	 *
+	 * kasan_register() carves its shadow out of the tail of the region and
+	 * reduces heapsize by that much, so heapend has to be recomputed from
+	 * the reduced size. Registering after the guard nodes were placed would
+	 * put the heap and its own shadow on top of each other.
+	 */
+
+	if (heap >= g_kmmheap && heap < &g_kmmheap[CONFIG_KMM_NHEAPS]) {
+		kasan_register((FAR void *)heapbase, &heapsize);
+
+		heapend = MM_ALIGN_DOWN(heapbase + heapsize);
+		heapsize = heapend - heapbase;
+
+		if (heapbase >= (uintptr_t)heapend) {
+			mdbg("ERROR : region too small once the KASan shadow is carved out.\n");
+			return -EINVAL;
+		}
+	}
 
 	mlldbg("Region %d: base=%p size=%u\n", IDX + 1, heapstart, heapsize);
 
