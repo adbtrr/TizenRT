@@ -1,0 +1,150 @@
+From 832be0dc4818d4d16630699f23c1ebf8ea9053ea Mon Sep 17 00:00:00 2001
+From: adbtrr_work5_kasan_flat_only <adbtrr_work5_kasan_flat_only@local>
+Date: Mon, 5 Oct 2026 11:44:29 +0000
+Subject: [PATCH 3/5] mm/kasan: wire the instrumentation flags for rtl8721csm
+
+The runtime and the allocator hooks are in place but nothing calls them
+yet, because nothing is compiled with -fsanitize=kernel-address. This adds
+the flags.
+
+The call threshold at zero forces outline instrumentation. That is not a
+tuning choice: inline instrumentation computes the shadow address with
+arithmetic the compiler fixes at build time, which needs the shadow at a
+link time constant address, and this port carves it out of the heap at run
+time. Stack and global instrumentation are off for the same reason.
+
+Because this port targets the flat build, where there is one image and one
+heap, the whole image is instrumented and there is no second compilation
+pass to distinguish. Two exclusions remain, both deliberate.
+
+os/mm is excluded by its own Make.defs. The sanitizer must not instrument
+itself or the first shadow lookup recurses forever, and excluding the rest
+of the memory manager with it is what makes the allocator safe to
+instrument at all: the free path writes its delay list link into a block
+it has just poisoned, and the heap walkers read every free node by design.
+
+The vendor board support code is excluded unless
+CONFIG_MM_KASAN_INSTRUMENT_BOARD asks for it. It is large, the flat image
+has a fixed partition to fit into, and it is the least likely place a
+first bring-up wants coverage. On this board it also keeps the sanitizer
+away from the TrustZone secure gateway veneers that the prebuilt
+cmse_implib archives call into. The vendor libraries which ship as
+binaries cannot be instrumented whatever this is set to.
+
+Verified by evaluating the real board Make.defs against the tc defconfig:
+instrumented with the option on, not instrumented with
+MM_KASAN_INSTRUMENT_ALL cleared, and not instrumented with KASan off.
+
+Not verified, and it decides whether any of this runs: GCC support for
+-fsanitize=kernel-address on Cortex-M33. The sanitizer is a middle end
+pass and should be architecture neutral, but no toolchain was available to
+confirm it. Build an instrumented object with the board's own CPU flags
+and check for __asan_load4_noabort before trusting this patch.
+---
+ build/configs/rtl8721csm/Make.defs | 29 +++++++++++++++++++++++++++++
+ os/board/rtl8721csm/src/Makefile   | 15 +++++++++++++++
+ os/mm/kasan/Kconfig                | 22 ++++++++++++++++++++++
+ 3 files changed, 66 insertions(+)
+
+diff --git a/build/configs/rtl8721csm/Make.defs b/build/configs/rtl8721csm/Make.defs
+index 34241df4..708c5771 100644
+--- a/build/configs/rtl8721csm/Make.defs
++++ b/build/configs/rtl8721csm/Make.defs
+@@ -136,6 +136,35 @@ ifeq ($(CONFIG_FRAME_POINTER),y)
+   ARCHOPTIMIZATION += -fomit-frame-pointer -mapcs -mno-sched-prolog
+ endif
+ 
++# KASan instrumentation.
++#
++# This port targets the flat build, where there is one image and one heap, so
++# the whole image is instrumented and there is no second compilation pass to
++# distinguish. os/mm is excluded separately by its own Make.defs, because the
++# sanitizer must not instrument itself, and the vendor board support code is
++# excluded by os/board/rtl8721csm/src/Makefile.
++
++ifeq ($(CONFIG_MM_KASAN_INSTRUMENT_ALL),y)
++  ARCHOPTIMIZATION += -fsanitize=kernel-address
++
++  # The call threshold at 0 forces outline instrumentation: every access
++  # becomes a helper call, so the runtime resolves the shadow itself. Inline
++  # instrumentation would need the shadow at a link time constant address,
++  # and this port carves it out of the heap at run time.
++  KASAN_PARAM += asan-stack=0
++  KASAN_PARAM += asan-globals=0
++  KASAN_PARAM += asan-instrumentation-with-call-threshold=0
++
++  ifeq ($(CONFIG_MM_KASAN_DISABLE_READS_CHECK),y)
++    KASAN_PARAM += asan-instrument-reads=0
++  endif
++  ifeq ($(CONFIG_MM_KASAN_DISABLE_WRITES_CHECK),y)
++    KASAN_PARAM += asan-instrument-writes=0
++  endif
++
++  ARCHOPTIMIZATION += $(addprefix --param ,$(KASAN_PARAM))
++endif
++
+ ARCHCFLAGS = -fno-builtin -fno-common -mcpu=cortex-m33 -mfpu=fpv5-sp-d16
+ ARCHCXXFLAGS = -fno-builtin -mcpu=cortex-m33 -mfpu=fpv5-sp-d16
+ 
+diff --git a/os/board/rtl8721csm/src/Makefile b/os/board/rtl8721csm/src/Makefile
+index 8aaae455..e9e3e6a5 100644
+--- a/os/board/rtl8721csm/src/Makefile
++++ b/os/board/rtl8721csm/src/Makefile
+@@ -51,6 +51,21 @@
+ 
+ -include $(TOPDIR)/Make.defs
+ 
++# The vendor board support code is left out of KASan instrumentation unless it
++# is asked for. It is large, and the single flat image has a fixed partition to
++# fit into, so a first bring-up covers TizenRT's own code and widens later.
++# See CONFIG_MM_KASAN_INSTRUMENT_BOARD.
++#
++# This also keeps the sanitizer away from the TrustZone secure gateway veneers
++# and the code behind them, which the prebuilt cmse_implib archives call into.
++
++ifeq ($(CONFIG_MM_KASAN),y)
++ifneq ($(CONFIG_MM_KASAN_INSTRUMENT_BOARD),y)
++CFLAGS += -fno-sanitize=kernel-address
++CXXFLAGS += -fno-sanitize=kernel-address
++endif
++endif
++
+ DEPPATH = --dep-path .
+ VPATH = .
+ ASRCS =
+diff --git a/os/mm/kasan/Kconfig b/os/mm/kasan/Kconfig
+index e46ee565..0d6f4bf5 100644
+--- a/os/mm/kasan/Kconfig
++++ b/os/mm/kasan/Kconfig
+@@ -74,6 +74,28 @@ config MM_KASAN_INSTRUMENT_ALL
+ 		NOTE: the board Make.defs must act on this symbol for it to have
+ 		any effect. A board which does not yet do so builds unchanged.
+ 
++config MM_KASAN_INSTRUMENT_BOARD
++	bool "Instrument the vendor board support code as well"
++	depends on MM_KASAN_INSTRUMENT_ALL
++	default n
++	---help---
++		Include the vendor board support code, os/board/<board>/src, in
++		instrumentation.
++
++		Off by default. That code is large, the flat image has a fixed
++		partition to fit into, and it is the least likely place for a
++		first bring-up to want coverage. Bring the board up with
++		TizenRT's own code instrumented, confirm a clean boot with no
++		reports, then turn this on to widen.
++
++		On rtl8721csm this also keeps the sanitizer away from the
++		TrustZone secure gateway veneers which the prebuilt cmse_implib
++		archives call into.
++
++		Note that the vendor libraries which ship as binaries cannot be
++		instrumented at all whatever this is set to, so some of the board
++		remains invisible either way.
++
+ if MM_KASAN_INSTRUMENT
+ 
+ config MM_KASAN_REGIONS
+-- 
+2.43.0
+

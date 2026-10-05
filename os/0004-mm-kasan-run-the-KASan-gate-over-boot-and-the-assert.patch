@@ -1,0 +1,119 @@
+From 951cde1ff942fca3eca895546add5a50847f83f4 Mon Sep 17 00:00:00 2001
+From: adbtrr_work5_kasan_flat_only <adbtrr_work5_kasan_flat_only@local>
+Date: Mon, 5 Oct 2026 11:44:29 +0000
+Subject: [PATCH 4/5] mm/kasan: run the KASan gate over boot and the assert
+ path
+
+Two integration points the runtime and the allocator hooks cannot reach
+from inside mm/.
+
+os_start() closes the gate before anything else runs. Instrumented code
+executes from the first line of the kernel, long before a heap exists, and
+a check taken then would look for a shadow map that has not been carved
+yet. The gate lives in .bss, so on a platform which clears .bss before
+reaching here it is already closed and the call changes nothing. It is
+kept because that ordering belongs to the startup code and is not
+something mm/ can assume.
+
+up_assert() stops checking for the duration of the dump. A report raised
+by KASan itself already arrives with checking off, since kasan_report()
+stops it before printing; this covers the opposite case, where an assert
+from somewhere else dumps a task whose TCB or stack has been freed.
+Reading that poisoned memory would raise a report, re-enter up_assert(),
+find the state already ABORT_STATE and go straight to the kernel fault
+path, discarding the dump being collected. The dump is worth more than the
+report, and the report is a consequence of the fault being dumped rather
+than a separate finding.
+
+Only armv8-m is touched, the family rtl8721csm builds as. The other assert
+handlers are left alone for the same reason the other boards are: nothing
+wires the instrumentation flags for them, so KASan cannot be enabled there
+and the change would be untestable.
+
+up_assert.c is in CMN_CSRCS for amebad and os_start.c is under kernel/, so
+both are part of the single flat image and neither can reference a runtime
+that is not linked.
+
+With CONFIG_MM_KASAN off both additions preprocess away to a null
+statement. Checked under -Wall -Werror with KASan off, with KASan on, and
+in the none mode.
+---
+ os/arch/arm/src/armv8-m/up_assert.c | 22 ++++++++++++++++++++++
+ os/kernel/init/os_start.c           | 14 ++++++++++++++
+ 2 files changed, 36 insertions(+)
+
+diff --git a/os/arch/arm/src/armv8-m/up_assert.c b/os/arch/arm/src/armv8-m/up_assert.c
+index 48a1757d..e9359582 100644
+--- a/os/arch/arm/src/armv8-m/up_assert.c
++++ b/os/arch/arm/src/armv8-m/up_assert.c
+@@ -87,6 +87,7 @@
+ #include <tinyara/sched.h>
+ 
+ #include <tinyara/mm/mm.h>
++#include <tinyara/mm/kasan.h>
+ 
+ #ifdef CONFIG_APP_BINARY_SEPARATION
+ #include <tinyara/binfmt/elf.h>
+@@ -597,6 +598,27 @@ void up_assert(const uint8_t *filename, int lineno)
+ 
+ 	irqstate_t flags = irqsave();
+ 
++	/* Stop checking for the rest of this call.
++	 *
++	 * An assert raised by KASan itself arrives with checking already off;
++	 * kasan_report() stops it before it prints. This is for the other
++	 * direction: an assert from anywhere else, whose dump then reads
++	 * poisoned memory and raises a report from inside the dump. A task
++	 * which aborted on a freed TCB or a freed stack does exactly that, and
++	 * the report would PANIC() back into this function, find the state
++	 * already ABORT_STATE and go straight to the kernel fault path below,
++	 * discarding the dump that was being collected.
++	 *
++	 * The dump is the more useful of the two, and the memory error that
++	 * would have been reported is a consequence of the fault being dumped
++	 * rather than a separate finding.
++	 *
++	 * Nothing re-enables it. Either the board resets, or execution
++	 * continues with whatever reports were already made.
++	 */
++
++	kasan_stop();
++
+ 	/* Add new line to distinguish between normal log and assert log.*/
+ 	lldbg_noarg("\n");
+ 
+diff --git a/os/kernel/init/os_start.c b/os/kernel/init/os_start.c
+index 1928e131..9c929aa4 100644
+--- a/os/kernel/init/os_start.c
++++ b/os/kernel/init/os_start.c
+@@ -68,6 +68,7 @@
+ #include  <tinyara/net/net.h>
+ #include  <tinyara/lib.h>
+ #include  <tinyara/mm/mm.h>
++#include  <tinyara/mm/kasan.h>
+ #include  <tinyara/kmalloc.h>
+ #include  <tinyara/init.h>
+ #include  <tinyara/pm/pm.h>
+@@ -424,6 +425,19 @@ void os_start(void)
+ {
+ 	int i;
+ 
++	/* Hold KASan off until a heap registers a region and a shadow map
++	 * exists to check against. This must be the first statement: everything
++	 * below is instrumented, and a check taken before any region is
++	 * registered would read a shadow map that is not there.
++	 *
++	 * The gate lives in .bss, so on a platform which clears .bss before
++	 * reaching here it is already closed and this call changes nothing.
++	 * It is kept because that ordering is a property of the startup code,
++	 * not something the memory manager can rely on.
++	 */
++
++	kasan_init_early();
++
+ 	slldbg("Entry\n");
+ 
+ 	g_os_initstate = OSINIT_BOOT;
+-- 
+2.43.0
+
