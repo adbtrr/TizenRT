@@ -1,0 +1,253 @@
+From 746dc51cfc6dea1791f88b5894bbc8ef049c1126 Mon Sep 17 00:00:00 2001
+From: adbtrr_work5_kasan_flat_only <adbtrr_work5_kasan_flat_only@local>
+Date: Wed, 7 Oct 2026 06:51:37 +0000
+Subject: [PATCH] mm/kasan: allow checking to be held back until it is asked
+ for
+
+Checking currently goes live the moment the first heap registers, which is
+very early in os_start(). The whole of boot then runs instrumented:
+drivers, Wi-Fi, the filesystem, the binary manager. That is where driver
+and vendor bugs eventually have to be found, but it is not where to begin,
+because a report from any of them stops the board before it reaches a
+prompt and there is no way to get a result out of a test that never runs.
+
+CONFIG_MM_KASAN_START_MANUAL holds reporting back. Regions still register
+and the region is still poisoned at registration; only the kasan_start()
+call is skipped, so the gate the instrumentation entry points test never
+opens until something opens it.
+
+The distinction that makes this safe is that reporting and shadow
+maintenance are separate. Every poison and unpoison the allocator performs
+happens whether or not reporting is on, so the map stays accurate the
+whole time and a block handed out during boot is tracked exactly like one
+handed out afterwards. Arming later therefore gives correct answers about
+memory that is already in use, including a use after free of something
+allocated long before.
+
+What it cannot do is report retroactively. KASan reports at the moment of
+access, so anything that went wrong while disarmed is simply not seen, and
+a boot time overflow can surface later as a confusing failure somewhere
+else. The Kconfig help says so, and says to boot once armed when the tests
+are clean.
+
+kasan_is_armed() reads the same gate, so the shell can say which state the
+system is in rather than leaving it to be inferred. It is a macro
+returning false when KASan is off, so the header stays complete in every
+configuration even though the application is not built in that case.
+
+The kasan_test application grows arm, disarm and status. They call
+kasan_start() and kasan_stop() straight through, as the self test already
+does: this is a flat build, so the application and the kernel are one
+image and one link.
+
+Default n, so nothing changes unless it is asked for. Checked under -Wall
+-Werror in four configurations, and the runtime produces the same
+diagnostic count as before the change.
+---
+ apps/system/kasan_test/kasan_test_main.c | 47 +++++++++++++++++++++++-
+ os/include/tinyara/mm/kasan.h            | 14 +++++++
+ os/mm/kasan/Kconfig                      | 30 +++++++++++++++
+ os/mm/kasan/generic.c                    | 13 ++++++-
+ os/mm/kasan/hook.c                       | 15 ++++++++
+ 5 files changed, 116 insertions(+), 3 deletions(-)
+
+diff --git a/apps/system/kasan_test/kasan_test_main.c b/apps/system/kasan_test/kasan_test_main.c
+index f7822895..3df8ae46 100644
+--- a/apps/system/kasan_test/kasan_test_main.c
++++ b/apps/system/kasan_test/kasan_test_main.c
+@@ -80,7 +80,47 @@ static void kasan_test_usage(void)
+ 	printf("an assert is the pass. Silence is the failure, and means the code\n");
+ 	printf("under test was never instrumented.\n\n");
+ 	printf("The board will reset on a caught case if it is configured to reset\n");
+-	printf("on assert, so run one case per boot.\n");
++	printf("on assert, so run one case per boot.\n\n");
++	printf("Control:\n");
++	printf("  %-10s  %s\n", "arm", "start reporting");
++	printf("  %-10s  %s\n", "disarm", "stop reporting");
++	printf("  %-10s  %s\n", "status", "say whether reporting is on");
++	printf("\nWith CONFIG_MM_KASAN_START_MANUAL the board boots disarmed, so a\n");
++	printf("report can only come from what you run after 'arm'. The shadow map\n");
++	printf("is maintained either way, so blocks allocated before arming are\n");
++	printf("still tracked.\n");
++}
++
++/* Reporting control. Called straight through: this is a flat build, so the
++ * application and the kernel are one image and one link.
++ */
++
++static int kasan_test_control(FAR const char *cmd)
++{
++	if (strcmp(cmd, "arm") == 0) {
++		kasan_start();
++		printf("kasan_test: armed - reporting is on\n");
++		return EXIT_SUCCESS;
++	}
++
++	if (strcmp(cmd, "disarm") == 0) {
++		kasan_stop();
++		printf("kasan_test: disarmed - reporting is off\n");
++		return EXIT_SUCCESS;
++	}
++
++	if (strcmp(cmd, "status") == 0) {
++		printf("kasan_test: reporting is %s\n", kasan_is_armed() ? "ON" : "off");
++
++		if (!kasan_is_armed()) {
++			printf("            the shadow map is still being maintained;\n");
++			printf("            run 'kasan_test arm' to begin reporting.\n");
++		}
++
++		return EXIT_SUCCESS;
++	}
++
++	return -1;
+ }
+ 
+ /****************************************************************************
+@@ -98,6 +138,11 @@ int kasan_test_main(int argc, FAR char *argv[])
+ 		return EXIT_FAILURE;
+ 	}
+ 
++	ret = kasan_test_control(argv[1]);
++	if (ret >= 0) {
++		return ret;
++	}
++
+ 	for (i = 0; i < KASAN_NCASES; i++) {
+ 		if (strcmp(argv[1], g_cases[i].name) == 0) {
+ 			sel = &g_cases[i];
+diff --git a/os/include/tinyara/mm/kasan.h b/os/include/tinyara/mm/kasan.h
+index dec51922..e995a756 100644
+--- a/os/include/tinyara/mm/kasan.h
++++ b/os/include/tinyara/mm/kasan.h
+@@ -96,6 +96,7 @@ enum kasan_selftest_e {
+ #define kasan_unregister(addr)		do { (void)(addr); } while (0)
+ #define kasan_start()
+ #define kasan_stop()
++#define kasan_is_armed()		false
+ #define kasan_init_early()
+ 
+ #else
+@@ -214,12 +215,25 @@ void kasan_unregister(FAR void *addr);
+  *
+  ****************************************************************************/
+ 
++/****************************************************************************
++ * Name: kasan_is_armed
++ *
++ * Description:
++ *   Whether a check would be reported right now. Reporting and shadow
++ *   maintenance are separate: the map is kept accurate whichever this
++ *   returns, so arming later still gives correct results for memory
++ *   allocated earlier.
++ *
++ ****************************************************************************/
++
+ #ifdef CONFIG_MM_KASAN_INSTRUMENT
+ void kasan_start(void);
+ void kasan_stop(void);
++bool kasan_is_armed(void);
+ #else
+ #define kasan_start()
+ #define kasan_stop()
++#define kasan_is_armed()	false
+ #endif
+ 
+ /****************************************************************************
+diff --git a/os/mm/kasan/Kconfig b/os/mm/kasan/Kconfig
+index 6bee18e5..aff5fff5 100644
+--- a/os/mm/kasan/Kconfig
++++ b/os/mm/kasan/Kconfig
+@@ -130,6 +130,36 @@ config MM_KASAN_SELFTEST
+ 		Requires BUILTIN_APPS so the application registers as a TASH
+ 		command.
+ 
++config MM_KASAN_START_MANUAL
++	bool "Leave checking off until it is asked for"
++	default n
++	---help---
++		Register the regions and maintain the shadow map as usual, but do
++		not begin reporting until something calls kasan_start().
++
++		Without this, checking goes live the moment the first heap
++		registers, which is very early in os_start(). The whole of boot
++		then runs instrumented: drivers, Wi-Fi, the filesystem and the
++		binary manager. That is what you want eventually, but it is not
++		where to begin, because a report from any of them stops the board
++		before it reaches a prompt.
++
++		With this set the board boots silently and you arm KASan when you
++		are ready, so a report can only come from the code you are
++		testing.
++
++		The shadow map is still maintained while disarmed. Every
++		allocation and free keeps it accurate, so when you do arm, blocks
++		handed out during boot are tracked correctly and a later use
++		after free of one of them is still caught.
++
++		What is lost is anything that went wrong while disarmed: KASan
++		reports at the moment of access, never retroactively. Once your
++		own tests are clean, boot once with this off, because the boot
++		path is where driver and vendor bugs surface.
++
++		The kasan_test application arms and disarms it from the shell.
++
+ config MM_KASAN_DISABLE_NULL_POINTER_CHECK
+ 	bool "Do not check for NULL pointer access"
+ 	default n
+diff --git a/os/mm/kasan/generic.c b/os/mm/kasan/generic.c
+index d3faea23..e04bd012 100644
+--- a/os/mm/kasan/generic.c
++++ b/os/mm/kasan/generic.c
+@@ -410,11 +410,20 @@ void kasan_register(FAR void *addr, FAR size_t *size)
+ 
+ 	spin_unlock_irqrestore(&g_lock, flags);
+ 
+-	/* Enable checking, then poison the whole region. The allocator is
+-	 * responsible for unpoisoning each block as it is handed out.
++	/* Poison the whole region. The allocator is responsible for unpoisoning
++	 * each block as it is handed out.
++	 *
++	 * Checking is enabled here too unless CONFIG_MM_KASAN_START_MANUAL asks
++	 * for it to be held back. Note that the poisoning below, and every
++	 * poison and unpoison the allocator does afterwards, happen either way:
++	 * only reporting waits. The shadow map is therefore already correct
++	 * whenever kasan_start() is eventually called, and blocks handed out
++	 * while disarmed are tracked like any other.
+ 	 */
+ 
++#ifndef CONFIG_MM_KASAN_START_MANUAL
+ 	kasan_start();
++#endif
+ 	kasan_poison(addr, *size);
+ 
+ 	/* Hand back the size that is left for the heap. region->end still spans
+diff --git a/os/mm/kasan/hook.c b/os/mm/kasan/hook.c
+index eb6309f8..6bf5ba4e 100644
+--- a/os/mm/kasan/hook.c
++++ b/os/mm/kasan/hook.c
+@@ -350,6 +350,21 @@ void kasan_stop(void)
+ 	g_region_init = 0;
+ }
+ 
++/****************************************************************************
++ * Name: kasan_is_armed
++ *
++ * Description:
++ *   Whether a check would be reported right now. Reads the same gate the
++ *   instrumentation entry points test, so it answers for reporting only: the
++ *   shadow map is maintained whether this is true or false.
++ *
++ ****************************************************************************/
++
++bool kasan_is_armed(void)
++{
++	return g_region_init == KASAN_INIT_VALUE;
++}
++
+ /****************************************************************************
+  * Name: __asan_handle_no_return
+  *
+-- 
+2.43.0
+
