@@ -80,7 +80,47 @@ static void kasan_test_usage(void)
 	printf("an assert is the pass. Silence is the failure, and means the code\n");
 	printf("under test was never instrumented.\n\n");
 	printf("The board will reset on a caught case if it is configured to reset\n");
-	printf("on assert, so run one case per boot.\n");
+	printf("on assert, so run one case per boot.\n\n");
+	printf("Control:\n");
+	printf("  %-10s  %s\n", "arm", "start reporting");
+	printf("  %-10s  %s\n", "disarm", "stop reporting");
+	printf("  %-10s  %s\n", "status", "say whether reporting is on");
+	printf("\nWith CONFIG_MM_KASAN_START_MANUAL the board boots disarmed, so a\n");
+	printf("report can only come from what you run after 'arm'. The shadow map\n");
+	printf("is maintained either way, so blocks allocated before arming are\n");
+	printf("still tracked.\n");
+}
+
+/* Reporting control. Called straight through: this is a flat build, so the
+ * application and the kernel are one image and one link.
+ */
+
+static int kasan_test_control(FAR const char *cmd)
+{
+	if (strcmp(cmd, "arm") == 0) {
+		kasan_start();
+		printf("kasan_test: armed - reporting is on\n");
+		return EXIT_SUCCESS;
+	}
+
+	if (strcmp(cmd, "disarm") == 0) {
+		kasan_stop();
+		printf("kasan_test: disarmed - reporting is off\n");
+		return EXIT_SUCCESS;
+	}
+
+	if (strcmp(cmd, "status") == 0) {
+		printf("kasan_test: reporting is %s\n", kasan_is_armed() ? "ON" : "off");
+
+		if (!kasan_is_armed()) {
+			printf("            the shadow map is still being maintained;\n");
+			printf("            run 'kasan_test arm' to begin reporting.\n");
+		}
+
+		return EXIT_SUCCESS;
+	}
+
+	return -1;
 }
 
 /****************************************************************************
@@ -96,6 +136,11 @@ int kasan_test_main(int argc, FAR char *argv[])
 	if (argc != 2) {
 		kasan_test_usage();
 		return EXIT_FAILURE;
+	}
+
+	ret = kasan_test_control(argv[1]);
+	if (ret >= 0) {
+		return ret;
 	}
 
 	for (i = 0; i < KASAN_NCASES; i++) {

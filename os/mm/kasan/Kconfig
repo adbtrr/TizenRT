@@ -130,6 +130,36 @@ config MM_KASAN_SELFTEST
 		Requires BUILTIN_APPS so the application registers as a TASH
 		command.
 
+config MM_KASAN_START_MANUAL
+	bool "Leave checking off until it is asked for"
+	default n
+	---help---
+		Register the regions and maintain the shadow map as usual, but do
+		not begin reporting until something calls kasan_start().
+
+		Without this, checking goes live the moment the first heap
+		registers, which is very early in os_start(). The whole of boot
+		then runs instrumented: drivers, Wi-Fi, the filesystem and the
+		binary manager. That is what you want eventually, but it is not
+		where to begin, because a report from any of them stops the board
+		before it reaches a prompt.
+
+		With this set the board boots silently and you arm KASan when you
+		are ready, so a report can only come from the code you are
+		testing.
+
+		The shadow map is still maintained while disarmed. Every
+		allocation and free keeps it accurate, so when you do arm, blocks
+		handed out during boot are tracked correctly and a later use
+		after free of one of them is still caught.
+
+		What is lost is anything that went wrong while disarmed: KASan
+		reports at the moment of access, never retroactively. Once your
+		own tests are clean, boot once with this off, because the boot
+		path is where driver and vendor bugs surface.
+
+		The kasan_test application arms and disarms it from the shell.
+
 config MM_KASAN_DISABLE_NULL_POINTER_CHECK
 	bool "Do not check for NULL pointer access"
 	default n

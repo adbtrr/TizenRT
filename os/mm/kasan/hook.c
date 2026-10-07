@@ -351,6 +351,21 @@ void kasan_stop(void)
 }
 
 /****************************************************************************
+ * Name: kasan_is_armed
+ *
+ * Description:
+ *   Whether a check would be reported right now. Reads the same gate the
+ *   instrumentation entry points test, so it answers for reporting only: the
+ *   shadow map is maintained whether this is true or false.
+ *
+ ****************************************************************************/
+
+bool kasan_is_armed(void)
+{
+	return g_region_init == KASAN_INIT_VALUE;
+}
+
+/****************************************************************************
  * Name: __asan_handle_no_return
  *
  * Description:

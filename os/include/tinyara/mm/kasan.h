@@ -96,6 +96,7 @@ enum kasan_selftest_e {
 #define kasan_unregister(addr)		do { (void)(addr); } while (0)
 #define kasan_start()
 #define kasan_stop()
+#define kasan_is_armed()		false
 #define kasan_init_early()
 
 #else
@@ -214,12 +215,25 @@ void kasan_unregister(FAR void *addr);
  *
  ****************************************************************************/
 
+/****************************************************************************
+ * Name: kasan_is_armed
+ *
+ * Description:
+ *   Whether a check would be reported right now. Reporting and shadow
+ *   maintenance are separate: the map is kept accurate whichever this
+ *   returns, so arming later still gives correct results for memory
+ *   allocated earlier.
+ *
+ ****************************************************************************/
+
 #ifdef CONFIG_MM_KASAN_INSTRUMENT
 void kasan_start(void);
 void kasan_stop(void);
+bool kasan_is_armed(void);
 #else
 #define kasan_start()
 #define kasan_stop()
+#define kasan_is_armed()	false
 #endif
 
 /****************************************************************************

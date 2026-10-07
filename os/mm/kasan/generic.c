@@ -410,11 +410,20 @@ void kasan_register(FAR void *addr, FAR size_t *size)
 
 	spin_unlock_irqrestore(&g_lock, flags);
 
-	/* Enable checking, then poison the whole region. The allocator is
-	 * responsible for unpoisoning each block as it is handed out.
+	/* Poison the whole region. The allocator is responsible for unpoisoning
+	 * each block as it is handed out.
+	 *
+	 * Checking is enabled here too unless CONFIG_MM_KASAN_START_MANUAL asks
+	 * for it to be held back. Note that the poisoning below, and every
+	 * poison and unpoison the allocator does afterwards, happen either way:
+	 * only reporting waits. The shadow map is therefore already correct
+	 * whenever kasan_start() is eventually called, and blocks handed out
+	 * while disarmed are tracked like any other.
 	 */
 
+#ifndef CONFIG_MM_KASAN_START_MANUAL
 	kasan_start();
+#endif
 	kasan_poison(addr, *size);
 
 	/* Hand back the size that is left for the heap. region->end still spans
