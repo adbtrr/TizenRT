@@ -130,6 +130,31 @@ config MM_KASAN_SELFTEST
 		Requires BUILTIN_APPS so the application registers as a TASH
 		command.
 
+config MM_KASAN_LOCK_WORDS
+	int "Shadow words to write per interrupt-disabled section"
+	default 256
+	---help---
+		How many shadow words kasan_poison() and kasan_unpoison() write
+		before releasing the lock and taking it again, so that interrupts
+		are serviced during a long range.
+
+		This matters at registration, which poisons a whole region in one
+		call. A region of a few megabytes is tens of thousands of shadow
+		words, and writing them in one unbroken interrupt-disabled section
+		stalls the system for long enough to starve a driver or trip a
+		watchdog, every boot. Slow memory such as PSRAM makes it worse.
+
+		Lower it if boot still stalls, raise it if registration is
+		noticeably slow. The default writes one kilobyte of shadow per
+		section on a 32 bit target, which covers 128 KB of heap.
+
+		Each individual word is still updated under the lock, so no
+		read-modify-write is ever torn. What is given up is only that a
+		whole range stops being updated atomically, which no caller needs:
+		at registration nothing has been allocated from the region yet,
+		and on malloc and free the block is not reachable by anything else
+		while its shadow is being changed.
+
 config MM_KASAN_START_MANUAL
 	bool "Leave checking off until it is asked for"
 	default n

@@ -124,6 +124,21 @@
 
 #define KASAN_MIN_REGION_SIZE		(4 * KASAN_SHADOW_SCALE * KASAN_BITS_PER_WORD)
 
+/* Shadow words written per interrupt-disabled section. Defaulted here as well
+ * as in Kconfig so that the file builds standalone, and floored at one
+ * because the budget counts down to zero: a value of zero would wrap on the
+ * first decrement and hold the lock for four billion words.
+ */
+
+#ifndef CONFIG_MM_KASAN_LOCK_WORDS
+#define CONFIG_MM_KASAN_LOCK_WORDS	256
+#endif
+
+#if CONFIG_MM_KASAN_LOCK_WORDS < 1
+#undef CONFIG_MM_KASAN_LOCK_WORDS
+#define CONFIG_MM_KASAN_LOCK_WORDS	1
+#endif
+
 /****************************************************************************
  * Private Types
  ****************************************************************************/
@@ -270,6 +285,19 @@ static inline bool kasan_is_poisoned(FAR const void *addr, size_t size)
  *   manager passes a granule aligned size, because MM_ALIGN_UP() rounds to
  *   MM_MIN_CHUNK, which is a multiple of KASAN_SHADOW_SCALE.
  *
+ *   The lock is released and retaken every CONFIG_MM_KASAN_LOCK_WORDS words
+ *   so that a long range does not hold interrupts off. Registration poisons a
+ *   whole region in one call, and a region of a few megabytes is tens of
+ *   thousands of shadow words: writing them in one unbroken section stalls
+ *   the system long enough to starve a driver or trip a watchdog, on every
+ *   boot, and slow memory such as PSRAM makes it worse.
+ *
+ *   Every individual word is still written under the lock, so a
+ *   read-modify-write is never torn. Only whole range atomicity is given up,
+ *   which no caller needs: at registration nothing has been allocated from
+ *   the region yet, and on malloc and free the block is unreachable by
+ *   anything else while its shadow is being changed.
+ *
  ****************************************************************************/
 
 static void kasan_set_poison(FAR const void *addr, size_t size, bool poisoned)
@@ -278,6 +306,7 @@ static void kasan_set_poison(FAR const void *addr, size_t size, bool poisoned)
 	irqstate_t flags;
 	unsigned int bit;
 	unsigned int nbit;
+	unsigned int budget;
 	uintptr_t mask;
 
 	p = kasan_mem_to_shadow(addr, size, &bit);
@@ -289,6 +318,7 @@ static void kasan_set_poison(FAR const void *addr, size_t size, bool poisoned)
 	mask = KASAN_FIRST_WORD_MASK(bit);
 	size /= KASAN_SHADOW_SCALE;
 
+	budget = CONFIG_MM_KASAN_LOCK_WORDS;
 	flags = spin_lock_irqsave(&g_lock);
 
 	while (size >= nbit) {
@@ -303,6 +333,17 @@ static void kasan_set_poison(FAR const void *addr, size_t size, bool poisoned)
 
 		nbit = KASAN_BITS_PER_WORD;
 		mask = UINTPTR_MAX;
+
+		/* Let anything pending in happen, then carry on. p, bit, size,
+		 * nbit and mask are all local, so the walk resumes exactly where
+		 * it left off.
+		 */
+
+		if (--budget == 0) {
+			spin_unlock_irqrestore(&g_lock, flags);
+			budget = CONFIG_MM_KASAN_LOCK_WORDS;
+			flags = spin_lock_irqsave(&g_lock);
+		}
 	}
 
 	if (size) {
