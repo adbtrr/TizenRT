@@ -1,0 +1,169 @@
+From 17cd81de292f05e0efe2e2a1d6ca30e22061a638 Mon Sep 17 00:00:00 2001
+From: adbtrr_work5_kasan_flat_only <adbtrr_work5_kasan_flat_only@local>
+Date: Thu, 8 Oct 2026 16:07:44 +0000
+Subject: [PATCH] mm/kasan: do not hold interrupts off for a whole shadow range
+
+kasan_set_poison() took the lock once and held it across the entire
+range. On a single core target spin_lock_irqsave() is plain irqsave(), so
+that is interrupts disabled for the whole walk.
+
+For an allocation or a free that is a handful of words and does not
+matter. Registration is different: kasan_register() poisons a whole
+region in one call, and a region of a few megabytes is tens of thousands
+of shadow words. On rtl8721csm the second region is 3 MB of PSRAM, which
+is about 24,000 word writes into slow memory with interrupts off, during
+early boot, on every boot. That is long enough to starve a driver that is
+mid-initialisation or to trip a watchdog, and it is deterministic rather
+than intermittent, so it presents as the system simply never getting as
+far as a prompt.
+
+Release the lock and take it again every CONFIG_MM_KASAN_LOCK_WORDS
+words. The walk state is entirely in locals, so it resumes exactly where
+it left off.
+
+Every individual word is still written under the lock, so no
+read-modify-write is ever torn. What is given up is whole range
+atomicity, and no caller needs it: at registration nothing has been
+allocated from the region yet, and on malloc and free the block is not
+reachable by anything else while its shadow is being changed. A reader
+that interleaved with a free could briefly see part of a block poisoned,
+which is a missed report and never a false one.
+
+The default of 256 words writes one kilobyte of shadow per section on a
+32 bit target, covering 128 KB of heap. The value is a Kconfig because
+the right answer depends on the watchdog window and on how slow the
+memory is. It is floored at one in the source as well, because the budget
+counts down to zero and a configured zero would wrap on the first
+decrement and hold the lock for four billion words, which is the bug this
+commit fixes rather than a smaller version of it.
+
+Proved transparent rather than argued: a sequence of 400 randomised
+poison and unpoison operations, with unaligned starts and lengths
+spanning many chunks, produces a bit identical shadow map at chunk sizes
+1, 3, 7, 256 and one million. The detection suite passes identically at
+chunk sizes 1 and 256, and the runtime produces the same diagnostic count
+as before the change.
+---
+ os/mm/kasan/Kconfig   | 25 +++++++++++++++++++++++++
+ os/mm/kasan/generic.c | 41 +++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 66 insertions(+)
+
+diff --git a/os/mm/kasan/Kconfig b/os/mm/kasan/Kconfig
+index aff5fff5..ce54aa74 100644
+--- a/os/mm/kasan/Kconfig
++++ b/os/mm/kasan/Kconfig
+@@ -130,6 +130,31 @@ config MM_KASAN_SELFTEST
+ 		Requires BUILTIN_APPS so the application registers as a TASH
+ 		command.
+ 
++config MM_KASAN_LOCK_WORDS
++	int "Shadow words to write per interrupt-disabled section"
++	default 256
++	---help---
++		How many shadow words kasan_poison() and kasan_unpoison() write
++		before releasing the lock and taking it again, so that interrupts
++		are serviced during a long range.
++
++		This matters at registration, which poisons a whole region in one
++		call. A region of a few megabytes is tens of thousands of shadow
++		words, and writing them in one unbroken interrupt-disabled section
++		stalls the system for long enough to starve a driver or trip a
++		watchdog, every boot. Slow memory such as PSRAM makes it worse.
++
++		Lower it if boot still stalls, raise it if registration is
++		noticeably slow. The default writes one kilobyte of shadow per
++		section on a 32 bit target, which covers 128 KB of heap.
++
++		Each individual word is still updated under the lock, so no
++		read-modify-write is ever torn. What is given up is only that a
++		whole range stops being updated atomically, which no caller needs:
++		at registration nothing has been allocated from the region yet,
++		and on malloc and free the block is not reachable by anything else
++		while its shadow is being changed.
++
+ config MM_KASAN_START_MANUAL
+ 	bool "Leave checking off until it is asked for"
+ 	default n
+diff --git a/os/mm/kasan/generic.c b/os/mm/kasan/generic.c
+index e04bd012..2cd97227 100644
+--- a/os/mm/kasan/generic.c
++++ b/os/mm/kasan/generic.c
+@@ -124,6 +124,21 @@
+ 
+ #define KASAN_MIN_REGION_SIZE		(4 * KASAN_SHADOW_SCALE * KASAN_BITS_PER_WORD)
+ 
++/* Shadow words written per interrupt-disabled section. Defaulted here as well
++ * as in Kconfig so that the file builds standalone, and floored at one
++ * because the budget counts down to zero: a value of zero would wrap on the
++ * first decrement and hold the lock for four billion words.
++ */
++
++#ifndef CONFIG_MM_KASAN_LOCK_WORDS
++#define CONFIG_MM_KASAN_LOCK_WORDS	256
++#endif
++
++#if CONFIG_MM_KASAN_LOCK_WORDS < 1
++#undef CONFIG_MM_KASAN_LOCK_WORDS
++#define CONFIG_MM_KASAN_LOCK_WORDS	1
++#endif
++
+ /****************************************************************************
+  * Private Types
+  ****************************************************************************/
+@@ -270,6 +285,19 @@ static inline bool kasan_is_poisoned(FAR const void *addr, size_t size)
+  *   manager passes a granule aligned size, because MM_ALIGN_UP() rounds to
+  *   MM_MIN_CHUNK, which is a multiple of KASAN_SHADOW_SCALE.
+  *
++ *   The lock is released and retaken every CONFIG_MM_KASAN_LOCK_WORDS words
++ *   so that a long range does not hold interrupts off. Registration poisons a
++ *   whole region in one call, and a region of a few megabytes is tens of
++ *   thousands of shadow words: writing them in one unbroken section stalls
++ *   the system long enough to starve a driver or trip a watchdog, on every
++ *   boot, and slow memory such as PSRAM makes it worse.
++ *
++ *   Every individual word is still written under the lock, so a
++ *   read-modify-write is never torn. Only whole range atomicity is given up,
++ *   which no caller needs: at registration nothing has been allocated from
++ *   the region yet, and on malloc and free the block is unreachable by
++ *   anything else while its shadow is being changed.
++ *
+  ****************************************************************************/
+ 
+ static void kasan_set_poison(FAR const void *addr, size_t size, bool poisoned)
+@@ -278,6 +306,7 @@ static void kasan_set_poison(FAR const void *addr, size_t size, bool poisoned)
+ 	irqstate_t flags;
+ 	unsigned int bit;
+ 	unsigned int nbit;
++	unsigned int budget;
+ 	uintptr_t mask;
+ 
+ 	p = kasan_mem_to_shadow(addr, size, &bit);
+@@ -289,6 +318,7 @@ static void kasan_set_poison(FAR const void *addr, size_t size, bool poisoned)
+ 	mask = KASAN_FIRST_WORD_MASK(bit);
+ 	size /= KASAN_SHADOW_SCALE;
+ 
++	budget = CONFIG_MM_KASAN_LOCK_WORDS;
+ 	flags = spin_lock_irqsave(&g_lock);
+ 
+ 	while (size >= nbit) {
+@@ -303,6 +333,17 @@ static void kasan_set_poison(FAR const void *addr, size_t size, bool poisoned)
+ 
+ 		nbit = KASAN_BITS_PER_WORD;
+ 		mask = UINTPTR_MAX;
++
++		/* Let anything pending in happen, then carry on. p, bit, size,
++		 * nbit and mask are all local, so the walk resumes exactly where
++		 * it left off.
++		 */
++
++		if (--budget == 0) {
++			spin_unlock_irqrestore(&g_lock, flags);
++			budget = CONFIG_MM_KASAN_LOCK_WORDS;
++			flags = spin_lock_irqsave(&g_lock);
++		}
+ 	}
+ 
+ 	if (size) {
+-- 
+2.43.0
+
