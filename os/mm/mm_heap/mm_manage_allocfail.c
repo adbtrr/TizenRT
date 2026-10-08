@@ -108,9 +108,27 @@ void mm_manage_alloc_fail_dump(struct mm_heap_s *heap, int startidx, int endidx,
 	up_cpu_pause_all();
 #endif
 	extern bool abort_mode;
-#ifdef CONFIG_MM_ASSERT_ON_FAIL
-	abort_mode = true;
+#ifndef CONFIG_MM_ASSERT_ON_FAIL
+	bool saved_abort_mode = abort_mode;
 #endif
+
+	/* This runs with interrupts disabled, because mm_manage_alloc_fail()
+	 * takes a critical section around it, so the report has to leave over
+	 * the low level polled console.
+	 *
+	 * mfdbg() picks that path only when abort_mode is set or when it is
+	 * called from an interrupt handler. Neither holds here once
+	 * CONFIG_MM_ASSERT_ON_FAIL is off: mfdbg() then resolves to dbg(),
+	 * which is syslog(), which writes through the serial driver. As soon
+	 * as the transmit buffer fills, uart_putxmitchar() enables the
+	 * transmit interrupt and waits on dev->xmitsem for it. That interrupt
+	 * is masked, so nothing ever posts the semaphore: the failure is never
+	 * reported and the allocating thread never returns from its malloc.
+	 *
+	 * So claim abort mode for the duration of the dump whatever the
+	 * configuration, and give it back if we are going to return.
+	 */
+	abort_mode = true;
 
 	mfdbg("Allocation failed from %s heap.\n", (heap_type == KERNEL_HEAP) ? KERNEL_STR : USER_STR);
 	mfdbg(" - requested size %u\n", size);
@@ -187,6 +205,14 @@ void mm_manage_alloc_fail_dump(struct mm_heap_s *heap, int startidx, int endidx,
 	 * which we paused earlier.
 	 */
 	up_cpu_resume_all();
+#endif
+
+	/* Only when we are going to return. With CONFIG_MM_ASSERT_ON_FAIL the
+	 * caller panics next and abort mode is what the crash dump wants, so
+	 * that configuration behaves exactly as it did before.
+	 */
+#ifndef CONFIG_MM_ASSERT_ON_FAIL
+	abort_mode = saved_abort_mode;
 #endif
 }
 
