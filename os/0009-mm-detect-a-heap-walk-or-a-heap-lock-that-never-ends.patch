@@ -1,0 +1,316 @@
+From e98f0189694b8eeb44e90419c0671149d8de2964 Mon Sep 17 00:00:00 2001
+From: adbtrr_work5_kasan_flat_only <adbtrr_work5_kasan_flat_only@local>
+Date: Fri, 9 Oct 2026 04:24:17 +0000
+Subject: [PATCH] mm: detect a heap walk or a heap lock that never ends
+
+An allocator call that never returns has only a few possible causes, and
+with CONFIG_MM_ASSERT_ON_FAIL set none of them is an allocation failure:
+that path reports and asserts. What is left is a walk over heap metadata
+that never terminates, or a wait for the heap semaphore that is never
+satisfied. Both present the same way from the outside, as the system
+stopping inside malloc with nothing on the console, and neither says
+anything about which it was.
+
+There are exactly four unbounded waits in the malloc call graph:
+
+  mm_malloc.c       the delay list walk, before the semaphore is taken
+  mm_malloc.c       the free list search for a large enough chunk
+  mm_addfreechunk.c the free list walk that finds the insertion point
+  mm_sem.c          the wait for the heap semaphore
+
+The index scan in mm_malloc() is bounded by MM_NNODES and cannot hang.
+
+Bound the three walks by the number of chunks the heap can hold. No chunk
+is smaller than MM_MIN_CHUNK, so no honest list can be longer than that,
+and a walk which passes the count has found a cycle rather than a long
+list. That is a proof rather than a threshold, so the bound needs no
+tuning and cannot fire on a healthy heap. One extra node is allowed so
+that a list legitimately at full length never trips, and a heap whose
+size is not set yet is left unchecked rather than bounded by a guess.
+
+For the semaphore there is nothing to bound, so instead name the holder
+before blocking, and only when the semaphore is actually contended. If
+that is the last line the board prints, the holder it names is the task
+that never gave the heap back.
+
+Both reports go out with lldbg(), which is lowsyslog() on a target with
+CONFIG_ARCH_LOWPUTC. That path is polled and touches neither the serial
+driver nor a semaphore, so it reaches the console from inside the heap
+critical section and with interrupts disabled, which is where these
+walks run. Using syslog() here would deadlock on the transmit semaphore
+waiting for an interrupt that is masked.
+
+All of it is behind CONFIG_MM_HANG_DETECT, default n. With the option off
+the walks compile back to exactly what they were, bare for statements
+with an empty body, and the semaphore wait is untouched.
+
+Tested rather than argued. Over a heap sized to hold 4096 chunks, no
+honest list of 1 to 4096 nodes trips the guard; every closed cycle of 1
+to 64 nodes is caught, named and asserted; and a heap with its size
+still zero walks unchecked instead of reporting. A list wired into a
+cycle spins forever with the option off and is caught immediately with
+it on, which is the symptom and the diagnosis of the same build. Both
+halves of every conditional compile under -Wall -Wextra -Werror.
+---
+ os/mm/Kconfig                   | 30 ++++++++++++
+ os/mm/mm_heap/mm_addfreechunk.c |  7 ++-
+ os/mm/mm_heap/mm_hangdetect.h   | 86 +++++++++++++++++++++++++++++++++
+ os/mm/mm_heap/mm_malloc.c       |  9 +++-
+ os/mm/mm_heap/mm_sem.c          | 27 +++++++++++
+ 5 files changed, 157 insertions(+), 2 deletions(-)
+ create mode 100644 os/mm/mm_heap/mm_hangdetect.h
+
+diff --git a/os/mm/Kconfig b/os/mm/Kconfig
+index eeeeacda..63df1cea 100644
+--- a/os/mm/Kconfig
++++ b/os/mm/Kconfig
+@@ -128,6 +128,36 @@ config MM_ASSERT_ON_FAIL
+ 		When memory allocation fails, make assertion.
+ 		From the application binary with loadable build, it will be reloaded.
+ 
++config MM_HANG_DETECT
++	bool "Detect a heap walk that never ends"
++	default n
++	---help---
++		The allocator walks several singly linked lists threaded through
++		heap metadata, and none of the walks is bounded. A corrupted link
++		that points back into its own list spins forever with nothing on
++		the console, inside an allocator call that never returns, which
++		presents as the system stopping for no visible reason rather than
++		as a heap error.
++
++		This bounds each walk by the number of chunks the heap can hold.
++		No chunk is smaller than the granule, so no honest list can be
++		longer than that, and a walk which passes the count has found a
++		cycle rather than a long list. It is a proof, not a threshold, so
++		it needs no tuning and cannot fire on a healthy heap. The walk
++		then names the list and the node it stopped at, and asserts.
++
++		It also reports the holder of the heap semaphore when an allocation
++		has to wait for it, which is the other way an allocator call stops
++		returning: if the semaphore is never released, every later
++		allocation blocks, and the last line printed names the task that
++		never gave it back.
++
++		Both reports go out over the low level console, so they survive
++		interrupts being disabled and the heap critical section being held.
++
++		This is a bring up and debug option. The cost is one decrement per
++		list step and one sem_trywait() per contended lock.
++
+ config MM_DUMP_CORRPUTED_HEAP
+ 	bool "Dump the complete corrupted heap"
+ 	default n
+diff --git a/os/mm/mm_heap/mm_addfreechunk.c b/os/mm/mm_heap/mm_addfreechunk.c
+index 455731b3..00569dab 100644
+--- a/os/mm/mm_heap/mm_addfreechunk.c
++++ b/os/mm/mm_heap/mm_addfreechunk.c
+@@ -58,6 +58,8 @@
+ 
+ #include <tinyara/mm/mm.h>
+ 
++#include "mm_hangdetect.h"
++
+ /****************************************************************************
+  * Pre-processor Definitions
+  ****************************************************************************/
+@@ -83,6 +85,7 @@ void mm_addfreechunk(FAR struct mm_heap_s *heap, FAR struct mm_freenode_s *node)
+ {
+ 	FAR struct mm_freenode_s *next;
+ 	FAR struct mm_freenode_s *prev;
++	MM_WALK_DECL(heap);
+ 
+ #ifdef CONFIG_DEBUG_MM_UAF
+ 	mm_uaf_poison(node);
+@@ -94,7 +97,9 @@ void mm_addfreechunk(FAR struct mm_heap_s *heap, FAR struct mm_freenode_s *node)
+ 
+ 	/* Now put the new free node in a descending order */
+ 
+-	for (prev = &heap->mm_nodelist[ndx], next = prev->flink; next && next->size > node->size; prev = next, next = next->flink) ;
++	for (prev = &heap->mm_nodelist[ndx], next = prev->flink; next && next->size > node->size; prev = next, next = next->flink) {
++		MM_WALK_STEP("free", next);
++	}
+ 
+ 	/* Does it go in mid next or at the end? */
+ 
+diff --git a/os/mm/mm_heap/mm_hangdetect.h b/os/mm/mm_heap/mm_hangdetect.h
+new file mode 100644
+index 00000000..6d49b8a6
+--- /dev/null
++++ b/os/mm/mm_heap/mm_hangdetect.h
+@@ -0,0 +1,86 @@
++/****************************************************************************
++ *
++ * Copyright 2026 Samsung Electronics All Rights Reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
++ * either express or implied. See the License for the specific
++ * language governing permissions and limitations under the License.
++ *
++ ****************************************************************************/
++
++#ifndef __MM_MM_HEAP_MM_HANGDETECT_H
++#define __MM_MM_HEAP_MM_HANGDETECT_H
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <tinyara/config.h>
++
++#include <debug.h>
++#include <assert.h>
++
++#include <tinyara/mm/mm.h>
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++/* The heap walks the allocator performs are all over singly linked lists
++ * threaded through heap metadata, and none of them is bounded: a corrupted
++ * flink that points back into the list spins forever with the console
++ * silent, inside an allocator call that simply never returns.
++ *
++ * No chunk is smaller than MM_MIN_CHUNK, so no honest list can be longer
++ * than the heap holds chunks. A walk that passes that count has therefore
++ * found a cycle, not a long list. That is a proof rather than a threshold,
++ * so the bound never needs tuning and never fires on a healthy heap.
++ *
++ * The report goes out with lldbg(), which is lowsyslog() where the target
++ * has CONFIG_ARCH_LOWPUTC. That path is polled and touches neither the
++ * serial driver nor a semaphore, so it still reaches the console from
++ * inside the heap critical section and with interrupts disabled, which is
++ * exactly where these walks run.
++ */
++
++#ifdef CONFIG_MM_HANG_DETECT
++
++/* The heap can hold mm_heapsize / MM_MIN_CHUNK chunks, so that many nodes
++ * is the longest honest list; one more is allowed before calling it a cycle
++ * so that a list which is legitimately at full length never trips.
++ *
++ * A heap whose size is not set yet has no meaningful bound, so the walk is
++ * left unchecked rather than guessing one. No current caller walks before
++ * mm_addregion() has accumulated the size, this only keeps a future one
++ * from seeing a false report.
++ */
++
++#define MM_WALK_DECL(h)							\
++	size_t _mm_walk_left = ((h)->mm_heapsize != 0 ?			\
++				(h)->mm_heapsize / MM_MIN_CHUNK + 1 :	\
++				(size_t)-1)
++
++#define MM_WALK_STEP(what, p)							\
++	do {									\
++		if (_mm_walk_left-- == 0) {					\
++			lldbg("mm: %s list cycles at %p, heap is corrupt\n",	\
++			      (what), (p));					\
++			PANIC();						\
++		}								\
++	} while (0)
++
++#else
++
++#define MM_WALK_DECL(h)		int _mm_walk_left __attribute__((unused)) = ((void)(h), 0)
++#define MM_WALK_STEP(what, p)	do { } while (0)
++
++#endif							/* CONFIG_MM_HANG_DETECT */
++#endif							/* __MM_MM_HEAP_MM_HANGDETECT_H */
+diff --git a/os/mm/mm_heap/mm_malloc.c b/os/mm/mm_heap/mm_malloc.c
+index 47abe408..c64e9549 100644
+--- a/os/mm/mm_heap/mm_malloc.c
++++ b/os/mm/mm_heap/mm_malloc.c
+@@ -67,6 +67,7 @@
+ #include <tinyara/arch.h>
+ 
+ #include "mm_node.h"
++#include "mm_hangdetect.h"
+ 
+ /****************************************************************************
+  * Pre-processor Definitions
+@@ -96,6 +97,7 @@ static void mm_free_delaylist(FAR struct mm_heap_s *heap)
+ #if defined(CONFIG_BUILD_FLAT) || defined(__KERNEL__)
+ 	FAR struct mm_delaynode_s *tmp;
+ 	irqstate_t flags;
++	MM_WALK_DECL(heap);
+ 
+ 	/* Move the delay list to local */
+ 
+@@ -112,6 +114,8 @@ static void mm_free_delaylist(FAR struct mm_heap_s *heap)
+ 	{
+ 		FAR struct mm_delaynode_s *address;
+ 
++		MM_WALK_STEP("delay", tmp);
++
+ 		/* Get the first delayed deallocation */
+ 		address = tmp;
+ 		tmp = tmp->flink;
+@@ -196,7 +200,10 @@ retry_after_gc:
+ 
+ 	/* If node is not NULL, there exists a free node big enough to allocate. */
+ 	FAR struct mm_freenode_s *prev = &heap->mm_nodelist[ndx];
+-	for ( ; node && node->size > size; prev = node, node = node->flink) ;
++	MM_WALK_DECL(heap);
++	for ( ; node && node->size > size; prev = node, node = node->flink) {
++		MM_WALK_STEP("free", node);
++	}
+ 	if (!(node && node->size == size)) {
+ 		node = prev;
+ 	}
+diff --git a/os/mm/mm_heap/mm_sem.c b/os/mm/mm_heap/mm_sem.c
+index d5b061dd..1ec15edf 100644
+--- a/os/mm/mm_heap/mm_sem.c
++++ b/os/mm/mm_heap/mm_sem.c
+@@ -164,6 +164,32 @@ bool mm_takesemaphore(FAR struct mm_heap_s *heap)
+ 		/* Take the semaphore (perhaps waiting) */
+ 
+ 		mvdbg("PID=%d taking\n", my_pid);
++
++#ifdef CONFIG_MM_HANG_DETECT
++		/* Say who we are about to wait for, before we wait. A heap
++		 * semaphore whose holder never releases it blocks every later
++		 * allocation here, and from the outside that is an allocator call
++		 * that simply never returns, with nothing on the console.
++		 *
++		 * Printed only when the semaphore is actually contended, so an
++		 * uncontended heap stays silent, and printed over lldbg() so it
++		 * survives interrupts being disabled. If this is the last line the
++		 * board prints, the holder it names is the task that never gave the
++		 * heap back.
++		 */
++
++		if (sem_trywait(&heap->mm_semaphore) != 0) {
++			lldbg("mm: pid %d waiting on heap %p, holder %d, count %d\n", my_pid, heap, heap->mm_holder, heap->mm_counts_held);
++
++			while (sem_wait(&heap->mm_semaphore) != 0) {
++				/* The only case that an error should occur here is
++				 * if the wait was awakened by a signal.
++				 */
++
++				ASSERT(errno == EINTR);
++			}
++		}
++#else
+ 		while (sem_wait(&heap->mm_semaphore) != 0) {
+ 			/* The only case that an error should occur here is if
+ 			 * the wait was awakened by a signal.
+@@ -171,6 +197,7 @@ bool mm_takesemaphore(FAR struct mm_heap_s *heap)
+ 
+ 			ASSERT(errno == EINTR);
+ 		}
++#endif
+ 
+ 		/* We have it.  Claim the stake and return */
+ 
+-- 
+2.43.0
+
