@@ -128,6 +128,36 @@ config MM_ASSERT_ON_FAIL
 		When memory allocation fails, make assertion.
 		From the application binary with loadable build, it will be reloaded.
 
+config MM_HANG_DETECT
+	bool "Detect a heap walk that never ends"
+	default n
+	---help---
+		The allocator walks several singly linked lists threaded through
+		heap metadata, and none of the walks is bounded. A corrupted link
+		that points back into its own list spins forever with nothing on
+		the console, inside an allocator call that never returns, which
+		presents as the system stopping for no visible reason rather than
+		as a heap error.
+
+		This bounds each walk by the number of chunks the heap can hold.
+		No chunk is smaller than the granule, so no honest list can be
+		longer than that, and a walk which passes the count has found a
+		cycle rather than a long list. It is a proof, not a threshold, so
+		it needs no tuning and cannot fire on a healthy heap. The walk
+		then names the list and the node it stopped at, and asserts.
+
+		It also reports the holder of the heap semaphore when an allocation
+		has to wait for it, which is the other way an allocator call stops
+		returning: if the semaphore is never released, every later
+		allocation blocks, and the last line printed names the task that
+		never gave it back.
+
+		Both reports go out over the low level console, so they survive
+		interrupts being disabled and the heap critical section being held.
+
+		This is a bring up and debug option. The cost is one decrement per
+		list step and one sem_trywait() per contended lock.
+
 config MM_DUMP_CORRPUTED_HEAP
 	bool "Dump the complete corrupted heap"
 	default n

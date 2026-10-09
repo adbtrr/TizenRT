@@ -164,6 +164,32 @@ bool mm_takesemaphore(FAR struct mm_heap_s *heap)
 		/* Take the semaphore (perhaps waiting) */
 
 		mvdbg("PID=%d taking\n", my_pid);
+
+#ifdef CONFIG_MM_HANG_DETECT
+		/* Say who we are about to wait for, before we wait. A heap
+		 * semaphore whose holder never releases it blocks every later
+		 * allocation here, and from the outside that is an allocator call
+		 * that simply never returns, with nothing on the console.
+		 *
+		 * Printed only when the semaphore is actually contended, so an
+		 * uncontended heap stays silent, and printed over lldbg() so it
+		 * survives interrupts being disabled. If this is the last line the
+		 * board prints, the holder it names is the task that never gave the
+		 * heap back.
+		 */
+
+		if (sem_trywait(&heap->mm_semaphore) != 0) {
+			lldbg("mm: pid %d waiting on heap %p, holder %d, count %d\n", my_pid, heap, heap->mm_holder, heap->mm_counts_held);
+
+			while (sem_wait(&heap->mm_semaphore) != 0) {
+				/* The only case that an error should occur here is
+				 * if the wait was awakened by a signal.
+				 */
+
+				ASSERT(errno == EINTR);
+			}
+		}
+#else
 		while (sem_wait(&heap->mm_semaphore) != 0) {
 			/* The only case that an error should occur here is if
 			 * the wait was awakened by a signal.
@@ -171,6 +197,7 @@ bool mm_takesemaphore(FAR struct mm_heap_s *heap)
 
 			ASSERT(errno == EINTR);
 		}
+#endif
 
 		/* We have it.  Claim the stake and return */
 

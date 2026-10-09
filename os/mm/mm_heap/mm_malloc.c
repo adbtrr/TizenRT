@@ -67,6 +67,7 @@
 #include <tinyara/arch.h>
 
 #include "mm_node.h"
+#include "mm_hangdetect.h"
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -96,6 +97,7 @@ static void mm_free_delaylist(FAR struct mm_heap_s *heap)
 #if defined(CONFIG_BUILD_FLAT) || defined(__KERNEL__)
 	FAR struct mm_delaynode_s *tmp;
 	irqstate_t flags;
+	MM_WALK_DECL(heap);
 
 	/* Move the delay list to local */
 
@@ -111,6 +113,8 @@ static void mm_free_delaylist(FAR struct mm_heap_s *heap)
 	while (tmp)
 	{
 		FAR struct mm_delaynode_s *address;
+
+		MM_WALK_STEP("delay", tmp);
 
 		/* Get the first delayed deallocation */
 		address = tmp;
@@ -196,7 +200,10 @@ retry_after_gc:
 
 	/* If node is not NULL, there exists a free node big enough to allocate. */
 	FAR struct mm_freenode_s *prev = &heap->mm_nodelist[ndx];
-	for ( ; node && node->size > size; prev = node, node = node->flink) ;
+	MM_WALK_DECL(heap);
+	for ( ; node && node->size > size; prev = node, node = node->flink) {
+		MM_WALK_STEP("free", node);
+	}
 	if (!(node && node->size == size)) {
 		node = prev;
 	}

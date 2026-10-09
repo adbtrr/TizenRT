@@ -58,6 +58,8 @@
 
 #include <tinyara/mm/mm.h>
 
+#include "mm_hangdetect.h"
+
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
@@ -83,6 +85,7 @@ void mm_addfreechunk(FAR struct mm_heap_s *heap, FAR struct mm_freenode_s *node)
 {
 	FAR struct mm_freenode_s *next;
 	FAR struct mm_freenode_s *prev;
+	MM_WALK_DECL(heap);
 
 #ifdef CONFIG_DEBUG_MM_UAF
 	mm_uaf_poison(node);
@@ -94,7 +97,9 @@ void mm_addfreechunk(FAR struct mm_heap_s *heap, FAR struct mm_freenode_s *node)
 
 	/* Now put the new free node in a descending order */
 
-	for (prev = &heap->mm_nodelist[ndx], next = prev->flink; next && next->size > node->size; prev = next, next = next->flink) ;
+	for (prev = &heap->mm_nodelist[ndx], next = prev->flink; next && next->size > node->size; prev = next, next = next->flink) {
+		MM_WALK_STEP("free", next);
+	}
 
 	/* Does it go in mid next or at the end? */
 
