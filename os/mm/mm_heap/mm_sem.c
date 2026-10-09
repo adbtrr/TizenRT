@@ -124,6 +124,16 @@ int mm_trysemaphore(FAR struct mm_heap_s *heap)
 			return -get_errno();
 		}
 
+		/* As in mm_takesemaphore(), and for the same reason. This path
+		 * acquires the heap too and is released through
+		 * mm_givesemaphore(), so without this the unlock there would have
+		 * no matching lock and would drive lockcount negative. It is
+		 * reached from sched_ufree() and sched_kfree(), which take the heap
+		 * here and give it back after the free.
+		 */
+
+		sched_lock();
+
 		/* We have it.  Claim the stak and return */
 
 		heap->mm_holder      = my_pid;
@@ -199,6 +209,45 @@ bool mm_takesemaphore(FAR struct mm_heap_s *heap)
 		}
 #endif
 
+		/* We have it. Hold off rescheduling for as long as we do.
+		 *
+		 * This is a mutex with no priority inheritance: mm_seminitialize()
+		 * creates it with sem_init() and never calls sem_setprotocol(), and
+		 * CONFIG_PRIORITY_INHERITANCE is not set on every target. Nothing
+		 * else keeps the holder on the CPU either, because the heap is
+		 * protected by a semaphore rather than by disabling interrupts, so
+		 * the whole of mm_malloc() and mm_free() has always been
+		 * preemptible.
+		 *
+		 * That is an unbounded priority inversion waiting to happen. A low
+		 * priority task takes the heap and is preempted; a high priority
+		 * task blocks on the heap below; and any task of middling priority
+		 * that is ready to run keeps the holder off the CPU indefinitely.
+		 * The holder never releases, every later allocation piles up in the
+		 * wait above, and the system stops with no fault and nothing on the
+		 * console.
+		 *
+		 * The window is small while heap operations are short, which is why
+		 * this went unnoticed. Anything that lengthens them opens it: with
+		 * KASan the allocator writes the shadow map inside this very
+		 * section, and the instrumented code around it runs two to three
+		 * times slower.
+		 *
+		 * Locking the scheduler closes it by construction rather than by
+		 * timing. Interrupts stay enabled throughout, so drivers and the
+		 * watchdog are unaffected; only a context switch is deferred, and
+		 * only for the length of one heap operation.
+		 *
+		 * Taken after the wait, never before, or the wait could block with
+		 * rescheduling disabled and nothing could ever release it. Taken on
+		 * the outermost acquire only: the recursive path above already runs
+		 * with it held. sched_lock() is a no-op before there is a task and
+		 * in interrupt context, and sched_unlock() makes the same two
+		 * checks, so the pair stays balanced wherever it is reached.
+		 */
+
+		sched_lock();
+
 		/* We have it.  Claim the stake and return */
 
 		heap->mm_holder      = my_pid;
@@ -244,6 +293,14 @@ void mm_givesemaphore(FAR struct mm_heap_s *heap)
 		heap->mm_holder      = -1;
 		heap->mm_counts_held = 0;
 		ASSERT(sem_post(&heap->mm_semaphore) == 0);
+
+		/* Paired with the sched_lock() taken on the outermost acquire in
+		 * mm_takesemaphore(). After the post, so that waking a waiter of
+		 * higher priority costs one context switch here rather than one on
+		 * the post and another on the unlock.
+		 */
+
+		sched_unlock();
 	}
 }
 
